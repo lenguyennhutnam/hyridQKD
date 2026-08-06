@@ -41,9 +41,18 @@ class TestConfigIO(unittest.TestCase):
         cfg["backend_config"]["seed"] = 999
         with open(self.bob, "w") as f:
             json.dump(cfg, f)
+        # Capture state before attempted update
+        alice_before = configio.read_config(self.alice)
+        bob_before = configio.read_config(self.bob)
+        # Attempt update should fail and raise ValueError
         with self.assertRaises(ValueError):
             configio.update_hw_sim_configs(0.1, 0.05, 0.5, 0.1, 0.7,
                                            alice_path=self.alice, bob_path=self.bob)
+        # Verify both files are unchanged on disk after the error
+        alice_after = configio.read_config(self.alice)
+        bob_after = configio.read_config(self.bob)
+        self.assertEqual(alice_before, alice_after)
+        self.assertEqual(bob_before, bob_after)
 
     def test_default_paths_exist(self):
         self.assertTrue(os.path.exists(configio.DEFAULT_ALICE))

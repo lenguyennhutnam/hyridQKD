@@ -42,13 +42,31 @@ def check_matched(alice_cfg, bob_cfg):
 
 def update_hw_sim_configs(eta, qberr, mu1, mu2, p1,
                           alice_path=DEFAULT_ALICE, bob_path=DEFAULT_BOB):
-    """Write eta/qberr/decoy_states into BOTH configs, preserving other fields."""
-    for path in (alice_path, bob_path):
-        cfg = read_config(path)
-        cfg["backend_config"]["eta"] = eta
-        cfg["backend_config"]["qberr"] = qberr
-        cfg["backend_config"]["decoy_states"] = {"mu1": mu1, "mu2": mu2, "p1": p1}
+    """Write eta/qberr/decoy_states into BOTH configs, preserving other fields.
+
+    Validates in-memory before writing to prevent partial updates on error.
+    """
+    # Read both configs first
+    alice_cfg = read_config(alice_path)
+    bob_cfg = read_config(bob_path)
+
+    # Apply updates in memory
+    alice_cfg["backend_config"]["eta"] = eta
+    alice_cfg["backend_config"]["qberr"] = qberr
+    alice_cfg["backend_config"]["decoy_states"] = {"mu1": mu1, "mu2": mu2, "p1": p1}
+
+    bob_cfg["backend_config"]["eta"] = eta
+    bob_cfg["backend_config"]["qberr"] = qberr
+    bob_cfg["backend_config"]["decoy_states"] = {"mu1": mu1, "mu2": mu2, "p1": p1}
+
+    # Validate in memory before writing (fail-safe)
+    check_matched(alice_cfg, bob_cfg)
+
+    # Write both files only after validation passes
+    for path, cfg in [(alice_path, alice_cfg), (bob_path, bob_cfg)]:
         with open(path, "w") as f:
             json.dump(cfg, f, indent=2)
             f.write("\n")
+
+    # Final guard: verify after writing
     check_matched(read_config(alice_path), read_config(bob_path))
