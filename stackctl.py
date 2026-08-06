@@ -18,6 +18,11 @@ LOG_DIR = os.path.join(APP_DIR, "logs")
 PID_DIR = os.path.join(LOG_DIR, "pids")
 COLLECTOR_PID = os.path.join(PID_DIR, "collector.pid")
 
+# Popen handle for a collector we spawned in this interpreter. When set and
+# its pid matches the pid file, we can reap it with poll()/waitpid() instead
+# of relying on kill(pid, 0), which reports zombies as alive.
+_collector_proc = None
+
 
 def _ensure_dirs():
     os.makedirs(PID_DIR, exist_ok=True)
@@ -43,12 +48,15 @@ def stack_running():
 
 def start_collector(csv_path, extra_args=()):
     """Spawn collector.py in its own session; return its pid."""
+    global _collector_proc
     _ensure_dirs()
     cmd = ["python3", os.path.join(APP_DIR, "collector.py"),
            "--csv", csv_path] + list(extra_args)
     log = open(os.path.join(LOG_DIR, "collector.log"), "ab", buffering=0)
     proc = subprocess.Popen(cmd, cwd=APP_DIR, stdout=log, stderr=log,
                             start_new_session=True)
+    log.close()  # child holds its own fd copy; our handle is no longer needed
+    _collector_proc = proc
     with open(COLLECTOR_PID, "w") as f:
         f.write(str(proc.pid))
     return proc.pid
@@ -62,9 +70,33 @@ def _read_pid():
         return None
 
 
+def _pid_is_collector(pid):
+    """True if pid is alive and its cmdline looks like our collector.
+
+    Guards against pid reuse: a stale pid file could point at an unrelated
+    process that happens to have been assigned the same pid later.
+    """
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            cmdline = f.read()
+    except OSError:
+        return False
+    return b"collector.py" in cmdline
+
+
 def collector_running():
     pid = _read_pid()
     if pid is None:
+        return False
+    if _collector_proc is not None and _collector_proc.pid == pid:
+        # We own this child: poll() reaps it via waitpid(WNOHANG), so a dead
+        # child is correctly reported dead instead of showing up as a zombie
+        # under kill(pid, 0).
+        return _collector_proc.poll() is None
+    # Not our child (e.g. orphan pid file from a previous app run). An
+    # orphan gets reparented to init and reaped there, so kill(pid, 0)
+    # failing does mean dead. Guard against pid reuse before trusting it.
+    if not _pid_is_collector(pid):
         return False
     try:
         os.kill(pid, 0)
@@ -76,8 +108,18 @@ def collector_running():
 def stop_collector(timeout=5.0):
     """SIGTERM the collector's process group (lets it flush + send gc Stop),
     escalate to SIGKILL after timeout. Idempotent."""
+    global _collector_proc
     pid = _read_pid()
     if pid is None:
+        return
+    owned = _collector_proc is not None and _collector_proc.pid == pid
+    if not owned and not _pid_is_collector(pid):
+        # Stale pid file: pid is dead, or reused by an unrelated process.
+        try:
+            os.remove(COLLECTOR_PID)
+        except OSError:
+            pass
+        _collector_proc = None
         return
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
@@ -86,6 +128,11 @@ def stop_collector(timeout=5.0):
             break
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if owned:
+                try:
+                    os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    pass
             if not collector_running():
                 break
             time.sleep(0.1)
@@ -95,6 +142,7 @@ def stop_collector(timeout=5.0):
         os.remove(COLLECTOR_PID)
     except OSError:
         pass
+    _collector_proc = None
 
 
 def stop_all():

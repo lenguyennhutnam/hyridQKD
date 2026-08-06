@@ -15,6 +15,11 @@ def _pgrep(name):
                           stdout=subprocess.DEVNULL).returncode == 0
 
 
+def _pgrep_f(pattern):
+    return subprocess.run(["pgrep", "-f", pattern],
+                          stdout=subprocess.DEVNULL).returncode == 0
+
+
 @unittest.skipUnless(HAVE_BIN, "stack binaries not built (bash build.sh)")
 class TestStackLifecycle(unittest.TestCase):
     def tearDown(self):
@@ -43,6 +48,8 @@ class TestStackLifecycle(unittest.TestCase):
         stackctl.stop_all()
         time.sleep(1)
         self.assertFalse(stackctl.collector_running())
+        self.assertFalse(_pgrep_f("collector.py --csv"),
+                         "collector process survived stop_all")
 
     def test_stop_all_idempotent_when_nothing_runs(self):
         stackctl.stop_all()
