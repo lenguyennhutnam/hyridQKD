@@ -6,7 +6,6 @@ Layout (spec §6): left = env-param form + presets + Apply/Stop; right =
 line, log pane. Closing the window stops every child process.
 """
 
-import dataclasses
 import tkinter as tk
 from collections import deque
 from tkinter import ttk
@@ -134,6 +133,8 @@ class App(tk.Tk):
 
     def _apply(self):
         self.apply_btn.state(["disabled"])
+        self.status_var.set("applying...")
+        self.update_idletasks()
         try:
             self.backend.apply(self._read_env())
             for h in (self.hist_t, self.hist_qber, self.hist_rate,
@@ -146,26 +147,37 @@ class App(tk.Tk):
             self.apply_btn.state(["!disabled"])
 
     def _stop(self):
+        self.status_var.set("stopping...")
+        self.update_idletasks()
         self.backend.stop()
 
     def _poll(self):
-        snap = self.backend.refresh()
-        self.status_var.set("%s   QBER %.2f%%   keys %d   secret %s b"
-                            % (snap.status, 100 * snap.qber, snap.blocks,
-                               format(snap.secret_bits, ",")))
-        self.status_lbl.config(bg=STATUS_COLORS.get(snap.status, "#777"))
-        if snap.status == "streaming":
-            self.hist_t.append(snap.unix_time)
-            self.hist_qber.append(100 * snap.qber)
-            self.hist_rate.append(snap.sifted)
-            self.hist_secret.append(snap.secret_bits)
-            self._redraw()
-        self.log.config(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.insert("end", "\n".join(snap.log_lines))
-        self.log.see("end")
-        self.log.config(state="disabled")
-        self.after(POLL_MS, self._poll)
+        try:
+            snap = self.backend.refresh()
+            self.status_var.set("%s   QBER %.2f%%   keys %d   secret %s b"
+                                % (snap.status, 100 * snap.qber, snap.blocks,
+                                   format(snap.secret_bits, ",")))
+            self.status_lbl.config(bg=STATUS_COLORS.get(snap.status, "#777"))
+            if snap.status == "streaming":
+                self.hist_t.append(snap.unix_time)
+                self.hist_qber.append(100 * snap.qber)
+                self.hist_rate.append(snap.sifted)
+                self.hist_secret.append(snap.secret_bits)
+                self._redraw()
+            self.log.config(state="normal")
+            self.log.delete("1.0", "end")
+            self.log.insert("end", "\n".join(snap.log_lines))
+            self.log.see("end")
+            self.log.config(state="disabled")
+        except Exception as exc:
+            self.status_var.set("error: %s" % exc)
+            self.status_lbl.config(bg=STATUS_COLORS["error"])
+            self.log.config(state="normal")
+            self.log.delete("1.0", "end")
+            self.log.insert("end", "Poll error: %s" % exc)
+            self.log.config(state="disabled")
+        finally:
+            self.after(POLL_MS, self._poll)
 
     def _redraw(self):
         t0 = self.hist_t[0]
