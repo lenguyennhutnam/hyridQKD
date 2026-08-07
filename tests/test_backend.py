@@ -6,9 +6,33 @@ import unittest
 
 import backend as backend_mod
 from backend import Backend, Snapshot
+import channel as channel_mod
 
 HEADER = ("unix_time,window_s,clicks,sifted,errors,qber,n_sig,m_sig,"
           "n_dec,m_dec,total_sifted,blocks,block_progress,secret_bits\n")
+
+
+class _FakeEve:
+    def __init__(self, order):
+        self._order = order
+        self._active = False
+        self._f = 0.0
+
+    @property
+    def active(self):
+        return self._active
+
+    @property
+    def current_f(self):
+        return self._f
+
+    def stop(self):
+        self._order.append("eve_stop")
+        self._active = False
+
+    def start(self, f):
+        self._active = True
+        self._f = f
 
 
 class TestRefresh(unittest.TestCase):
@@ -22,10 +46,17 @@ class TestRefresh(unittest.TestCase):
         # no-op stop_all so stop() doesn't try to kill real processes
         self._orig_stop_all = backend_mod.stackctl.stop_all
         backend_mod.stackctl.stop_all = lambda: None
+        self._orig_apply = (backend_mod.stackctl.stop_all,
+                            backend_mod.stackctl.start_stack,
+                            backend_mod.stackctl.start_collector,
+                            backend_mod.configio.update_hw_sim_configs)
 
     def tearDown(self):
         backend_mod.stackctl.collector_running = self._orig
         backend_mod.stackctl.stop_all = self._orig_stop_all
+        (backend_mod.stackctl.stop_all, backend_mod.stackctl.start_stack,
+         backend_mod.stackctl.start_collector,
+         backend_mod.configio.update_hw_sim_configs) = self._orig_apply
         os.remove(self.csv)
 
     def _write_row(self, t, qber="0.0100"):
@@ -72,6 +103,26 @@ class TestRefresh(unittest.TestCase):
         self.b._started = True
         self.b.stop()
         self.assertEqual(self.b.refresh().status, "down")
+
+    def test_apply_stops_eve_first(self):
+        # apply() must stop Eve before restarting the stack (PIDs change).
+        order = []
+        self.b.eve = _FakeEve(order)
+        backend_mod.stackctl.stop_all = lambda: order.append("stop_all")
+        backend_mod.stackctl.start_stack = lambda *a, **k: order.append("start_stack")
+        backend_mod.stackctl.start_collector = lambda *a, **k: order.append("start_collector")
+        backend_mod.configio.update_hw_sim_configs = lambda *a, **k: order.append("cfg")
+        self.b.apply(channel_mod.EnvParams(), 1000)
+        self.assertLess(order.index("eve_stop"), order.index("start_stack"))
+
+    def test_refresh_reports_eve_state(self):
+        self.b.eve = _FakeEve([])
+        self.b.eve._active = True
+        self.b.eve._f = 0.3
+        backend_mod.stackctl.collector_running = lambda: False
+        snap = self.b.refresh()
+        self.assertTrue(snap.eve_active)
+        self.assertAlmostEqual(snap.eve_f, 0.3)
 
 
 if __name__ == "__main__":

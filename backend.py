@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 import channel
 import configio
+import evectl
 import stackctl
 
 STALE_S = 10.0  # newest CSV row older than this while running -> error
@@ -29,6 +30,8 @@ class Snapshot:
     block_progress: int = 0
     secret_bits: int = 0
     log_lines: list = field(default_factory=list)
+    eve_active: bool = False
+    eve_f: float = 0.0
 
 
 class Backend:
@@ -37,6 +40,7 @@ class Backend:
     def __init__(self, csv_path=None):
         self.csv_path = csv_path or os.path.join(stackctl.LOG_DIR, "live.csv")
         self._started = False
+        self.eve = evectl.EveController()
 
     def predict(self, env, n_z_block=10_000_000):
         """Forecast eta/qberr/key length without touching anything."""
@@ -49,10 +53,12 @@ class Backend:
         collector's --key-block-bits so the two provably agree on block size
         instead of relying on matching defaults in two separate modules.
         """
+        self.eve.stop()  # stack restart changes simulator PIDs; drop any jam first
         derived = self.predict(env, n_z_block)
         configio.update_hw_sim_configs(derived.eta, derived.e_avg,
                                        env.mu1, env.mu2, env.p1,
-                                       derived.pulse_distance)
+                                       derived.pulse_distance,
+                                       qber_sigma=env.qber_sigma)
         stackctl.stop_all()
         if os.path.exists(self.csv_path):
             os.remove(self.csv_path)  # fresh run, fresh CSV
@@ -71,8 +77,17 @@ class Backend:
 
     def stop(self):
         """Idempotent full stop (used by Stop button, atexit, window close)."""
+        self.eve.stop()
         stackctl.stop_all()
         self._started = False
+
+    def start_eve(self, f):
+        """Begin fractional jamming at fraction f (0..1)."""
+        self.eve.start(f)
+
+    def stop_eve(self):
+        """Stop jamming; leaves the simulator unjammed."""
+        self.eve.stop()
 
     def _last_row(self):
         try:
@@ -95,6 +110,8 @@ class Backend:
         row = self._last_row()
         running = stackctl.collector_running()
         snap = Snapshot(log_lines=self._log_tail())
+        snap.eve_active = self.eve.active
+        snap.eve_f = self.eve.current_f
         if row is None:
             snap.status = "starting" if running else "down"
             return snap
