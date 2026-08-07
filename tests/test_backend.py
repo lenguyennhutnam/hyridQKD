@@ -40,24 +40,27 @@ class TestRefresh(unittest.TestCase):
         fd, self.csv = tempfile.mkstemp(suffix=".csv")
         os.close(fd)
         self.b = Backend(csv_path=self.csv)
-        # collector "not running" by default
+        # Capture the REAL originals before any monkeypatching below, so
+        # tearDown always restores genuine functions -- not a lambda left
+        # over from an earlier line in this same setUp. Otherwise a later
+        # test module run via `discover` would inherit a stale stub.
         self._orig = backend_mod.stackctl.collector_running
-        backend_mod.stackctl.collector_running = lambda: False
-        # no-op stop_all so stop() doesn't try to kill real processes
-        self._orig_stop_all = backend_mod.stackctl.stop_all
-        backend_mod.stackctl.stop_all = lambda: None
         self._orig_apply = (backend_mod.stackctl.stop_all,
                             backend_mod.stackctl.start_stack,
                             backend_mod.stackctl.start_collector,
                             backend_mod.configio.update_hw_sim_configs)
+        # collector "not running" by default
+        backend_mod.stackctl.collector_running = lambda: False
+        # no-op stop_all so stop() doesn't try to kill real processes
+        backend_mod.stackctl.stop_all = lambda: None
 
     def tearDown(self):
         backend_mod.stackctl.collector_running = self._orig
-        backend_mod.stackctl.stop_all = self._orig_stop_all
         (backend_mod.stackctl.stop_all, backend_mod.stackctl.start_stack,
          backend_mod.stackctl.start_collector,
          backend_mod.configio.update_hw_sim_configs) = self._orig_apply
-        os.remove(self.csv)
+        if os.path.exists(self.csv):
+            os.remove(self.csv)
 
     def _write_row(self, t, qber="0.0100"):
         with open(self.csv, "a") as f:
