@@ -6,6 +6,7 @@ Layout (spec §6): left = env-param form + presets + Apply/Stop; right =
 line, log pane. Closing the window stops every child process.
 """
 
+import time
 import tkinter as tk
 from collections import deque
 from tkinter import ttk
@@ -31,6 +32,7 @@ FIELDS = [
     ("dead_us", "τ dead [µs]"), ("coeff", "dead-time coeff"),
     ("f_rep", "f_rep [Hz]"), ("mu1", "μ₁ (signal)"),
     ("mu2", "μ₂ (decoy)"), ("p1", "P(μ₁)"),
+    ("qber_sigma", "QBER jitter σ"),
 ]
 
 
@@ -81,10 +83,19 @@ class App(tk.Tk):
         self.apply_btn.grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=2)
         ttk.Button(left, text="Stop", command=self._stop).grid(
             row=row + 2, column=0, columnspan=2, sticky="ew")
+        # Eve controls: fraction input + toggle. NOT an EnvParams field; acts
+        # live (no stack restart), so it is separate from Apply.
+        ttk.Label(left, text="Eve f (0..1)").grid(row=row + 3, column=0, sticky="w")
+        self.eve_entry = ttk.Entry(left, width=12)
+        self.eve_entry.grid(row=row + 3, column=1, pady=1)
+        self.eve_entry.insert(0, "0.1")
+        self.eve_entry.bind("<KeyRelease>", lambda *_: self._schedule_forecast())
+        self.eve_btn = tk.Button(left, text="Eve: OFF", command=self._toggle_eve)
+        self.eve_btn.grid(row=row + 4, column=0, columnspan=2, sticky="ew", pady=2)
         self.forecast_var = tk.StringVar(value="forecast: -")
         self.forecast_lbl = ttk.Label(left, textvariable=self.forecast_var,
                                       wraplength=180, foreground="#333")
-        self.forecast_lbl.grid(row=row + 3, column=0, columnspan=2,
+        self.forecast_lbl.grid(row=row + 5, column=0, columnspan=2,
                                sticky="w", pady=6)
 
     # ---------------- right: plots + status + log ----------------
@@ -139,6 +150,21 @@ class App(tk.Tk):
             raise ValueError("block [bits] must be a positive integer")
         return n
 
+    def _read_eve_f(self):
+        f = float(self.eve_entry.get())
+        if not 0.0 <= f <= 1.0:
+            raise ValueError("Eve f must be in [0, 1]")
+        return f
+
+    def _toggle_eve(self):
+        try:
+            if self.backend.refresh().eve_active:
+                self.backend.stop_eve()
+            else:
+                self.backend.start_eve(self._read_eve_f())
+        except Exception as exc:
+            self.error_var.set("Eve toggle failed: %s" % exc)
+
     def _schedule_forecast(self):
         # Debounce keystrokes: recompute at most every 300 ms.
         if getattr(self, "_forecast_job", None):
@@ -154,10 +180,21 @@ class App(tk.Tk):
             return
         verdict = ("l~%s bits/block" % format(d.l_predict, ",")
                    if d.l_predict else "NO KEY (over decoy bound)")
-        self.forecast_var.set(
-            "forecast: η=%.3e  E=%.2f%%  rate~%.0f clicks/s  %s"
-            % (d.eta, 100 * d.e_avg, d.clicks_per_s, verdict))
-        # Spec §8: warn red when the forecast says the block will yield no key.
+        base_txt = ("forecast: η=%.3e  E=%.2f%%  rate~%.0f clicks/s  %s"
+                    % (d.eta, 100 * d.e_avg, d.clicks_per_s, verdict))
+        # Eve preview: E_eff at the entered f, vs the death threshold.
+        try:
+            from eve import effective_qber
+            f = self._read_eve_f()
+            e_eff = effective_qber(d.e_avg, f)
+            dead = self._death_qber if self._death_qber is not None \
+                else death_qber(self._read_env(), self._read_n_z_block())
+            eve_txt = "\nEve f=%.2f → E=%.1f%% → %s" % (
+                f, 100 * e_eff,
+                "NO KEY" if (dead is not None and e_eff >= dead) else "key ok")
+        except Exception:
+            eve_txt = ""
+        self.forecast_var.set(base_txt + eve_txt)
         self.forecast_lbl.config(
             foreground=STATUS_COLORS["error"] if d.l_predict == 0 else "#333")
 
@@ -203,6 +240,12 @@ class App(tk.Tk):
                    format(snap.block_progress, ","), format(self._n_z_block, ","),
                    format(snap.secret_bits, ",")))
             self.status_lbl.config(bg=STATUS_COLORS.get(snap.status, "#777"))
+            if snap.eve_active:
+                self.eve_btn.config(text="Eve: ON  f=%.2f" % snap.eve_f,
+                                    bg=STATUS_COLORS["error"], fg="white")
+            else:
+                self.eve_btn.config(text="Eve: OFF", bg="SystemButtonFace",
+                                    fg="black")
             if snap.status == "streaming":
                 self.hist_t.append(snap.unix_time)
                 self.hist_qber.append(100 * snap.qber)
@@ -233,6 +276,18 @@ class App(tk.Tk):
         if self._death_qber is not None:
             self.ax_qber.axhline(100 * self._death_qber, color="red",
                                  linestyle="--", linewidth=1)
+        # Shade intervals when Eve was ON (episodes are in unix time, same as
+        # hist_t). Open episodes (t_end==0) extend to the latest sample.
+        try:
+            now = self.hist_t[-1]
+            for ep in self.backend.eve.episodes():
+                end = ep.t_end if ep.t_end > 0 else now
+                x0, x1 = ep.t_start - t0, end - t0
+                if x1 >= xs[0] and x0 <= xs[-1]:
+                    self.ax_qber.axvspan(max(x0, xs[0]), min(x1, xs[-1]),
+                                         color="red", alpha=0.12)
+        except Exception:
+            pass
         self.ax_qber.set_ylabel("QBER %")
         self.ax_rate.clear()
         self.ax_rate.plot(xs, list(self.hist_rate))
