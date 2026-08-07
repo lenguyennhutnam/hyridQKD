@@ -57,6 +57,9 @@ class TestDerive(unittest.TestCase):
         d = derive(env)
         self.assertAlmostEqual(d.pulse_distance, 1.0 / 80e6, places=20)
 
+    def test_env_has_qber_sigma_default(self):
+        self.assertEqual(EnvParams().qber_sigma, 0.001)
+
 
 class TestDeathQber(unittest.TestCase):
     def test_death_qber_in_range_and_brackets_key_survival(self):

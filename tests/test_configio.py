@@ -60,6 +60,23 @@ class TestConfigIO(unittest.TestCase):
         self.assertTrue(os.path.exists(configio.DEFAULT_ALICE))
         self.assertTrue(os.path.exists(configio.DEFAULT_BOB))
 
+    def test_gaussian_qberr_written_when_sigma_positive(self):
+        configio.update_hw_sim_configs(0.0123, 0.0456, 0.29, 0.103, 0.62,
+                                       1.25e-8, qber_sigma=0.002,
+                                       alice_path=self.alice, bob_path=self.bob)
+        for p in (self.alice, self.bob):
+            q = configio.read_config(p)["backend_config"]["qberr"]
+            self.assertEqual(q, {"type": "Gaussian", "mean": 0.0456,
+                                 "std_dev": 0.002})
+
+    def test_fixed_qberr_when_sigma_zero(self):
+        configio.update_hw_sim_configs(0.0123, 0.0456, 0.29, 0.103, 0.62,
+                                       1.25e-8, qber_sigma=0.0,
+                                       alice_path=self.alice, bob_path=self.bob)
+        for p in (self.alice, self.bob):
+            q = configio.read_config(p)["backend_config"]["qberr"]
+            self.assertEqual(q, 0.0456)
+
 
 if __name__ == "__main__":
     unittest.main()

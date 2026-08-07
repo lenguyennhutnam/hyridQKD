@@ -38,6 +38,7 @@ class EnvParams:
     mu1: float = 0.29          # signal intensity
     mu2: float = 0.103         # decoy intensity
     p1: float = 0.62           # P(signal)
+    qber_sigma: float = 0.001  # Gaussian jitter std_dev on qberr (0 = fixed)
 
 
 @dataclass

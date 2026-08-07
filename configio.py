@@ -41,34 +41,37 @@ def check_matched(alice_cfg, bob_cfg):
 
 
 def update_hw_sim_configs(eta, qberr, mu1, mu2, p1, pulse_distance,
-                          alice_path=DEFAULT_ALICE, bob_path=DEFAULT_BOB):
+                          qber_sigma=0.0, alice_path=DEFAULT_ALICE,
+                          bob_path=DEFAULT_BOB):
     """Write eta/qberr/decoy_states/pulse_distance into BOTH configs, preserving
     other fields.
+
+    When qber_sigma > 0, qberr is written as a Gaussian distribution
+    {"type": "Gaussian", "mean": qberr, "std_dev": qber_sigma} so hw_sim's
+    per-batch QBER oscillates naturally (see qkd_1decoy_analysis note and
+    hw_sim/configs/src/backend/mod.rs). qber_sigma == 0 keeps the plain-float
+    form for backward compatibility.
 
     pulse_distance affects rate limiting on both sides, so both sides get the
     identical value, same as eta/qberr/decoy_states.
 
     Validates in-memory before writing to prevent partial updates on error.
     """
-    # Read both configs first
+    qberr_value = qberr
+    if qber_sigma > 0:
+        qberr_value = {"type": "Gaussian", "mean": qberr, "std_dev": qber_sigma}
+
     alice_cfg = read_config(alice_path)
     bob_cfg = read_config(bob_path)
 
-    # Apply updates in memory
-    alice_cfg["backend_config"]["eta"] = eta
-    alice_cfg["backend_config"]["qberr"] = qberr
-    alice_cfg["backend_config"]["decoy_states"] = {"mu1": mu1, "mu2": mu2, "p1": p1}
-    alice_cfg["backend_config"]["pulse_distance"] = pulse_distance
+    for cfg in (alice_cfg, bob_cfg):
+        cfg["backend_config"]["eta"] = eta
+        cfg["backend_config"]["qberr"] = qberr_value
+        cfg["backend_config"]["decoy_states"] = {"mu1": mu1, "mu2": mu2, "p1": p1}
+        cfg["backend_config"]["pulse_distance"] = pulse_distance
 
-    bob_cfg["backend_config"]["eta"] = eta
-    bob_cfg["backend_config"]["qberr"] = qberr
-    bob_cfg["backend_config"]["decoy_states"] = {"mu1": mu1, "mu2": mu2, "p1": p1}
-    bob_cfg["backend_config"]["pulse_distance"] = pulse_distance
-
-    # Validate in memory before writing (fail-safe)
     check_matched(alice_cfg, bob_cfg)
 
-    # Write both files only after validation passes
     for path, cfg in [(alice_path, alice_cfg), (bob_path, bob_cfg)]:
         with open(path, "w") as f:
             json.dump(cfg, f, indent=2)
