@@ -19,9 +19,13 @@ class TestRefresh(unittest.TestCase):
         # collector "not running" by default
         self._orig = backend_mod.stackctl.collector_running
         backend_mod.stackctl.collector_running = lambda: False
+        # no-op stop_all so stop() doesn't try to kill real processes
+        self._orig_stop_all = backend_mod.stackctl.stop_all
+        backend_mod.stackctl.stop_all = lambda: None
 
     def tearDown(self):
         backend_mod.stackctl.collector_running = self._orig
+        backend_mod.stackctl.stop_all = self._orig_stop_all
         os.remove(self.csv)
 
     def _write_row(self, t, qber="0.0100"):
@@ -54,8 +58,20 @@ class TestRefresh(unittest.TestCase):
         self.assertEqual(self.b.refresh().status, "error")
 
     def test_error_when_collector_died_after_rows(self):
+        # Scenario: we started the collector and it died unexpectedly
+        # (not a deliberate Stop) -> should still be "error".
+        self.b._started = True
         self._write_row(time.time())
         self.assertEqual(self.b.refresh().status, "error")
+
+    def test_down_after_deliberate_stop(self):
+        # Scenario: user presses Stop. Rows from the run are still on disk
+        # (only apply() clears the CSV), but this was a clean, deliberate
+        # shutdown -> should read as "down", not "error".
+        self._write_row(time.time())
+        self.b._started = True
+        self.b.stop()
+        self.assertEqual(self.b.refresh().status, "down")
 
 
 if __name__ == "__main__":

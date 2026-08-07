@@ -101,6 +101,9 @@ class Backend:
             snap.status = "streaming"
         elif running:
             snap.status = "error"      # collector alive but stream stalled
+        elif self._started:
+            snap.status = "error"      # we started it and it died on its own
         else:
-            snap.status = "error"      # rows exist but collector died
+            snap.status = "down"       # deliberately stopped (or never started
+                                        # by this instance, e.g. stale live.csv)
         return snap
