@@ -6,7 +6,6 @@ Layout (spec §6): left = env-param form + presets + Apply/Stop; right =
 line, log pane. Closing the window stops every child process.
 """
 
-import time
 import tkinter as tk
 from collections import deque
 from tkinter import ttk
@@ -92,6 +91,10 @@ class App(tk.Tk):
         self.eve_entry.bind("<KeyRelease>", lambda *_: self._schedule_forecast())
         self.eve_btn = tk.Button(left, text="Eve: OFF", command=self._toggle_eve)
         self.eve_btn.grid(row=row + 4, column=0, columnspan=2, sticky="ew", pady=2)
+        # Capture the platform default colors once so the OFF branch in
+        # _poll() can restore them instead of hardcoding a Windows-only
+        # name like "SystemButtonFace" (this app runs on Linux/X11 via WSLg).
+        self._eve_btn_defaults = (self.eve_btn.cget("bg"), self.eve_btn.cget("fg"))
         self.forecast_var = tk.StringVar(value="forecast: -")
         self.forecast_lbl = ttk.Label(left, textvariable=self.forecast_var,
                                       wraplength=180, foreground="#333")
@@ -158,7 +161,7 @@ class App(tk.Tk):
 
     def _toggle_eve(self):
         try:
-            if self.backend.refresh().eve_active:
+            if self.backend.eve.active:
                 self.backend.stop_eve()
             else:
                 self.backend.start_eve(self._read_eve_f())
@@ -244,8 +247,9 @@ class App(tk.Tk):
                 self.eve_btn.config(text="Eve: ON  f=%.2f" % snap.eve_f,
                                     bg=STATUS_COLORS["error"], fg="white")
             else:
-                self.eve_btn.config(text="Eve: OFF", bg="SystemButtonFace",
-                                    fg="black")
+                self.eve_btn.config(text="Eve: OFF",
+                                    bg=self._eve_btn_defaults[0],
+                                    fg=self._eve_btn_defaults[1])
             if snap.status == "streaming":
                 self.hist_t.append(snap.unix_time)
                 self.hist_qber.append(100 * snap.qber)
