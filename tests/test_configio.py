@@ -22,6 +22,7 @@ class TestConfigIO(unittest.TestCase):
     def test_update_writes_both_sides_and_preserves_rest(self):
         before = configio.read_config(self.alice)
         configio.update_hw_sim_configs(0.0123, 0.0456, 0.29, 0.103, 0.62,
+                                       1.25e-8,
                                        alice_path=self.alice, bob_path=self.bob)
         for p in (self.alice, self.bob):
             cfg = configio.read_config(p)
@@ -29,6 +30,7 @@ class TestConfigIO(unittest.TestCase):
             self.assertEqual(cfg["backend_config"]["qberr"], 0.0456)
             self.assertEqual(cfg["backend_config"]["decoy_states"],
                              {"mu1": 0.29, "mu2": 0.103, "p1": 0.62})
+            self.assertEqual(cfg["backend_config"]["pulse_distance"], 1.25e-8)
         after = configio.read_config(self.alice)
         self.assertEqual(before["backend_config"]["seed"],
                          after["backend_config"]["seed"])
@@ -46,7 +48,7 @@ class TestConfigIO(unittest.TestCase):
         bob_before = configio.read_config(self.bob)
         # Attempt update should fail and raise ValueError
         with self.assertRaises(ValueError):
-            configio.update_hw_sim_configs(0.1, 0.05, 0.5, 0.1, 0.7,
+            configio.update_hw_sim_configs(0.1, 0.05, 0.5, 0.1, 0.7, 1e-8,
                                            alice_path=self.alice, bob_path=self.bob)
         # Verify both files are unchanged on disk after the error
         alice_after = configio.read_config(self.alice)

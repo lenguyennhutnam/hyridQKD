@@ -7,7 +7,6 @@ import csv
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 import channel
 import configio
@@ -43,18 +42,29 @@ class Backend:
         """Forecast eta/qberr/key length without touching anything."""
         return channel.derive(env, n_z_block)
 
-    def apply(self, env):
-        """Write configs from env, restart stack + collector. Returns forecast."""
-        derived = self.predict(env)
+    def apply(self, env, n_z_block=10_000_000):
+        """Write configs from env, restart stack + collector. Returns forecast.
+
+        n_z_block is threaded into both the forecast (predict) and the
+        collector's --key-block-bits so the two provably agree on block size
+        instead of relying on matching defaults in two separate modules.
+        """
+        derived = self.predict(env, n_z_block)
         configio.update_hw_sim_configs(derived.eta, derived.e_avg,
-                                       env.mu1, env.mu2, env.p1)
+                                       env.mu1, env.mu2, env.p1,
+                                       derived.pulse_distance)
         stackctl.stop_all()
         if os.path.exists(self.csv_path):
             os.remove(self.csv_path)  # fresh run, fresh CSV
+        # Truncate the log tail too, so the log pane doesn't show the
+        # previous run's output after a restart.
+        os.makedirs(stackctl.LOG_DIR, exist_ok=True)
+        open(os.path.join(stackctl.LOG_DIR, "collector.log"), "w").close()
         stackctl.start_stack()
         stackctl.start_collector(self.csv_path, [
             "--mu1", str(env.mu1), "--mu2", str(env.mu2),
             "--p1", str(env.p1), "--eta", str(derived.eta),
+            "--key-block-bits", str(n_z_block),
         ])
         self._started = True
         return derived

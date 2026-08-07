@@ -1,4 +1,9 @@
-"""Integration tests for stack/collector lifecycle. Skipped if bin/ is missing."""
+"""Integration tests for stack/collector lifecycle. Skipped if bin/ is missing.
+
+WARNING: running this module calls stackctl.stop_all(), which kills any qline
+stack / collector the user currently has running (e.g. from the GUI or a
+manual run_stack.sh). Don't run it while relying on a live stack elsewhere.
+"""
 import os
 import subprocess
 import time

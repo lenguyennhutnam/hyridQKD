@@ -40,9 +40,13 @@ def check_matched(alice_cfg, bob_cfg):
                          % (a.get("decoy_states"), b.get("decoy_states")))
 
 
-def update_hw_sim_configs(eta, qberr, mu1, mu2, p1,
+def update_hw_sim_configs(eta, qberr, mu1, mu2, p1, pulse_distance,
                           alice_path=DEFAULT_ALICE, bob_path=DEFAULT_BOB):
-    """Write eta/qberr/decoy_states into BOTH configs, preserving other fields.
+    """Write eta/qberr/decoy_states/pulse_distance into BOTH configs, preserving
+    other fields.
+
+    pulse_distance affects rate limiting on both sides, so both sides get the
+    identical value, same as eta/qberr/decoy_states.
 
     Validates in-memory before writing to prevent partial updates on error.
     """
@@ -54,10 +58,12 @@ def update_hw_sim_configs(eta, qberr, mu1, mu2, p1,
     alice_cfg["backend_config"]["eta"] = eta
     alice_cfg["backend_config"]["qberr"] = qberr
     alice_cfg["backend_config"]["decoy_states"] = {"mu1": mu1, "mu2": mu2, "p1": p1}
+    alice_cfg["backend_config"]["pulse_distance"] = pulse_distance
 
     bob_cfg["backend_config"]["eta"] = eta
     bob_cfg["backend_config"]["qberr"] = qberr
     bob_cfg["backend_config"]["decoy_states"] = {"mu1": mu1, "mu2": mu2, "p1": p1}
+    bob_cfg["backend_config"]["pulse_distance"] = pulse_distance
 
     # Validate in memory before writing (fail-safe)
     check_matched(alice_cfg, bob_cfg)

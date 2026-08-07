@@ -15,7 +15,7 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 
-from channel import EnvParams  # noqa: E402
+from channel import EnvParams, death_qber  # noqa: E402
 from presets import load_presets  # noqa: E402
 
 POLL_MS = 2000
@@ -44,6 +44,8 @@ class App(tk.Tk):
         self.hist_qber = deque(maxlen=HISTORY)
         self.hist_rate = deque(maxlen=HISTORY)
         self.hist_secret = deque(maxlen=HISTORY)
+        self._death_qber = None  # set once per Apply (expensive), see _apply()
+        self._n_z_block = 10_000_000  # block size in effect, for the status line
         self._build_left()
         self._build_right()
         self._load_preset("aurea")
@@ -72,9 +74,10 @@ class App(tk.Tk):
         ttk.Button(left, text="Stop", command=self._stop).grid(
             row=row + 2, column=0, columnspan=2, sticky="ew")
         self.forecast_var = tk.StringVar(value="forecast: -")
-        ttk.Label(left, textvariable=self.forecast_var, wraplength=180,
-                  foreground="#333").grid(row=row + 3, column=0, columnspan=2,
-                                          sticky="w", pady=6)
+        self.forecast_lbl = ttk.Label(left, textvariable=self.forecast_var,
+                                      wraplength=180, foreground="#333")
+        self.forecast_lbl.grid(row=row + 3, column=0, columnspan=2,
+                               sticky="w", pady=6)
 
     # ---------------- right: plots + status + log ----------------
     def _build_right(self):
@@ -94,6 +97,15 @@ class App(tk.Tk):
                                    fg="white", bg=STATUS_COLORS["down"],
                                    font=("TkDefaultFont", 11, "bold"))
         self.status_lbl.pack(fill="x", pady=3)
+        # Sticky error area: set by _apply()/_stop() on exception and by
+        # _poll()'s except branch; _poll() never touches it on the normal
+        # path, so an Apply failure stays visible instead of being
+        # overwritten by the next 2 s poll tick.
+        self.error_var = tk.StringVar(value="")
+        self.error_lbl = tk.Label(right, textvariable=self.error_var,
+                                  fg=STATUS_COLORS["error"], anchor="w",
+                                  wraplength=500, justify="left")
+        self.error_lbl.pack(fill="x")
         self.log = tk.Text(right, height=8, state="disabled",
                            font=("TkFixedFont", 8))
         self.log.pack(fill="x")
@@ -130,18 +142,27 @@ class App(tk.Tk):
         self.forecast_var.set(
             "forecast: eta=%.3e  E=%.2f%%  rate~%.0f clicks/s  %s"
             % (d.eta, 100 * d.e_avg, d.clicks_per_s, verdict))
+        # Spec §8: warn red when the forecast says the block will yield no key.
+        self.forecast_lbl.config(
+            foreground=STATUS_COLORS["error"] if d.l_predict == 0 else "#333")
 
     def _apply(self):
         self.apply_btn.state(["disabled"])
         self.status_var.set("applying...")
+        self.error_var.set("")
         self.update_idletasks()
         try:
-            self.backend.apply(self._read_env())
+            env = self._read_env()
+            self.backend.apply(env, self._n_z_block)
+            # Expensive (~25 finite-key evaluations) -- computed once here,
+            # never from the per-keystroke _forecast().
+            self._death_qber = death_qber(env, self._n_z_block)
             for h in (self.hist_t, self.hist_qber, self.hist_rate,
                       self.hist_secret):
                 h.clear()
         except Exception as exc:
-            self.status_var.set("error: %s" % exc)
+            self.status_var.set("error")
+            self.error_var.set("Apply failed: %s" % exc)
             self.status_lbl.config(bg=STATUS_COLORS["error"])
         finally:
             self.apply_btn.state(["!disabled"])
@@ -149,14 +170,21 @@ class App(tk.Tk):
     def _stop(self):
         self.status_var.set("stopping...")
         self.update_idletasks()
-        self.backend.stop()
+        try:
+            self.backend.stop()
+        except Exception as exc:
+            self.status_var.set("error")
+            self.error_var.set("Stop failed: %s" % exc)
+            self.status_lbl.config(bg=STATUS_COLORS["error"])
 
     def _poll(self):
         try:
             snap = self.backend.refresh()
-            self.status_var.set("%s   QBER %.2f%%   keys %d   secret %s b"
-                                % (snap.status, 100 * snap.qber, snap.blocks,
-                                   format(snap.secret_bits, ",")))
+            self.status_var.set(
+                "%s   QBER %.2f%%   keys %d   block %s/%s   secret %s b"
+                % (snap.status, 100 * snap.qber, snap.blocks,
+                   format(snap.block_progress, ","), format(self._n_z_block, ","),
+                   format(snap.secret_bits, ",")))
             self.status_lbl.config(bg=STATUS_COLORS.get(snap.status, "#777"))
             if snap.status == "streaming":
                 self.hist_t.append(snap.unix_time)
@@ -170,7 +198,8 @@ class App(tk.Tk):
             self.log.see("end")
             self.log.config(state="disabled")
         except Exception as exc:
-            self.status_var.set("error: %s" % exc)
+            self.status_var.set("error")
+            self.error_var.set("Poll failed: %s" % exc)
             self.status_lbl.config(bg=STATUS_COLORS["error"])
             self.log.config(state="normal")
             self.log.delete("1.0", "end")
@@ -184,6 +213,9 @@ class App(tk.Tk):
         xs = [t - t0 for t in self.hist_t]
         self.ax_qber.clear()
         self.ax_qber.plot(xs, list(self.hist_qber))
+        if self._death_qber is not None:
+            self.ax_qber.axhline(100 * self._death_qber, color="red",
+                                 linestyle="--", linewidth=1)
         self.ax_qber.set_ylabel("QBER %")
         self.ax_rate.clear()
         self.ax_rate.plot(xs, list(self.hist_rate))

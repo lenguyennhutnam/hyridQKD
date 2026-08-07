@@ -1,8 +1,8 @@
 """Tests for channel.py against DecoyState-sourced formulas."""
-import math
+import dataclasses
 import unittest
 
-from channel import EnvParams, derive
+from channel import EnvParams, death_qber, derive
 
 
 class TestDerive(unittest.TestCase):
@@ -42,6 +42,46 @@ class TestDerive(unittest.TestCase):
         d = derive(EnvParams())
         self.assertGreater(d.clicks_per_s, 0)
         self.assertLess(d.clicks_per_s, 80e6)
+
+    def test_clicks_per_s_matches_hw_sim_rate_model(self):
+        # hw_sim's actual stream rate: effective_eta * f_rep, where
+        # effective_eta = p1*(1-exp(-mu1*eta)) + (1-p1)*(1-exp(-mu2*eta))
+        # = d_avg - pdc. No dead-time (cdt) factor -- hw_sim has none.
+        env = EnvParams()
+        d = derive(env)
+        self.assertAlmostEqual(d.clicks_per_s, (d.d_avg - env.pdc) * env.f_rep,
+                               places=6)
+
+    def test_pulse_distance_is_inverse_of_f_rep(self):
+        env = EnvParams(f_rep=80e6)
+        d = derive(env)
+        self.assertAlmostEqual(d.pulse_distance, 1.0 / 80e6, places=20)
+
+
+class TestDeathQber(unittest.TestCase):
+    def test_death_qber_in_range_and_brackets_key_survival(self):
+        env = EnvParams()
+        q = death_qber(env)
+        self.assertGreater(q, 0.0)
+        self.assertLess(q, 0.15)
+
+        from keyrate import KeyParams, secret_key_length
+        eta = 10 ** (-(env.alpha * env.d_km + env.odr_losses) / 10) * env.eta_bob
+        params = KeyParams(mu1=env.mu1, mu2=env.mu2, p1=env.p1, eta=eta,
+                           pdc=env.pdc)
+        self.assertGreater(secret_key_length(10_000_000, q - 0.005, params), 0)
+        self.assertEqual(secret_key_length(10_000_000, q + 0.005, params), 0)
+
+
+class TestGuiFieldsCoverage(unittest.TestCase):
+    def test_gui_fields_match_env_params(self):
+        try:
+            import gui
+        except ImportError:
+            self.skipTest("matplotlib/tkinter not available")
+        field_names = {f for f, _ in gui.FIELDS}
+        env_field_names = {f.name for f in dataclasses.fields(EnvParams)}
+        self.assertEqual(field_names, env_field_names)
 
 
 if __name__ == "__main__":

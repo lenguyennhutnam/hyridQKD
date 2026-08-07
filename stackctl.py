@@ -28,8 +28,15 @@ def _ensure_dirs():
     os.makedirs(PID_DIR, exist_ok=True)
 
 
-def start_stack(mode="decoy"):
-    """Run run_stack.sh (blocks a few seconds); raise if it fails."""
+def start_stack(mode="decoy", health_timeout=3.0):
+    """Run run_stack.sh (blocks a few seconds); raise if it fails.
+
+    run_stack.sh backgrounds all 5 binaries and always exits 0 (it never waits
+    on them), so a dead simulator would otherwise surface only as a confusing
+    starting->error transition later. Poll for a live simulator process for up
+    to health_timeout seconds and raise here instead, naming the log that
+    explains why (e.g. a bad hw_sim config).
+    """
     _ensure_dirs()
     env = dict(os.environ, MODE=mode)
     with open(os.path.join(LOG_DIR, "run_stack.log"), "ab") as log:
@@ -38,6 +45,14 @@ def start_stack(mode="decoy"):
                              stderr=subprocess.STDOUT).returncode
     if ret != 0:
         raise RuntimeError("run_stack.sh failed (exit %d), see logs/run_stack.log" % ret)
+
+    deadline = time.time() + health_timeout
+    while time.time() < deadline:
+        if stack_running():
+            return
+        time.sleep(0.1)
+    raise RuntimeError("qline stack did not come up (no simulator process "
+                       "after %.1fs), see logs/hwsim_bob.log" % health_timeout)
 
 
 def stack_running():
