@@ -25,12 +25,12 @@ STATUS_COLORS = {"down": "#9e9e9e", "starting": "#f0ad4e",
 
 # (field, label) in display order; must match EnvParams field names.
 FIELDS = [
-    ("d_km", "distance d [km]"), ("alpha", "alpha [dB/km]"),
-    ("odr_losses", "optics losses [dB]"), ("eta_bob", "detector eff."),
-    ("pdc", "dark count pdc"), ("e_det", "optical error e_det"),
-    ("dead_us", "dead time [us]"), ("coeff", "dead-time coeff"),
-    ("f_rep", "rep. rate [Hz]"), ("mu1", "mu1 (signal)"),
-    ("mu2", "mu2 (decoy)"), ("p1", "P(signal)"),
+    ("d_km", "d [km]"), ("alpha", "α [dB/km]"),
+    ("odr_losses", "optics losses [dB]"), ("eta_bob", "η detector"),
+    ("pdc", "p_dc (dark count)"), ("e_det", "e_det (optical err)"),
+    ("dead_us", "τ dead [µs]"), ("coeff", "dead-time coeff"),
+    ("f_rep", "f_rep [Hz]"), ("mu1", "μ₁ (signal)"),
+    ("mu2", "μ₂ (decoy)"), ("p1", "P(μ₁)"),
 ]
 
 
@@ -63,6 +63,14 @@ class App(tk.Tk):
             e.bind("<KeyRelease>", lambda *_: self._schedule_forecast())
             self.entries[field] = e
         row = len(FIELDS)
+        # Block size (n_z) is not an EnvParams field -- kept separate from
+        # FIELDS/entries so it stays out of the FIELDS<->EnvParams invariant.
+        ttk.Label(left, text="block [bits]").grid(row=row, column=0, sticky="w")
+        self.block_entry = ttk.Entry(left, width=12)
+        self.block_entry.grid(row=row, column=1, pady=1)
+        self.block_entry.insert(0, "10000000")
+        self.block_entry.bind("<KeyRelease>", lambda *_: self._schedule_forecast())
+        row += 1
         ttk.Label(left, text="preset").grid(row=row, column=0, sticky="w")
         self.preset_box = ttk.Combobox(left, values=list(load_presets()),
                                        state="readonly", width=11)
@@ -124,6 +132,13 @@ class App(tk.Tk):
             kwargs[field] = float(self.entries[field].get())
         return EnvParams(**kwargs)
 
+    def _read_n_z_block(self):
+        # int(float(...)) so scientific-notation input like "1e7" also works.
+        n = int(float(self.block_entry.get()))
+        if n <= 0:
+            raise ValueError("block [bits] must be a positive integer")
+        return n
+
     def _schedule_forecast(self):
         # Debounce keystrokes: recompute at most every 300 ms.
         if getattr(self, "_forecast_job", None):
@@ -133,14 +148,14 @@ class App(tk.Tk):
     def _forecast(self):
         self._forecast_job = None
         try:
-            d = self.backend.predict(self._read_env())
+            d = self.backend.predict(self._read_env(), self._read_n_z_block())
         except Exception as exc:  # bad input or broken bound: show, don't crash
             self.forecast_var.set("forecast: ERROR %s" % exc)
             return
         verdict = ("l~%s bits/block" % format(d.l_predict, ",")
                    if d.l_predict else "NO KEY (over decoy bound)")
         self.forecast_var.set(
-            "forecast: eta=%.3e  E=%.2f%%  rate~%.0f clicks/s  %s"
+            "forecast: η=%.3e  E=%.2f%%  rate~%.0f clicks/s  %s"
             % (d.eta, 100 * d.e_avg, d.clicks_per_s, verdict))
         # Spec §8: warn red when the forecast says the block will yield no key.
         self.forecast_lbl.config(
@@ -153,7 +168,9 @@ class App(tk.Tk):
         self.update_idletasks()
         try:
             env = self._read_env()
-            self.backend.apply(env, self._n_z_block)
+            n_z_block = self._read_n_z_block()
+            self.backend.apply(env, n_z_block)
+            self._n_z_block = n_z_block
             # Expensive (~25 finite-key evaluations) -- computed once here,
             # never from the per-keystroke _forecast().
             self._death_qber = death_qber(env, self._n_z_block)
