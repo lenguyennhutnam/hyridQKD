@@ -9,11 +9,29 @@ row spans ~20 periods, so the row-averaged QBER lands on eve.effective_qber(f).
 
 The controller owns a daemon thread. stop() always leaves the simulator UNjammed
 (a final SIGUSR2) and joins the thread, so no jam state or stray timer survives.
+
+Concurrency notes:
+- Each duty-cycle thread gets its OWN threading.Event (created in start() and
+  passed into _run as an argument), instead of sharing one Event on self. This
+  means a thread that fails to join within the timeout (e.g. because
+  signal_sender is slow/blocked) is waiting on an Event nobody else touches
+  anymore: a later start() creates a brand-new Event for the new thread, so it
+  can never accidentally "resurrect" the stale thread by clearing a shared
+  flag it's still waiting on.
+- Each thread also receives its `f` as an argument rather than reading
+  self._f, so it is fully independent of self._f once started; self._f is
+  purely a status field for current_f() and can be safely written under the
+  lock without racing the thread's behaviour.
+- All mutation of self._f / self._thread / self._stop_evt is done while
+  holding self._lock (blocking calls like Event.set()/thread.join() are done
+  OUTSIDE the lock, using locally-captured references, so slow joins never
+  block other callers of active()/current_f()/episodes()).
 """
 
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -32,7 +50,7 @@ class Episode:
 def _default_sender(sig):
     """Send `sig` to every running simulator process (both Alice and Bob)."""
     out = subprocess.run(["pgrep", "-x", "simulator"],
-                         stdout=subprocess.PIPE).stdout.decode()
+                         stdout=subprocess.PIPE, timeout=2.0).stdout.decode()
     for pid in out.split():
         try:
             os.kill(int(pid), sig)
@@ -48,18 +66,21 @@ class EveController:
         self.period_s = period_s
         self.csv_path = csv_path or DEFAULT_CSV
         self._thread = None
-        self._stop_evt = threading.Event()
+        self._stop_evt = None      # this thread's OWN Event, or None if idle
+        self._zombies = []         # threads that didn't join within timeout
         self._f = 0.0
         self._lock = threading.Lock()
         self._episodes = []        # list[Episode]; last may be open (t_end 0)
 
     @property
     def active(self):
-        return self._thread is not None and self._thread.is_alive()
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
 
     @property
     def current_f(self):
-        return self._f
+        with self._lock:
+            return self._f
 
     def episodes(self):
         with self._lock:
@@ -70,34 +91,57 @@ class EveController:
         # Validate through eve.EveParams-equivalent range check.
         if not 0.0 <= f <= 1.0:
             raise ValueError("jamming fraction f must be in [0, 1], got %r" % f)
-        if self.active:
-            # Adjust in place: close the old episode, open a new one at new f.
-            self._close_episode()
-        self._f = f
+        # Always close out whatever's currently running first (no-op if idle).
+        # This also avoids a check-then-act race on `active`.
+        self._close_episode()
+        stop_evt = threading.Event()
+        thread = threading.Thread(target=self._run, args=(f, stop_evt),
+                                  daemon=True)
         with self._lock:
+            self._f = f
+            self._stop_evt = stop_evt
+            self._thread = thread
             self._episodes.append(Episode(time.time(), 0.0, f))
-        self._stop_evt.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        thread.start()
 
-    def _run(self):
-        on = self.period_s * self._f
+    def _run(self, f, stop_evt):
+        """Duty-cycle loop for one episode. Reads only its own args, never
+        shared mutable controller state, so it can't be disturbed by a
+        concurrent start()/stop() touching self._f or self._stop_evt."""
+        on = self.period_s * f
         off = self.period_s - on
-        while not self._stop_evt.is_set():
+        while not stop_evt.is_set():
             if on > 0:
                 self._send(signal.SIGUSR1)
-                if self._stop_evt.wait(on):
+                if stop_evt.wait(on):
                     break
             if off > 0:
                 self._send(signal.SIGUSR2)
-                if self._stop_evt.wait(off):
+                if stop_evt.wait(off):
                     break
 
     def _close_episode(self):
-        self._stop_evt.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-        self._thread = None
+        with self._lock:
+            thread = self._thread
+            stop_evt = self._stop_evt
+            self._thread = None
+            self._stop_evt = None
+        if stop_evt is not None:
+            stop_evt.set()
+        if thread is not None:
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                # The thread is still running (e.g. blocked in a slow
+                # signal_sender). It owns its own Event, already set, so it
+                # will exit as soon as its current send/wait returns -- it
+                # just won't be reflected in self._thread anymore. Keep a
+                # reference instead of silently dropping it.
+                with self._lock:
+                    self._zombies.append(thread)
+                print("evectl: warning: duty-cycle thread did not join within "
+                     "2.0s timeout; it will keep exiting on its own private "
+                     "stop event and will not affect future start()/stop() "
+                     "calls", file=sys.stderr)
         with self._lock:
             if self._episodes and self._episodes[-1].t_end == 0.0:
                 ep = self._episodes[-1]
@@ -110,7 +154,8 @@ class EveController:
         self._close_episode()
         # Always end in the clean state, even if we were never active (harmless).
         self._send(signal.SIGUSR2)
-        self._f = 0.0
+        with self._lock:
+            self._f = 0.0
         return was_active
 
     def _append_csv(self, ep):
