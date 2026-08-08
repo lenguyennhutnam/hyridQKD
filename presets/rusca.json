@@ -1,0 +1,6 @@
+{
+    "d_km": 0.0, "alpha": 0.2, "odr_losses": 0.0, "eta_bob": 0.5,
+    "pdc": 1e-08, "e_det": 0.01, "dead_us": 0.1, "coeff": 1.0,
+    "f_rep": 1000000000.0, "mu1": 0.5, "mu2": 0.1, "p1": 0.5,
+    "qber_sigma": 0.001
+}
