@@ -47,22 +47,57 @@ class Episode:
     f: float
 
 
-def _default_sender(sig):
-    """Send `sig` to every running simulator process (both Alice and Bob)."""
-    out = subprocess.run(["pgrep", "-x", "simulator"],
-                         stdout=subprocess.PIPE, timeout=2.0).stdout.decode()
-    for pid in out.split():
+def _resolve_sim_pids():
+    """Resolve the PIDs of every running `simulator` process (Alice + Bob),
+    once. Best-effort: returns [] on pgrep failure or no match, rather than
+    raising, so a caller's subsequent sends just become no-ops."""
+    try:
+        out = subprocess.run(["pgrep", "-x", "simulator"],
+                             stdout=subprocess.PIPE, timeout=2.0).stdout.decode()
+    except (subprocess.SubprocessError, OSError):
+        return []
+    pids = []
+    for tok in out.split():
         try:
-            os.kill(int(pid), sig)
+            pids.append(int(tok))
+        except ValueError:
+            pass
+    return pids
+
+
+def _send_to_pids(sig, pids):
+    """Send `sig` to each of `pids`, ignoring ones that are already gone."""
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
         except (ProcessLookupError, ValueError):
             pass
+
+
+def _make_pid_sender(pids):
+    """Bind a fixed PID list into a `sender(sig)` callable."""
+    def _send(sig):
+        _send_to_pids(sig, pids)
+    return _send
+
+
+def _default_sender(sig):
+    """Send `sig` to every running simulator process, resolving PIDs fresh on
+    every call. Kept as a simple, self-contained one-shot sender; the
+    controller itself does NOT use this per-signal (that would mean a pgrep
+    fork per duty-cycle tick) -- it resolves PIDs once per start() session
+    instead, see EveController.start()."""
+    _send_to_pids(sig, _resolve_sim_pids())
 
 
 class EveController:
     """Fractional jamming via a background duty-cycle thread."""
 
     def __init__(self, signal_sender=None, period_s=0.1, csv_path=None):
-        self._send = signal_sender or _default_sender
+        # None => use a per-session PID-cached sender built fresh in start()
+        # (see there); a caller-injected sender (e.g. test Recorder) is used
+        # verbatim everywhere, including stop()'s final signal.
+        self._send = signal_sender
         self.period_s = period_s
         self.csv_path = csv_path or DEFAULT_CSV
         self._thread = None
@@ -94,8 +129,17 @@ class EveController:
         # Always close out whatever's currently running first (no-op if idle).
         # This also avoids a check-then-act race on `active`.
         self._close_episode()
+        if self._send is not None:
+            sender = self._send  # injected (e.g. test Recorder): use as-is
+        else:
+            # Resolve simulator PIDs ONCE per session, not once per signal
+            # (duty-cycle ticks 10-20x/s -- a pgrep fork on every tick was
+            # the bug this caches around). backend.apply() always tears down
+            # and recreates Eve after a stack restart (new PIDs), so
+            # resolving here already gives "re-query after each Apply".
+            sender = _make_pid_sender(_resolve_sim_pids())
         stop_evt = threading.Event()
-        thread = threading.Thread(target=self._run, args=(f, stop_evt),
+        thread = threading.Thread(target=self._run, args=(f, stop_evt, sender),
                                   daemon=True)
         with self._lock:
             self._f = f
@@ -104,19 +148,20 @@ class EveController:
             self._episodes.append(Episode(time.time(), 0.0, f))
         thread.start()
 
-    def _run(self, f, stop_evt):
-        """Duty-cycle loop for one episode. Reads only its own args, never
-        shared mutable controller state, so it can't be disturbed by a
-        concurrent start()/stop() touching self._f or self._stop_evt."""
+    def _run(self, f, stop_evt, sender):
+        """Duty-cycle loop for one episode. Reads only its own args (f,
+        stop_evt, sender), never shared mutable controller state, so it
+        can't be disturbed by a concurrent start()/stop() touching self._f,
+        self._stop_evt, or self._send -- and it never re-resolves PIDs."""
         on = self.period_s * f
         off = self.period_s - on
         while not stop_evt.is_set():
             if on > 0:
-                self._send(signal.SIGUSR1)
+                sender(signal.SIGUSR1)
                 if stop_evt.wait(on):
                     break
             if off > 0:
-                self._send(signal.SIGUSR2)
+                sender(signal.SIGUSR2)
                 if stop_evt.wait(off):
                     break
 
@@ -152,8 +197,14 @@ class EveController:
         """Stop jamming: leave the simulator unjammed, join the thread. Idempotent."""
         was_active = self.active
         self._close_episode()
-        # Always end in the clean state, even if we were never active (harmless).
-        self._send(signal.SIGUSR2)
+        # Always end in the clean state, even if we were never active
+        # (harmless). Use the injected sender verbatim if there is one;
+        # otherwise resolve PIDs fresh here (NOT the session's cached list --
+        # stop() wants whatever simulators are alive right now).
+        if self._send is not None:
+            self._send(signal.SIGUSR2)
+        else:
+            _send_to_pids(signal.SIGUSR2, _resolve_sim_pids())
         with self._lock:
             self._f = 0.0
         return was_active

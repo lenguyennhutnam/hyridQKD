@@ -185,16 +185,20 @@ class App(tk.Tk):
                    if d.l_predict else "NO KEY (over decoy bound)")
         base_txt = ("forecast: η=%.3e  E=%.2f%%  rate~%.0f clicks/s  %s"
                     % (d.eta, 100 * d.e_avg, d.clicks_per_s, verdict))
-        # Eve preview: E_eff at the entered f, vs the death threshold.
+        # Eve preview: E_eff at the entered f, vs the death threshold. Do NOT
+        # compute a fresh death_qber() here -- it's ~25 finite-key evaluations
+        # (see channel.death_qber docstring) and _forecast() runs on every
+        # debounced keystroke. Before the first Apply self._death_qber is
+        # still None, so show a neutral verdict instead of running the bisection.
         try:
             from eve import effective_qber
             f = self._read_eve_f()
             e_eff = effective_qber(d.e_avg, f)
-            dead = self._death_qber if self._death_qber is not None \
-                else death_qber(self._read_env(), self._read_n_z_block())
-            eve_txt = "\nEve f=%.2f → E=%.1f%% → %s" % (
-                f, 100 * e_eff,
-                "NO KEY" if (dead is not None and e_eff >= dead) else "key ok")
+            if self._death_qber is not None:
+                verdict = "NO KEY" if e_eff >= self._death_qber else "key ok"
+            else:
+                verdict = "(Apply to compute threshold)"
+            eve_txt = "\nEve f=%.2f → E=%.1f%% → %s" % (f, 100 * e_eff, verdict)
         except Exception:
             eve_txt = ""
         self.forecast_var.set(base_txt + eve_txt)
