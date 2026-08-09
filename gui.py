@@ -20,6 +20,13 @@ from presets import load_presets  # noqa: E402
 
 POLL_MS = 2000
 HISTORY = 300  # plot points kept (~10 min at 2 s)
+# Only draw the death-QBER line once the window's QBER climbs to this fraction
+# of it; below that the line would flatten a low-QBER trace, so we hide it and
+# let matplotlib autoscale to the data (jitter/Eve variation becomes visible).
+DEATH_LINE_SHOW_FRAC = 0.5
+BUFFER_FILL = "#4a90d9"       # key-buffer bar fill (filling)
+BUFFER_FULL = "#d9534f"       # key-buffer bar fill (at B_max)
+BUFFER_TRACK = "#e0e0e0"      # key-buffer bar background track
 STATUS_COLORS = {"down": "#9e9e9e", "starting": "#f0ad4e",
                  "streaming": "#5cb85c", "error": "#d9534f"}
 
@@ -44,9 +51,10 @@ class App(tk.Tk):
         self.hist_t = deque(maxlen=HISTORY)
         self.hist_qber = deque(maxlen=HISTORY)
         self.hist_rate = deque(maxlen=HISTORY)
-        self.hist_secret = deque(maxlen=HISTORY)
         self._death_qber = None  # set once per Apply (expensive), see _apply()
         self._n_z_block = 10_000_000  # block size in effect, for the status line
+        self._b_max = 10_000_000  # key-buffer capacity [bits], from the B_max input
+        self._secret_now = 0       # latest cumulative secret bits, for the buffer bar
         self._build_left()
         self._build_right()
         self._load_preset("aurea")
@@ -100,6 +108,15 @@ class App(tk.Tk):
                                       wraplength=180, foreground="#333")
         self.forecast_lbl.grid(row=row + 5, column=0, columnspan=2,
                                sticky="w", pady=6)
+        # Key-buffer config, separated from the system params above by a rule.
+        # B_max is the buffer capacity [bits]; NOT an EnvParams field (display
+        # only, updates the bar live, no Apply needed).
+        ttk.Separator(left, orient="horizontal").grid(
+            row=row + 6, column=0, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(left, text="B_max [bits]").grid(row=row + 7, column=0, sticky="w")
+        self.bmax_entry = ttk.Entry(left, width=12)
+        self.bmax_entry.grid(row=row + 7, column=1, pady=1)
+        self.bmax_entry.insert(0, "10000000")
 
     # ---------------- right: plots + status + log ----------------
     def _build_right(self):
@@ -108,10 +125,12 @@ class App(tk.Tk):
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
         fig = Figure(figsize=(7, 5), dpi=90)
-        self.ax_qber = fig.add_subplot(311)
-        self.ax_rate = fig.add_subplot(312)
-        self.ax_secret = fig.add_subplot(313)
-        fig.subplots_adjust(hspace=0.55)
+        # Buffer row is half-height of the two time-series plots (it's just a
+        # bar, not a curve) so the filled bar looks slim without top/bottom pad.
+        gs = fig.add_gridspec(3, 1, height_ratios=[1, 1, 0.5], hspace=0.6)
+        self.ax_qber = fig.add_subplot(gs[0])
+        self.ax_rate = fig.add_subplot(gs[1])
+        self.ax_buffer = fig.add_subplot(gs[2])  # key-buffer fill bar, not a time series
         self.canvas = FigureCanvasTkAgg(fig, master=right)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         self.status_var = tk.StringVar(value="down")
@@ -131,6 +150,8 @@ class App(tk.Tk):
         self.log = tk.Text(right, height=8, state="disabled",
                            font=("TkFixedFont", 8))
         self.log.pack(fill="x")
+        self._draw_buffer()      # render an empty buffer bar before the first run
+        self.canvas.draw_idle()
 
     # ---------------- helpers ----------------
     def _load_preset(self, name):
@@ -158,6 +179,16 @@ class App(tk.Tk):
         if not 0.0 <= f <= 1.0:
             raise ValueError("Eve f must be in [0, 1]")
         return f
+
+    def _read_b_max(self):
+        # int(float(...)) so "1e7" also works; falls back to the last good value.
+        try:
+            n = int(float(self.bmax_entry.get()))
+            if n > 0:
+                self._b_max = n
+        except (ValueError, tk.TclError):
+            pass
+        return self._b_max
 
     def _toggle_eve(self):
         try:
@@ -218,9 +249,9 @@ class App(tk.Tk):
             # Expensive (~25 finite-key evaluations) -- computed once here,
             # never from the per-keystroke _forecast().
             self._death_qber = death_qber(env, self._n_z_block)
-            for h in (self.hist_t, self.hist_qber, self.hist_rate,
-                      self.hist_secret):
+            for h in (self.hist_t, self.hist_qber, self.hist_rate):
                 h.clear()
+            self._secret_now = 0  # fresh run: buffer starts empty
         except Exception as exc:
             self.status_var.set("error")
             self.error_var.set("Apply failed: %s" % exc)
@@ -258,8 +289,13 @@ class App(tk.Tk):
                 self.hist_t.append(snap.unix_time)
                 self.hist_qber.append(100 * snap.qber)
                 self.hist_rate.append(snap.sifted)
-                self.hist_secret.append(snap.secret_bits)
+                self._secret_now = snap.secret_bits  # cumulative, for the buffer bar
                 self._redraw()
+            else:
+                # Keep the buffer bar rendered (empty/last state) before the
+                # first stream and while down, so it never shows a blank axis.
+                self._draw_buffer()
+                self.canvas.draw_idle()
             self.log.config(state="normal")
             self.log.delete("1.0", "end")
             self.log.insert("end", "\n".join(snap.log_lines))
@@ -281,9 +317,13 @@ class App(tk.Tk):
         xs = [t - t0 for t in self.hist_t]
         self.ax_qber.clear()
         self.ax_qber.plot(xs, list(self.hist_qber))
-        if self._death_qber is not None:
-            self.ax_qber.axhline(100 * self._death_qber, color="red",
-                                 linestyle="--", linewidth=1)
+        # Only draw the death-QBER line once the trace climbs near it, so a
+        # low-QBER run isn't flattened by a far-away line (spec: user request).
+        if self._death_qber is not None and self.hist_qber:
+            death_pct = 100 * self._death_qber
+            if max(self.hist_qber) >= death_pct * DEATH_LINE_SHOW_FRAC:
+                self.ax_qber.axhline(death_pct, color="red",
+                                     linestyle="--", linewidth=1)
         # Shade intervals when Eve was ON (episodes are in unix time, same as
         # hist_t). Open episodes (t_end==0) extend to the latest sample.
         try:
@@ -296,15 +336,50 @@ class App(tk.Tk):
                                          color="red", alpha=0.12)
         except Exception:
             pass
+        self._mark_current(self.ax_qber, xs, self.hist_qber, "%.2f%%")
         self.ax_qber.set_ylabel("QBER %")
         self.ax_rate.clear()
         self.ax_rate.plot(xs, list(self.hist_rate))
+        self._mark_current(self.ax_rate, xs, self.hist_rate,
+                           lambda v: format(int(v), ","))
         self.ax_rate.set_ylabel("sifted/win")
-        self.ax_secret.clear()
-        self.ax_secret.plot(xs, list(self.hist_secret))
-        self.ax_secret.set_ylabel("secret bits")
-        self.ax_secret.set_xlabel("t [s]")
+        self._draw_buffer()
         self.canvas.draw_idle()
+
+    def _mark_current(self, ax, xs, ys, fmt):
+        """Mark the latest value: a faint horizontal dashed line at its level
+        (traceable back to the Oy axis) plus the value labelled at the point."""
+        if not xs or not ys:
+            return
+        y = ys[-1]
+        text = fmt(y) if callable(fmt) else fmt % y
+        ax.axhline(y, color="#888", linestyle="--", linewidth=0.8)
+        ax.annotate(text, xy=(xs[-1], y), xytext=(4, 0),
+                    textcoords="offset points", va="center", ha="left",
+                    fontsize=8, color="#c00", clip_on=False)
+
+    def _draw_buffer(self):
+        """Key buffer as a horizontal fill bar: filled = min(secret, B_max),
+        capped and recoloured at B_max, with 'current / max' above the right end."""
+        b_max = self._read_b_max()
+        fill = min(self._secret_now, b_max)
+        full = self._secret_now >= b_max
+        ax = self.ax_buffer
+        ax.clear()
+        ax.barh(0, b_max, height=1.0, color=BUFFER_TRACK)                     # track
+        ax.barh(0, fill, height=1.0,
+                color=BUFFER_FULL if full else BUFFER_FILL)                  # fill
+        if 0 < fill < b_max:
+            ax.axvline(fill, color="#333", linestyle="--", linewidth=0.8)    # current mark
+        ax.set_xlim(0, b_max)
+        ax.set_ylim(-0.5, 0.5)
+        ax.set_yticks([])
+        ax.set_xlabel("key buffer [bits]")
+        label = "%s / %s%s" % (format(self._secret_now, ","),
+                               format(b_max, ","), "  FULL" if full else "")
+        ax.text(0.99, 1.08, label, transform=ax.transAxes, ha="right",
+                va="bottom", fontsize=9,
+                color=BUFFER_FULL if full else "#333")
 
     def _on_close(self):
         self.backend.stop()
