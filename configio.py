@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Read/update hw_sim decoy config files for Alice and Bob.
+"""Read/update hw_sim config files for Alice and Bob (both PM decoy and
+ENT plain pairs).
 
 Bob's eta/qberr drive the observed physics (Alice's copies are ignored by the
 simulator), but seed/angles/decoy_states MUST be identical on both sides or the

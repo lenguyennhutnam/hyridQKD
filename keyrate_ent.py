@@ -5,7 +5,8 @@ Analytic model from J. C. Chapman, C. C. W. Lim, P. G. Kwiat,
 "Hyperentangled Time-bin and Polarization Quantum Key Distribution",
 Phys. Rev. Applied 18, 044027 (2022), d=2 branch. Equation numbers below
 refer to its Appendix A; the local extraction (checked line-by-line against
-the PDF) is docs/chapman2022-bbm92-formula-sheet.md.
+the PDF) is ../docs/chapman2022-bbm92-formula-sheet.md (workspace root,
+one level up from this repo's qkd_app/).
 
 Model assumptions (App. A1): pair source in Alice's lab (one-way loss —
 eta_a is local, only eta_b carries the channel), both bases generate key
@@ -133,6 +134,11 @@ def h2(x):
 
 # Scan grids for the (A19) maximisation. r: key-generation share of the raw
 # block; beta in (0, eps_sec/4) as fractions of the open upper end.
+# Note: n_ext + 4*log2(beta) is monotone increasing in beta, so the largest
+# fraction (0.999) wins at every (m, q) tested -- this grid is not a true
+# 2-D optimisation, it is kept for auditability. The optimum always sitting
+# at the open upper end of (0, eps_sec/4) is a documented modelling choice
+# (see the formula sheet's caveat on beta), not a search result.
 _R_GRID = (0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.93, 0.95, 0.97, 0.99)
 _BETA_FRACS = (0.999, 0.5, 0.1, 1e-2, 1e-3, 1e-4, 1e-6)
 

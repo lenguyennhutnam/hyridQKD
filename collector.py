@@ -38,7 +38,7 @@ from keyrate import KeyParams, secret_key_length
 from keyrate_ent import secret_key_length_ent
 
 # ==================== PARAMETERS (chinh o day) ====================
-KEY_BLOCK_BITS = 10_000_000   # so sifted bit (basis khoa Z) cho 1 block finite-key
+KEY_BLOCK_BITS = 10_000_000   # so sifted bit cho 1 block finite-key (PM: basis Z; ENT: ca hai basis)
 PRINT_INTERVAL_S = 2.0        # chu ky in ra terminal (giay)
 
 # Tham so giao thuc dung cho cong thuc key length (phai khop hw_sim config).

@@ -105,7 +105,8 @@ class TestFiniteKey(unittest.TestCase):
         self.assertLess(ell / self.M, 0.85)
 
     def test_key_dead_above_threshold(self):
-        # asymptotic death: 1 = 2.12*h2(Q) -> Q ~ 11%; finite-key slightly lower
+        # asymptotic death: 1 = 2.12*h2(Q) -> Q ~ 10.09%; finite-key measured
+        # thresholds are lower (9.94% @ n_z=1e7, 9.62% @ 1e6, 8.62% @ 1e5)
         self.assertEqual(ke.secret_key_length_ent(self.M, 0.12), 0)
 
     def test_key_alive_below_threshold(self):

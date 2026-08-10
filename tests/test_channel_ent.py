@@ -47,8 +47,9 @@ class TestDeriveEnt(unittest.TestCase):
 
 class TestDeathQberEnt(unittest.TestCase):
     def test_threshold_in_expected_band(self):
-        # no decoy penalty: death near the 2.12*h2(Q)=1 point (~11%),
-        # a bit lower from finite statistics
+        # no decoy penalty: asymptotic death at 1 = 2.12*h2(Q) -> Q ~ 10.09%;
+        # finite-key measured thresholds are lower (9.94% @ n_z=1e7,
+        # 9.62% @ 1e6, 8.62% @ 1e5)
         t = death_qber_ent(EntEnvParams(), n_z_block=10_000_000)
         self.assertGreater(t, 0.08)
         self.assertLess(t, 0.13)
