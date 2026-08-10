@@ -32,6 +32,7 @@ class Snapshot:
     log_lines: list = field(default_factory=list)
     eve_active: bool = False
     eve_f: float = 0.0
+    protocol: str = "pm"
 
 
 class Backend:
@@ -40,25 +41,48 @@ class Backend:
     def __init__(self, csv_path=None):
         self.csv_path = csv_path or os.path.join(stackctl.LOG_DIR, "live.csv")
         self._started = False
+        self._protocol = "pm"
         self.eve = evectl.EveController()
 
-    def predict(self, env, n_z_block=10_000_000):
-        """Forecast eta/qberr/key length without touching anything."""
+    def predict(self, env, n_z_block=10_000_000, protocol="pm"):
+        """Forecast hw_sim knobs/key length without touching anything.
+
+        env must be channel.EnvParams for pm, channel.EntEnvParams for ent.
+        """
+        if protocol == "ent":
+            return channel.derive_ent(env, n_z_block)
         return channel.derive(env, n_z_block)
 
-    def apply(self, env, n_z_block=10_000_000):
+    def apply(self, env, n_z_block=10_000_000, protocol="pm"):
         """Write configs from env, restart stack + collector. Returns forecast.
 
         n_z_block is threaded into both the forecast (predict) and the
         collector's --key-block-bits so the two provably agree on block size
         instead of relying on matching defaults in two separate modules.
+
+        protocol selects pm (decoy BB84, default) or ent (BBM92): pm writes
+        the decoy configs and starts the decoy stack; ent writes the plain
+        (non-decoy) configs, starts the plain stack, and tells the collector
+        to parse the stream as ENT via --protocol ent.
         """
         self.eve.stop()  # stack restart changes simulator PIDs; drop any jam first
-        derived = self.predict(env, n_z_block)
-        configio.update_hw_sim_configs(derived.eta, derived.e_avg,
-                                       env.mu1, env.mu2, env.p1,
-                                       derived.pulse_distance,
-                                       qber_sigma=env.qber_sigma)
+        derived = self.predict(env, n_z_block, protocol)
+        if protocol == "ent":
+            configio.update_hw_sim_plain_configs(derived.r_coinc, derived.q2,
+                                                 derived.pulse_distance,
+                                                 qber_sigma=env.qber_sigma)
+            mode = "plain"
+            collector_args = ["--protocol", "ent",
+                              "--key-block-bits", str(n_z_block)]
+        else:
+            configio.update_hw_sim_configs(derived.eta, derived.e_avg,
+                                           env.mu1, env.mu2, env.p1,
+                                           derived.pulse_distance,
+                                           qber_sigma=env.qber_sigma)
+            mode = "decoy"
+            collector_args = ["--mu1", str(env.mu1), "--mu2", str(env.mu2),
+                              "--p1", str(env.p1), "--eta", str(derived.eta),
+                              "--key-block-bits", str(n_z_block)]
         stackctl.stop_all()
         if os.path.exists(self.csv_path):
             os.remove(self.csv_path)  # fresh run, fresh CSV
@@ -66,13 +90,10 @@ class Backend:
         # previous run's output after a restart.
         os.makedirs(stackctl.LOG_DIR, exist_ok=True)
         open(os.path.join(stackctl.LOG_DIR, "collector.log"), "w").close()
-        stackctl.start_stack()
-        stackctl.start_collector(self.csv_path, [
-            "--mu1", str(env.mu1), "--mu2", str(env.mu2),
-            "--p1", str(env.p1), "--eta", str(derived.eta),
-            "--key-block-bits", str(n_z_block),
-        ])
+        stackctl.start_stack(mode)
+        stackctl.start_collector(self.csv_path, collector_args)
         self._started = True
+        self._protocol = protocol
         return derived
 
     def stop(self):
@@ -112,6 +133,7 @@ class Backend:
         snap = Snapshot(log_lines=self._log_tail())
         snap.eve_active = self.eve.active
         snap.eve_f = self.eve.current_f
+        snap.protocol = self._protocol
         if row is None:
             snap.status = "starting" if running else "down"
             return snap
