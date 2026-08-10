@@ -78,5 +78,56 @@ class TestConfigIO(unittest.TestCase):
             self.assertEqual(q, 0.0456)
 
 
+class TestPlainConfigIO(unittest.TestCase):
+    """ENT mode writes the PLAIN (non-decoy) config pair."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.alice = os.path.join(self.tmp, "alice.json")
+        self.bob = os.path.join(self.tmp, "bob.json")
+        shutil.copy(configio.DEFAULT_ALICE_PLAIN, self.alice)
+        shutil.copy(configio.DEFAULT_BOB_PLAIN, self.bob)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_plain_paths_exist(self):
+        self.assertTrue(os.path.exists(configio.DEFAULT_ALICE_PLAIN))
+        self.assertTrue(os.path.exists(configio.DEFAULT_BOB_PLAIN))
+
+    def test_update_writes_both_sides_no_decoy(self):
+        configio.update_hw_sim_plain_configs(0.0032, 0.0151, 1.25e-8,
+                                             alice_path=self.alice,
+                                             bob_path=self.bob)
+        for p in (self.alice, self.bob):
+            cfg = configio.read_config(p)["backend_config"]
+            self.assertEqual(cfg["eta"], 0.0032)
+            self.assertEqual(cfg["qberr"], 0.0151)
+            self.assertEqual(cfg["pulse_distance"], 1.25e-8)
+            # plain mode MUST have no decoy_states (mismatch with the other
+            # side's mode desyncs the preshared-seed RNG -> QBER 50%)
+            self.assertNotIn("decoy_states", cfg)
+
+    def test_gaussian_qberr_when_sigma_positive(self):
+        configio.update_hw_sim_plain_configs(0.0032, 0.0151, 1.25e-8,
+                                             qber_sigma=0.002,
+                                             alice_path=self.alice,
+                                             bob_path=self.bob)
+        for p in (self.alice, self.bob):
+            q = configio.read_config(p)["backend_config"]["qberr"]
+            self.assertEqual(q, {"type": "Gaussian", "mean": 0.0151,
+                                 "std_dev": 0.002})
+
+    def test_mismatched_seed_detected(self):
+        cfg = configio.read_config(self.bob)
+        cfg["backend_config"]["seed"] = 999
+        with open(self.bob, "w") as f:
+            json.dump(cfg, f)
+        with self.assertRaises(ValueError):
+            configio.update_hw_sim_plain_configs(0.1, 0.05, 1e-8,
+                                                 alice_path=self.alice,
+                                                 bob_path=self.bob)
+
+
 if __name__ == "__main__":
     unittest.main()
