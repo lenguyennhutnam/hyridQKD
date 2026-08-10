@@ -64,6 +64,35 @@ class TestErrorModel(unittest.TestCase):
         q = ke.q2_est(0.5, 1e-6, 1e-6, 0.5, 0.5, 0.3)
         self.assertLessEqual(q, 0.5)
 
+    def test_multi_pair_errors_zero_when_bob_dark(self):
+        # Physical pin for the (A12) eta_A/eta_B correction: if Bob detects
+        # nothing (eta_b=0) there can be no coincidence, so no multi-pair
+        # error either. The corrected form (eta_b in the second sum) gives
+        # exactly 0 here.
+        self.assertEqual(ke._multi_pair_errors(0.05, 0.3, 0.0), 0.0)
+
+        # Prove the pin is not vacuous: the published (buggy) form, which
+        # uses eta_a in BOTH sums and so never reads eta_b at all, breaks
+        # this invariant and returns a positive number for the same inputs.
+        def buggy_multi_pair_errors(gamma, eta_a, eta_b):
+            total = 0.0
+            for n in range(2, ke.N_MAX + 1):
+                pn = ke.pair_prob(n, gamma)
+                pa = 1.0 - (1.0 - eta_a) ** n
+                total += pn * (pa * pa - (eta_a ** n) * (eta_a ** n))
+            return 0.5 * total
+
+        self.assertGreater(buggy_multi_pair_errors(0.05, 0.3, 0.0), 0.0)
+
+    def test_phi_errors_n1_dominated_limit(self):
+        # (A11) sanity check: for gamma -> 0, single-pair events (n=1)
+        # dominate (P_n ~ gamma^n for n>=2 is negligible), and the n=1 term
+        # reduces to P_1 * eta_a * eta_b * e2 (same_mode = e2^1 * 2/2 = e2).
+        gamma, ea, eb, e2 = 1e-6, 0.3, 0.24, 0.01
+        expected = ke.pair_prob(1, gamma) * ea * eb * e2
+        actual = ke._phi_errors(gamma, ea, eb, e2)
+        self.assertAlmostEqual(actual, expected, delta=expected * 1e-4)
+
 
 class TestFiniteKey(unittest.TestCase):
     M = 10_000_000
