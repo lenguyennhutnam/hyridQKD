@@ -2,7 +2,7 @@
 import dataclasses
 import unittest
 
-from channel import EnvParams, death_qber, derive
+from channel import EntEnvParams, EnvParams, death_qber, derive
 
 
 class TestDerive(unittest.TestCase):
@@ -77,14 +77,38 @@ class TestDeathQber(unittest.TestCase):
 
 
 class TestGuiFieldsCoverage(unittest.TestCase):
-    def test_gui_fields_match_env_params(self):
+    """The GUI form must expose exactly the fields of each dataclass.
+
+    The form is split into a shared region plus one region per protocol;
+    ENT keys carry an "ent_" prefix (eta_bob exists in both dataclasses).
+    """
+
+    def _gui(self):
         try:
             import gui
         except ImportError:
             self.skipTest("matplotlib/tkinter not available")
-        field_names = {f for f, _ in gui.FIELDS}
+        return gui
+
+    def test_gui_fields_match_env_params(self):
+        gui = self._gui()
+        field_names = {f for f, _ in gui.FIELDS_SHARED + gui.FIELDS_PM}
         env_field_names = {f.name for f in dataclasses.fields(EnvParams)}
         self.assertEqual(field_names, env_field_names)
+
+    def test_gui_fields_match_ent_env_params(self):
+        gui = self._gui()
+        field_names = {f for f, _ in gui.FIELDS_SHARED}
+        field_names |= {f[4:] for f, _ in gui.FIELDS_ENT}
+        env_field_names = {f.name for f in dataclasses.fields(EntEnvParams)}
+        self.assertEqual(field_names, env_field_names)
+
+    def test_ent_entry_keys_are_prefixed(self):
+        gui = self._gui()
+        self.assertTrue(all(f.startswith("ent_") for f, _ in gui.FIELDS_ENT))
+        shared_pm = {f for f, _ in gui.FIELDS_SHARED + gui.FIELDS_PM}
+        # No entry key may be claimed twice (eta_bob collision guard).
+        self.assertFalse(shared_pm & {f for f, _ in gui.FIELDS_ENT})
 
 
 if __name__ == "__main__":

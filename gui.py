@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Tkinter control panel. Pure UI: every action goes through backend.Backend.
 
-Layout (spec §6): left = env-param form + presets + Apply/Stop; right =
-3 matplotlib axes (QBER, sifted rate, secret bits), status light, forecast
-line, log pane. Closing the window stops every child process.
+Layout (spec §6): left = protocol radio (PM/ENT) + a static three-region
+env-param form (shared channel / PM-only / ENT-only, all always visible) +
+presets + Apply/Stop; right = 3 matplotlib axes (QBER, sifted rate, key
+buffer), status light, forecast line, log pane. Closing the window stops
+every child process.
 """
 
 import tkinter as tk
@@ -15,8 +17,8 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 
-from channel import EnvParams, death_qber  # noqa: E402
-from presets import load_presets  # noqa: E402
+from channel import EntEnvParams, EnvParams, death_qber, death_qber_ent  # noqa: E402
+from presets import load_ent_presets, load_presets  # noqa: E402
 
 POLL_MS = 2000
 HISTORY = 300  # plot points kept (~10 min at 2 s)
@@ -30,15 +32,24 @@ BUFFER_TRACK = "#e0e0e0"      # key-buffer bar background track
 STATUS_COLORS = {"down": "#9e9e9e", "starting": "#f0ad4e",
                  "streaming": "#5cb85c", "error": "#d9534f"}
 
-# (field, label) in display order; must match EnvParams field names.
-FIELDS = [
+# (field, label) per region; names must match the dataclass field names
+# (ENT keys carry an "ent_" prefix in self.entries because eta_bob exists
+# in both EnvParams and EntEnvParams -- stripped in _read_ent_env()).
+FIELDS_SHARED = [
     ("d_km", "d [km]"), ("alpha", "α [dB/km]"),
-    ("odr_losses", "optics losses [dB]"), ("eta_bob", "η detector"),
-    ("pdc", "p_dc (dark count)"), ("e_det", "e_det (optical err)"),
-    ("dead_us", "τ dead [µs]"), ("coeff", "dead-time coeff"),
-    ("f_rep", "f_rep [Hz]"), ("mu1", "μ₁ (signal)"),
-    ("mu2", "μ₂ (decoy)"), ("p1", "P(μ₁)"),
+    ("odr_losses", "optics losses [dB]"), ("f_rep", "f_rep [Hz]"),
     ("qber_sigma", "QBER jitter σ"),
+]
+FIELDS_PM = [
+    ("eta_bob", "η detector"), ("pdc", "p_dc (dark count)"),
+    ("e_det", "e_det (optical err)"), ("dead_us", "τ dead [µs]"),
+    ("coeff", "dead-time coeff"), ("mu1", "μ₁ (signal)"),
+    ("mu2", "μ₂ (decoy)"), ("p1", "P(μ₁)"),
+]
+FIELDS_ENT = [
+    ("ent_eta_a", "η_A (Alice)"), ("ent_eta_bob", "η_B detector"),
+    ("ent_xi_a", "ξ_A (bg/pulse)"), ("ent_xi_b", "ξ_B (bg/pulse)"),
+    ("ent_e_intr", "e₂ intrinsic"), ("ent_mu", "μ (pairs/pulse)"),
 ]
 
 
@@ -46,7 +57,7 @@ class App(tk.Tk):
     def __init__(self, backend):
         super().__init__()
         self.backend = backend
-        self.title("QKD Control Panel (PM / BB84 decoy)")
+        self.title("QKD Control Panel (PM / ENT)")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.hist_t = deque(maxlen=HISTORY)
         self.hist_qber = deque(maxlen=HISTORY)
@@ -57,6 +68,10 @@ class App(tk.Tk):
         self._secret_now = 0       # latest cumulative secret bits, for the buffer bar
         self._build_left()
         self._build_right()
+        # Seed the ENT region too, so its entries are never empty if the user
+        # flips the radio without loading an ENT preset first. Order matters:
+        # the last _load_preset() also selects the starting mode (PM).
+        self._load_preset("chapman_current")
         self._load_preset("aurea")
         self.after(POLL_MS, self._poll)
 
@@ -64,16 +79,34 @@ class App(tk.Tk):
     def _build_left(self):
         left = ttk.Frame(self, padding=8)
         left.grid(row=0, column=0, sticky="ns")
+        # Protocol selector. Layout is STATIC (spec §6): all three param
+        # regions stay visible in both modes; the radio only decides which
+        # region feeds predict()/apply().
+        self.proto_var = tk.StringVar(value="pm")
+        proto = ttk.Frame(left)
+        proto.grid(row=0, column=0, columnspan=2, sticky="w")
+        for val, txt in (("pm", "PM (BB84 decoy)"), ("ent", "ENT (BBM92)")):
+            ttk.Radiobutton(proto, text=txt, value=val,
+                            variable=self.proto_var,
+                            command=self._schedule_forecast).pack(side="left")
         self.entries = {}
-        for i, (field, label) in enumerate(FIELDS):
-            ttk.Label(left, text=label).grid(row=i, column=0, sticky="w")
-            e = ttk.Entry(left, width=12)
-            e.grid(row=i, column=1, pady=1)
-            e.bind("<KeyRelease>", lambda *_: self._schedule_forecast())
-            self.entries[field] = e
-        row = len(FIELDS)
+        row = 1
+        for title, fields in (("channel", FIELDS_SHARED),
+                              ("PM", FIELDS_PM), ("ENT", FIELDS_ENT)):
+            ttk.Separator(left, orient="horizontal").grid(
+                row=row, column=0, columnspan=2, sticky="ew", pady=3)
+            ttk.Label(left, text=title, font=("TkDefaultFont", 9, "bold")
+                      ).grid(row=row + 1, column=0, columnspan=2, sticky="w")
+            row += 2
+            for field, label in fields:
+                ttk.Label(left, text=label).grid(row=row, column=0, sticky="w")
+                e = ttk.Entry(left, width=12)
+                e.grid(row=row, column=1, pady=1)
+                e.bind("<KeyRelease>", lambda *_: self._schedule_forecast())
+                self.entries[field] = e
+                row += 1
         # Block size (n_z) is not an EnvParams field -- kept separate from
-        # FIELDS/entries so it stays out of the FIELDS<->EnvParams invariant.
+        # FIELDS_*/entries so it stays out of the FIELDS<->dataclass invariant.
         ttk.Label(left, text="block [bits]").grid(row=row, column=0, sticky="w")
         self.block_entry = ttk.Entry(left, width=12)
         self.block_entry.grid(row=row, column=1, pady=1)
@@ -81,8 +114,9 @@ class App(tk.Tk):
         self.block_entry.bind("<KeyRelease>", lambda *_: self._schedule_forecast())
         row += 1
         ttk.Label(left, text="preset").grid(row=row, column=0, sticky="w")
-        self.preset_box = ttk.Combobox(left, values=list(load_presets()),
-                                       state="readonly", width=11)
+        self.preset_box = ttk.Combobox(
+            left, values=list(load_presets()) + list(load_ent_presets()),
+            state="readonly", width=11)
         self.preset_box.grid(row=row, column=1, pady=4)
         self.preset_box.bind("<<ComboboxSelected>>",
                              lambda *_: self._load_preset(self.preset_box.get()))
@@ -155,17 +189,45 @@ class App(tk.Tk):
 
     # ---------------- helpers ----------------
     def _load_preset(self, name):
-        env = load_presets()[name]
-        for field, _ in FIELDS:
+        """Fill the shared region + the preset's own region, and select its mode.
+
+        Only the matching protocol's region is touched, so loading a PM preset
+        leaves the ENT entries at their last (seeded) values and vice versa.
+        """
+        pm, ent = load_presets(), load_ent_presets()
+        if name in ent:
+            env = ent[name]
+            fields = FIELDS_SHARED + FIELDS_ENT
+            self.proto_var.set("ent")
+        else:
+            env = pm[name]
+            fields = FIELDS_SHARED + FIELDS_PM
+            self.proto_var.set("pm")
+        for field, _ in fields:
+            attr = field[4:] if field.startswith("ent_") else field
             self.entries[field].delete(0, "end")
-            self.entries[field].insert(0, repr(getattr(env, field)))
+            self.entries[field].insert(0, repr(getattr(env, attr)))
         self._schedule_forecast()
 
     def _read_env(self):
         kwargs = {}
-        for field, _ in FIELDS:
+        for field, _ in FIELDS_SHARED + FIELDS_PM:
             kwargs[field] = float(self.entries[field].get())
         return EnvParams(**kwargs)
+
+    def _read_ent_env(self):
+        kwargs = {}
+        for field, _ in FIELDS_SHARED:
+            kwargs[field] = float(self.entries[field].get())
+        for field, _ in FIELDS_ENT:
+            kwargs[field[4:]] = float(self.entries[field].get())
+        return EntEnvParams(**kwargs)
+
+    def _read_proto_env(self):
+        """(protocol, env) for the currently selected mode."""
+        proto = self.proto_var.get()
+        return proto, (self._read_ent_env() if proto == "ent"
+                       else self._read_env())
 
     def _read_n_z_block(self):
         # int(float(...)) so scientific-notation input like "1e7" also works.
@@ -208,14 +270,25 @@ class App(tk.Tk):
     def _forecast(self):
         self._forecast_job = None
         try:
-            d = self.backend.predict(self._read_env(), self._read_n_z_block())
+            proto, env = self._read_proto_env()
+            d = self.backend.predict(env, self._read_n_z_block(),
+                                     protocol=proto)
         except Exception as exc:  # bad input or broken bound: show, don't crash
             self.forecast_var.set("forecast: ERROR %s" % exc)
             return
         verdict = ("l~%s bits/block" % format(d.l_predict, ",")
-                   if d.l_predict else "NO KEY (over decoy bound)")
-        base_txt = ("forecast: η=%.3e  E=%.2f%%  rate~%.0f clicks/s  %s"
-                    % (d.eta, 100 * d.e_avg, d.clicks_per_s, verdict))
+                   if d.l_predict else "NO KEY (over finite-key bound)")
+        # e_base = the mode's operating QBER; feeds the Eve preview below.
+        if proto == "ent":
+            base_txt = ("forecast: η_B=%.3e  R=%.3e  Q₂=%.2f%%  "
+                        "rate~%.0f clicks/s  %s"
+                        % (d.eta_b, d.r_coinc, 100 * d.q2, d.clicks_per_s,
+                           verdict))
+            e_base = d.q2
+        else:
+            base_txt = ("forecast: η=%.3e  E=%.2f%%  rate~%.0f clicks/s  %s"
+                        % (d.eta, 100 * d.e_avg, d.clicks_per_s, verdict))
+            e_base = d.e_avg
         # Eve preview: E_eff at the entered f, vs the death threshold. Do NOT
         # compute a fresh death_qber() here -- it's ~25 finite-key evaluations
         # (see channel.death_qber docstring) and _forecast() runs on every
@@ -224,7 +297,7 @@ class App(tk.Tk):
         try:
             from eve import effective_qber
             f = self._read_eve_f()
-            e_eff = effective_qber(d.e_avg, f)
+            e_eff = effective_qber(e_base, f)
             if self._death_qber is not None:
                 verdict = "NO KEY" if e_eff >= self._death_qber else "key ok"
             else:
@@ -242,13 +315,16 @@ class App(tk.Tk):
         self.error_var.set("")
         self.update_idletasks()
         try:
-            env = self._read_env()
+            proto, env = self._read_proto_env()
             n_z_block = self._read_n_z_block()
-            self.backend.apply(env, n_z_block)
+            self.backend.apply(env, n_z_block, protocol=proto)
             self._n_z_block = n_z_block
             # Expensive (~25 finite-key evaluations) -- computed once here,
             # never from the per-keystroke _forecast().
-            self._death_qber = death_qber(env, self._n_z_block)
+            if proto == "ent":
+                self._death_qber = death_qber_ent(env, self._n_z_block)
+            else:
+                self._death_qber = death_qber(env, self._n_z_block)
             for h in (self.hist_t, self.hist_qber, self.hist_rate):
                 h.clear()
             self._secret_now = 0  # fresh run: buffer starts empty
