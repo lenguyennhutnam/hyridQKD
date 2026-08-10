@@ -348,11 +348,15 @@ class App(tk.Tk):
     def _poll(self):
         try:
             snap = self.backend.refresh()
+            # Lead with the protocol the STACK is actually running (from the
+            # backend), not the radio: with the static layout the radio can be
+            # flipped after an Apply, and without this the panel would show PM
+            # forecast text over an ENT trace with nothing to tell them apart.
             self.status_var.set(
-                "%s   QBER %.2f%%   keys %d   block %s/%s   secret %s b"
-                % (snap.status, 100 * snap.qber, snap.blocks,
-                   format(snap.block_progress, ","), format(self._n_z_block, ","),
-                   format(snap.secret_bits, ",")))
+                "[%s] %s   QBER %.2f%%   keys %d   block %s/%s   secret %s b"
+                % (snap.protocol.upper(), snap.status, 100 * snap.qber,
+                   snap.blocks, format(snap.block_progress, ","),
+                   format(self._n_z_block, ","), format(snap.secret_bits, ",")))
             self.status_lbl.config(bg=STATUS_COLORS.get(snap.status, "#777"))
             if snap.eve_active:
                 self.eve_btn.config(text="Eve: ON  f=%.2f" % snap.eve_f,
