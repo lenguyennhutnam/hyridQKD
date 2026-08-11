@@ -20,6 +20,10 @@ from matplotlib.figure import Figure  # noqa: E402
 
 import panelstate  # noqa: E402
 from channel import EntEnvParams, EnvParams, death_qber, death_qber_ent  # noqa: E402
+# Per-mode background tints for the session timeline, plus the grey used for
+# stack-down stretches (whose width is the switch cost t_switch). Owned by
+# plots.py so the live panel and the exported figures cannot drift apart.
+from plots import DOWNTIME_BAND, MODE_BAND, MODE_LINE  # noqa: E402
 from presets import load_ent_presets, load_presets  # noqa: E402
 from timeline import Timeline  # noqa: E402
 
@@ -30,11 +34,6 @@ POLL_MS = 2000
 DEATH_LINE_SHOW_FRAC = 0.5
 BUFFER_FULL = "#d9534f"       # key-buffer bar fill (at B_max)
 BUFFER_TRACK = "#e0e0e0"      # key-buffer bar background track
-# Per-mode background tints for the session timeline, plus the grey used for
-# stack-down stretches (whose width is the switch cost t_switch).
-MODE_BAND = {"pm": "#D6E4F7", "ent": "#E2F0D9"}
-MODE_LINE = {"pm": "#2E75B6", "ent": "#70AD47"}
-DOWNTIME_BAND = "#DDDDDD"
 NOTICE_COLOR = "#31708f"      # transient confirmations (not failures)
 STATUS_COLORS = {"down": "#9e9e9e", "starting": "#f0ad4e",
                  "streaming": "#5cb85c", "error": "#d9534f"}

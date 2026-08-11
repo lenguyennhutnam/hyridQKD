@@ -42,6 +42,24 @@ def _run(n=30, blocks_at=(12, 24)):
     return run
 
 
+def _session_run(n=20, split=10):
+    """A run whose sidecar describes a PM stretch, a gap, then an ENT stretch."""
+    run = _run(n=n, blocks_at=(6, 15))
+    run.segments = [
+        {"protocol": "pm", "t_start": run.unix_t[0],
+         "t_end": run.unix_t[split - 1], "death_qber": 0.0522,
+         "i0": 0, "i1": split - 1},
+        {"protocol": "ent", "t_start": run.unix_t[split],
+         "t_end": run.unix_t[-1], "death_qber": 0.0994,
+         "i0": split, "i1": n - 1},
+    ]
+    run.gaps = [{"t_start": run.unix_t[split - 1] + 0.5,
+                 "t_end": run.unix_t[split] - 0.5, "is_switch": True}]
+    run.meta = dict(run.meta, kind="session",
+                    secret_by_protocol={"pm": 500, "ent": 500})
+    return run
+
+
 class TestFigureRun(unittest.TestCase):
     def test_has_four_panels(self):
         fig = plots.figure_run(_run())
@@ -132,6 +150,69 @@ class TestSaveFigures(unittest.TestCase):
         nested = os.path.join(self.out, "deep", "figs")
         paths = plots.save_run_figures(_run(), nested)
         self.assertTrue(os.path.exists(paths[0]))
+
+
+class TestSessionFigure(unittest.TestCase):
+    def test_mode_bands_and_downtime_band_are_drawn(self):
+        import matplotlib.colors as mcolors
+        fig = plots.figure_run(_session_run())
+        ax = fig.axes[0]
+        faces = {tuple(p.get_facecolor()[:3]) for p in ax.patches}
+        self.assertIn(mcolors.to_rgb(plots.MODE_BAND["pm"]), faces)
+        self.assertIn(mcolors.to_rgb(plots.MODE_BAND["ent"]), faces)
+        self.assertIn(mcolors.to_rgb(plots.DOWNTIME_BAND), faces)
+
+    def test_one_line_per_segment_so_the_gap_is_not_bridged(self):
+        # A single trace across both segments would draw a fake line over the
+        # downtime, which is the whole point of splitting by segment.
+        run = _session_run()
+        fig = plots.figure_run(run)
+        ax = fig.axes[0]
+        t0 = run.t_start
+        gap_lo = run.gaps[0]["t_start"] - t0
+        gap_hi = run.gaps[0]["t_end"] - t0
+        traces = [ln for ln in ax.lines if len(ln.get_xdata()) > 1]
+        self.assertGreaterEqual(len(traces), 2)
+        for line in traces:
+            xs = list(line.get_xdata())
+            spans_gap = min(xs) < gap_lo and max(xs) > gap_hi
+            self.assertFalse(spans_gap,
+                             "a trace bridges the downtime: %r" % (xs,))
+
+    def test_threshold_steps_between_segments(self):
+        fig = plots.figure_run(_session_run())
+        ax = fig.axes[0]
+        ys = sorted({round(float(c.get_segments()[0][0][1]), 2)
+                     for c in ax.collections if c.get_segments()})
+        self.assertEqual(ys, [5.22, 9.94])
+
+    def test_buffer_panel_splits_by_protocol(self):
+        fig = plots.figure_run(_session_run())
+        # panel 3 is the cumulative secret bits
+        self.assertGreaterEqual(len(fig.axes[2].lines), 1)
+
+    def test_subtitle_mentions_the_switch_cost(self):
+        fig = plots.figure_run(_session_run())
+        text = " ".join(t.get_text() for t in fig.texts)
+        self.assertIn("switch", text.lower())
+
+
+class TestPlainRunUnchanged(unittest.TestCase):
+    """A run without segments must render exactly as it did before."""
+
+    def test_no_bands_are_added(self):
+        fig = plots.figure_run(_run())
+        self.assertEqual(len(fig.axes[0].patches), 0)
+
+    def test_single_trace(self):
+        fig = plots.figure_run(_run())
+        traces = [l for l in fig.axes[0].lines if len(l.get_xdata()) > 1]
+        self.assertEqual(len(traces), 1)
+
+    def test_death_line_still_drawn_from_the_argument(self):
+        fig = plots.figure_run(_run(), death_qber=0.0522)
+        self.assertTrue(any(ln.get_linestyle() == "--"
+                            for ln in fig.axes[0].lines))
 
 
 if __name__ == "__main__":
