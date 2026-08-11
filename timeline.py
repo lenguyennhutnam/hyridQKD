@@ -41,6 +41,7 @@ class Segment:
     secret_final: int = 0          # last per-run secret_bits seen here
     i0: int = 0                    # index of its first sample
     i1: int = 0                    # index of its latest sample (inclusive)
+    secret_banked: int = 0         # production from runs before a mid-segment respawn
 
 
 @dataclass
@@ -101,8 +102,12 @@ class Timeline:
 
         # A collector that died and respawned restarts its counter mid-segment;
         # bank what it had already produced so the buffer cannot go backwards.
+        # secret_banked mirrors that into secret_by_protocol's per-segment
+        # sum, which reads secret_banked + secret_final instead of the raw
+        # (now-zeroed) secret_final alone.
         if secret_bits < seg.secret_final:
             seg.secret_offset += seg.secret_final
+            seg.secret_banked += seg.secret_final
             seg.secret_final = 0
 
         self.t.append(unix_t)
@@ -165,9 +170,15 @@ class Timeline:
 
         An unrecognised protocol string is bucketed under 'pm' rather than
         raising -- this feeds a progress bar, not a security claim.
+
+        A segment's own production is secret_banked + secret_final: bits from
+        runs before a mid-segment collector respawn (banked into
+        secret_offset, see add_sample) plus the current run's latest count.
+        Using secret_final alone would drop the banked bits, so this sum
+        stays consistent with total_secret across a respawn.
         """
         out = {name: 0 for name in PROTOCOLS}
         for seg in self._segments:
             key = seg.protocol if seg.protocol in out else _DEFAULT_PROTOCOL
-            out[key] += seg.secret_final
+            out[key] += seg.secret_banked + seg.secret_final
         return out

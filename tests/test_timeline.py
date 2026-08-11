@@ -126,6 +126,15 @@ class TestSwitch(unittest.TestCase):
         self.tl.begin_downtime(125.0, "ent", 0.0994)  # Apply ENT
         self.tl.add_sample(135.0, 6.0, 900, 0)
         self.assertTrue(self.tl.gaps[-1].is_switch)
+        # Stop and the Apply that follows it must coalesce into ONE gap --
+        # its width is the measured switch cost t_switch. Only the setUp
+        # gap (already closed) plus this single Stop->Apply gap may exist,
+        # and the gap must start at the Stop time (120.0), not the later
+        # Apply time (125.0). A version that always appends a new Gap on
+        # begin_downtime would instead strand a phantom permanently-open
+        # gap here and misreport the switch cost as 10s instead of 15s.
+        self.assertEqual(len(self.tl.gaps), 2)
+        self.assertAlmostEqual(self.tl.gaps[-1].t_start, 120.0)
 
     def test_latest_protocol_follows_the_running_segment(self):
         self.assertEqual(self.tl.latest_protocol, "pm")
@@ -146,6 +155,25 @@ class TestCollectorRestartWithinASegment(unittest.TestCase):
         tl.add_sample(114.0, 1.0, 500, 500)      # restarted, counter reset
         self.assertEqual(tl.total_secret, 4500)
         self.assertEqual(tl.secret_total, sorted(tl.secret_total))
+
+    def test_secret_by_protocol_sums_to_total_after_respawn_and_switch(self):
+        # The 4000 bits produced before the respawn must not vanish from the
+        # per-protocol split just because they got banked into
+        # secret_offset instead of staying in secret_final.
+        tl = Timeline()
+        tl.begin_downtime(100.0, "pm", 0.0522)
+        tl.add_sample(110.0, 1.0, 500, 1000)
+        tl.add_sample(112.0, 1.0, 500, 4000)
+        tl.add_sample(114.0, 1.0, 500, 500)      # restarted, counter reset
+        self.assertEqual(tl.total_secret, 4500)
+        self.assertEqual(sum(tl.secret_by_protocol.values()), tl.total_secret)
+        self.assertEqual(tl.secret_by_protocol, {"pm": 4500, "ent": 0})
+
+        tl.begin_downtime(120.0, "ent", 0.0994)
+        tl.add_sample(135.0, 6.0, 900, 2000)     # ENT distilled 2000
+        self.assertEqual(tl.total_secret, 6500)
+        self.assertEqual(sum(tl.secret_by_protocol.values()), tl.total_secret)
+        self.assertEqual(tl.secret_by_protocol, {"pm": 4500, "ent": 2000})
 
 
 class TestOrphanSamples(unittest.TestCase):
