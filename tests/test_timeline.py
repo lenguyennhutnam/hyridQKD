@@ -7,7 +7,7 @@ of these tests pin it.
 """
 import unittest
 
-from timeline import Gap, Segment, Timeline
+from timeline import Gap, Timeline
 
 
 class TestEmpty(unittest.TestCase):

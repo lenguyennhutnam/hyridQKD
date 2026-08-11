@@ -479,7 +479,7 @@ class App(tk.Tk):
             # flipped after an Apply, and without this the panel would show PM
             # forecast text over an ENT trace with nothing to tell them apart.
             self.status_var.set(
-                "[%s] %s   QBER %.2f%%   keys %d   block %s/%s   secret %s b"
+                "[%s] %s   QBER %.2f%%   keys %d   block %s/%s   secret %s b (run)"
                 % (snap.protocol.upper(), snap.status, 100 * snap.qber,
                    snap.blocks, format(snap.block_progress, ","),
                    format(self._n_z_block, ","), format(snap.secret_bits, ",")))
@@ -532,8 +532,10 @@ class App(tk.Tk):
         for seg in tl.segments:
             sl = slice(seg.i0, seg.i1 + 1)
             color = MODE_LINE.get(seg.protocol, MODE_LINE["pm"])
-            self.ax_qber.plot(xs[sl], tl.qber[sl], color=color, lw=1.5)
-            self.ax_rate.plot(xs[sl], tl.sifted[sl], color=color, lw=1.5)
+            self.ax_qber.plot(xs[sl], tl.qber[sl], color=color, lw=1.5,
+                              marker=".", markersize=3)
+            self.ax_rate.plot(xs[sl], tl.sifted[sl], color=color, lw=1.5,
+                              marker=".", markersize=3)
             self._draw_segment_threshold(seg, tl, xs)
         self._shade_eve(self.ax_qber, tl, t0, xs)
         self._mark_current(self.ax_qber, xs, tl.qber, "%.2f%%")

@@ -3,15 +3,20 @@
 Drives the real App with a stub backend (same approach as
 tests/test_gui_default.py); skips cleanly where there is no display.
 """
+import os
+import tempfile
 import unittest
+
+import matplotlib.colors as mcolors
 
 
 def _load_gui():
     try:
         import gui
+        import panelstate
     except ImportError:
-        return None
-    return gui
+        return None, None
+    return gui, panelstate
 
 
 class _StubSnapshot:
@@ -69,22 +74,40 @@ class _StubBackend:
 
 
 class _AppCase(unittest.TestCase):
-    """Boots a real App on the stub backend; skips without a display."""
+    """Boots a real App on the stub backend; skips without a display.
+
+    Redirects panelstate.DEFAULT_PATH to a throwaway file for the duration of
+    the test. App.__init__ loads any saved default over the seeded preset, so
+    without this a developer's real panel_default.json leaks into these
+    fixtures: a saved b_max < 5000 clips the ENT buffer bar to width 0 (one
+    fewer patch than the tests expect), and a saved non-positive block makes
+    _read_n_z_block() raise before begin_downtime() is ever reached.
+    """
 
     def setUp(self):
-        self.gui = _load_gui()
+        self.gui, self.panelstate = _load_gui()
         if self.gui is None:
             self.skipTest("matplotlib/tkinter not available")
+        fd, self.default_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        os.remove(self.default_path)              # start with "no default"
+        self._orig_default_path = self.panelstate.DEFAULT_PATH
+        self.panelstate.DEFAULT_PATH = self.default_path
         self.backend = _StubBackend()
         try:
             self.app = self.gui.App(self.backend)
         except Exception as exc:
+            self.panelstate.DEFAULT_PATH = self._orig_default_path
             self.skipTest("cannot create Tk window: %s" % exc)
         self.app.withdraw()
 
     def tearDown(self):
+        self.panelstate.DEFAULT_PATH = self._orig_default_path
         if getattr(self, "app", None) is not None:
+            self.app.update_idletasks()
             self.app.destroy()
+        if os.path.exists(self.default_path):
+            os.remove(self.default_path)
 
     def _stream(self, protocol, times, secret_seq):
         for unix_t, secret in zip(times, secret_seq):
@@ -171,17 +194,9 @@ class TestFailedRestartLeavesNoPhantomGap(_AppCase):
         self.assertEqual(self.app.timeline.gaps[0].t_end, 0.0)
 
 
-class TestSegmentDrawing(unittest.TestCase):
+class TestSegmentDrawing(_AppCase):
     def setUp(self):
-        self.gui = _load_gui()
-        if self.gui is None:
-            self.skipTest("matplotlib/tkinter not available")
-        self.backend = _StubBackend()
-        try:
-            self.app = self.gui.App(self.backend)
-        except Exception as exc:
-            self.skipTest("cannot create Tk window: %s" % exc)
-        self.app.withdraw()
+        super().setUp()
         tl = self.app.timeline
         tl.begin_downtime(100.0, "pm", 0.0522)
         for t, s in ((110.0, 0), (112.0, 3000)):
@@ -190,10 +205,6 @@ class TestSegmentDrawing(unittest.TestCase):
         for t, s in ((135.0, 0), (137.0, 2000)):
             tl.add_sample(t, 9.0, 900, s)
         self.app._redraw()
-
-    def tearDown(self):
-        if getattr(self, "app", None) is not None:
-            self.app.destroy()
 
     def test_one_line_per_segment_so_the_gap_is_not_bridged(self):
         # A single Line2D across both segments would draw a fake trace over
@@ -210,16 +221,32 @@ class TestSegmentDrawing(unittest.TestCase):
                              "a single line bridges the downtime gap")
 
     def test_mode_bands_and_a_grey_downtime_band_are_drawn(self):
-        colors = {p.get_facecolor()[:3] for p in self.app.ax_qber.patches}
+        facecolors = {tuple(p.get_facecolor()[:3])
+                     for p in self.app.ax_qber.patches}
         self.assertGreaterEqual(len(self.app.ax_qber.patches), 3,
                                 "two mode bands plus one downtime band")
-        self.assertTrue(colors, "bands must carry colours")
+        self.assertIn(mcolors.to_rgb(self.gui.DOWNTIME_BAND), facecolors)
+        self.assertIn(mcolors.to_rgb(self.gui.MODE_BAND["pm"]), facecolors)
+        self.assertIn(mcolors.to_rgb(self.gui.MODE_BAND["ent"]), facecolors)
 
     def test_threshold_is_drawn_per_segment_not_once(self):
         # Both thresholds are above DEATH_LINE_SHOW_FRAC of their segment's
-        # QBER here (5% vs 5.22%, 9% vs 9.94%), so both must appear.
+        # QBER here (5% vs 5.22%, 9% vs 9.94%), so both must appear as their
+        # OWN hlines() call — a single session-wide threshold line would
+        # collapse this to one collection and fail the length check below.
         segs = self.app.ax_qber.collections
-        self.assertGreaterEqual(len(segs), 1)
+        self.assertEqual(len(segs), 2)
+        found = []
+        for col in segs:
+            (x0, y0), (x1, y1) = col.get_segments()[0]
+            self.assertAlmostEqual(y0, y1)
+            found.append((round(y0, 2), (min(x0, x1), max(x0, x1))))
+        found.sort()
+        self.assertEqual(found, [(5.22, (0.0, 2.0)), (9.94, (25.0, 27.0))])
+        # x-extents must be disjoint: the step is what makes the PM vs ENT
+        # threshold change visible at the switch.
+        (_, (pm_x0, pm_x1)), (_, (ent_x0, ent_x1)) = found
+        self.assertLess(pm_x1, ent_x0)
 
     def test_buffer_is_split_by_protocol(self):
         self.app._draw_buffer()
