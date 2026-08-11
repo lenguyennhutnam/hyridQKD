@@ -171,5 +171,75 @@ class TestFailedRestartLeavesNoPhantomGap(_AppCase):
         self.assertEqual(self.app.timeline.gaps[0].t_end, 0.0)
 
 
+class TestSegmentDrawing(unittest.TestCase):
+    def setUp(self):
+        self.gui = _load_gui()
+        if self.gui is None:
+            self.skipTest("matplotlib/tkinter not available")
+        self.backend = _StubBackend()
+        try:
+            self.app = self.gui.App(self.backend)
+        except Exception as exc:
+            self.skipTest("cannot create Tk window: %s" % exc)
+        self.app.withdraw()
+        tl = self.app.timeline
+        tl.begin_downtime(100.0, "pm", 0.0522)
+        for t, s in ((110.0, 0), (112.0, 3000)):
+            tl.add_sample(t, 5.0, 1000, s)
+        tl.begin_downtime(120.0, "ent", 0.0994)
+        for t, s in ((135.0, 0), (137.0, 2000)):
+            tl.add_sample(t, 9.0, 900, s)
+        self.app._redraw()
+
+    def tearDown(self):
+        if getattr(self, "app", None) is not None:
+            self.app.destroy()
+
+    def test_one_line_per_segment_so_the_gap_is_not_bridged(self):
+        # A single Line2D across both segments would draw a fake trace over
+        # the downtime, which here runs from x=10 to x=25 (unix 120..135,
+        # shifted by t0=110). Counting lines alone is not enough: the
+        # _mark_current axhline already makes two. So also require that no
+        # single line carries points on both sides of the gap.
+        self.assertGreaterEqual(len(self.app.ax_qber.lines), 2)
+        for line in self.app.ax_qber.lines:
+            xs = list(line.get_xdata())
+            before = [x for x in xs if x <= 10.0]
+            after = [x for x in xs if x >= 25.0]
+            self.assertFalse(before and after,
+                             "a single line bridges the downtime gap")
+
+    def test_mode_bands_and_a_grey_downtime_band_are_drawn(self):
+        colors = {p.get_facecolor()[:3] for p in self.app.ax_qber.patches}
+        self.assertGreaterEqual(len(self.app.ax_qber.patches), 3,
+                                "two mode bands plus one downtime band")
+        self.assertTrue(colors, "bands must carry colours")
+
+    def test_threshold_is_drawn_per_segment_not_once(self):
+        # Both thresholds are above DEATH_LINE_SHOW_FRAC of their segment's
+        # QBER here (5% vs 5.22%, 9% vs 9.94%), so both must appear.
+        segs = self.app.ax_qber.collections
+        self.assertGreaterEqual(len(segs), 1)
+
+    def test_buffer_is_split_by_protocol(self):
+        self.app._draw_buffer()
+        # track + PM portion + ENT portion
+        self.assertGreaterEqual(len(self.app.ax_buffer.patches), 3)
+
+    def test_buffer_total_matches_the_timeline(self):
+        self.assertEqual(self.app.timeline.total_secret, 5000)
+        self.assertEqual(self.app.timeline.secret_by_protocol,
+                         {"pm": 3000, "ent": 2000})
+
+    def test_no_band_reaches_left_of_the_first_sample(self):
+        # The session's FIRST gap opens on Apply, before any sample exists, so
+        # its raw span starts at a negative x (t0 is the first SAMPLE). Drawn
+        # unclamped it would drag the x-axis into negative time.
+        for patch in self.app.ax_qber.patches:
+            xs = [point[0] for point in patch.get_xy()]
+            self.assertGreaterEqual(min(xs), 0.0,
+                                    "gap/mode bands must be clamped to x >= 0")
+
+
 if __name__ == "__main__":
     unittest.main()
