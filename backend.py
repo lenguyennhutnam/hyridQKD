@@ -4,6 +4,7 @@ files or sockets directly — it calls predict/apply/stop/refresh here.
 (Same split as VeriQloud's local/gui/backend.py.)"""
 
 import csv
+import dataclasses
 import os
 import time
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ from dataclasses import dataclass, field
 import channel
 import configio
 import evectl
+import runlog
 import stackctl
 
 STALE_S = 10.0  # newest CSV row older than this while running -> error
@@ -84,6 +86,11 @@ class Backend:
                               "--p1", str(env.p1), "--eta", str(derived.eta),
                               "--key-block-bits", str(n_z_block)]
         stackctl.stop_all()
+        # Park the run that just ended before wiping it -- the order matters,
+        # archiving after the delete would silently destroy it. The run is
+        # labelled from its own live sidecar (written at the bottom of this
+        # method when it started), not from the parameters being applied now.
+        runlog.archive_run(self.csv_path)
         if os.path.exists(self.csv_path):
             os.remove(self.csv_path)  # fresh run, fresh CSV
         # Truncate the log tail too, so the log pane doesn't show the
@@ -92,6 +99,14 @@ class Backend:
         open(os.path.join(stackctl.LOG_DIR, "collector.log"), "w").close()
         stackctl.start_stack(mode)
         stackctl.start_collector(self.csv_path, collector_args)
+        # Describe the run now starting, so that whoever archives it later
+        # (the next apply, possibly in a different session) can label it.
+        runlog.write_live_meta(self.csv_path, {
+            "protocol": protocol,
+            "n_z_block": n_z_block,
+            "env": dataclasses.asdict(env),
+            "forecast": dataclasses.asdict(derived),
+        })
         self._started = True
         self._protocol = protocol
         return derived
