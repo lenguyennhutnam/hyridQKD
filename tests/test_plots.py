@@ -3,6 +3,7 @@ import os
 import shutil
 import tempfile
 import unittest
+import warnings
 
 import matplotlib
 matplotlib.use("Agg")            # no display in tests
@@ -195,6 +196,114 @@ class TestSessionFigure(unittest.TestCase):
         fig = plots.figure_run(_session_run())
         text = " ".join(t.get_text() for t in fig.texts)
         self.assertIn("switch", text.lower())
+
+
+class TestSessionGapEdges(unittest.TestCase):
+    """Gaps whose end lands on, or after, the run's own time window."""
+
+    def _grey_widths(self, ax):
+        """Data-space widths of the downtime bands on an axes."""
+        import matplotlib.colors as mcolors
+        grey = mcolors.to_rgb(plots.DOWNTIME_BAND)
+        widths = []
+        for patch in ax.patches:
+            if tuple(patch.get_facecolor()[:3]) != grey:
+                continue
+            xs = [pt[0] for pt in patch.get_xy()]
+            widths.append(max(xs) - min(xs))
+        return widths
+
+    def test_leading_gap_ending_at_the_first_sample_is_not_still_down(self):
+        # The first Apply's downtime is closed with the first sample's unix
+        # time, so its SHIFTED end is exactly 0.0. Testing the sentinel on the
+        # shifted value read that as "still down" and greyed the whole figure.
+        run = _session_run()
+        run.gaps = [{"t_start": run.unix_t[0] - 24.0,
+                     "t_end": run.unix_t[0], "is_switch": False}] + run.gaps
+        ax = plots.figure_run(run).axes[0]
+        widths = self._grey_widths(ax)
+        self.assertTrue(widths, "the mid-run switch gap should still be drawn")
+        self.assertLess(max(widths), run.t[-1],
+                        "a grey band spans the whole run: %r" % (widths,))
+
+    def test_leading_gap_draws_no_label(self):
+        run = _session_run()
+        run.gaps = [{"t_start": run.unix_t[0] - 24.0,
+                     "t_end": run.unix_t[0], "is_switch": False}] + run.gaps
+        ax = plots.figure_run(run).axes[0]
+        # The leading gap is fully before the first sample: no band, so no
+        # label either (the old code fabricated a full-width "down ...s").
+        self.assertEqual([t.get_text() for t in ax.texts
+                          if t.get_text().startswith("down")], [])
+
+    def test_still_open_gap_spans_to_the_end_but_is_not_labelled(self):
+        run = _session_run()
+        run.gaps = [{"t_start": run.unix_t[-3], "t_end": 0.0,
+                     "is_switch": False}]
+        ax = plots.figure_run(run).axes[0]
+        self.assertTrue(self._grey_widths(ax), "still-down band missing")
+        self.assertEqual([t.get_text() for t in ax.texts
+                          if "down" in t.get_text()], [])
+
+    def test_gap_label_does_not_collide_with_the_panel_title(self):
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        fig = plots.figure_run(_session_run())
+        canvas = FigureCanvasAgg(fig)      # figure_run() leaves it canvas-less
+        canvas.draw()
+        ax = fig.axes[0]
+        labels = [t for t in ax.texts if "switch" in t.get_text()]
+        self.assertTrue(labels)
+        renderer = canvas.get_renderer()
+        title = ax.title.get_window_extent(renderer)
+        for text in labels:
+            box = text.get_window_extent(renderer)
+            self.assertLess(box.y1, title.y0 + 0.5,
+                            "gap label overlaps the title")
+
+
+class TestSessionSegmentHygiene(unittest.TestCase):
+    def test_legend_lists_each_protocol_once(self):
+        # A realistic hybrid session alternates: PM -> ENT -> PM.
+        run = _session_run(n=21, split=7)
+        run.segments = [
+            {"protocol": "pm", "t_start": run.unix_t[0],
+             "t_end": run.unix_t[6], "death_qber": 0.0522, "i0": 0, "i1": 6},
+            {"protocol": "ent", "t_start": run.unix_t[7],
+             "t_end": run.unix_t[13], "death_qber": 0.0994, "i0": 7, "i1": 13},
+            {"protocol": "pm", "t_start": run.unix_t[14],
+             "t_end": run.unix_t[20], "death_qber": 0.0522, "i0": 14, "i1": 20},
+        ]
+        for ax in (plots.figure_run(run).axes[0],
+                   plots.figure_run(run).axes[1]):
+            labels = ax.get_legend_handles_labels()[1]
+            self.assertEqual([l for l in labels if l in ("PM", "ENT")],
+                             ["PM", "ENT"])
+
+    def test_segment_without_indices_is_skipped_not_widened(self):
+        # Defaulting a missing i0/i1 to the whole run draws a trace over the
+        # downtime, exactly what the per-segment split exists to avoid.
+        run = _session_run()
+        run.segments[1] = {k: v for k, v in run.segments[1].items()
+                           if k not in ("i0", "i1")}
+        ax = plots.figure_run(run).axes[0]
+        traces = [ln for ln in ax.lines if len(ln.get_xdata()) > 1]
+        self.assertEqual(len(traces), 1)
+
+    def test_rate_panel_adds_no_empty_legend_when_segments_are_unusable(self):
+        run = _session_run()
+        run.segments = [{k: v for k, v in seg.items()
+                         if k not in ("i0", "i1")} for seg in run.segments]
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")     # the "no artists" UserWarning
+            ax = plots.figure_run(run).axes[1]
+        self.assertIsNone(ax.get_legend())
+
+    def test_plain_subtitle_uses_an_ascii_arrow(self):
+        # plots.py --list prints this to a console that may not be UTF-8.
+        plain = plots._subtitle(_session_run(), latex=False)
+        self.assertIn("->", plain)
+        self.assertNotIn("→", plain)
+        plain.encode("ascii")                  # must not raise
 
 
 class TestPlainRunUnchanged(unittest.TestCase):

@@ -47,11 +47,15 @@ DOWNTIME_BAND = "#DDDDDD"
 
 
 def style_axis(ax, title=None, xlabel=None, ylabel=None,
-               fontsize_title=9, fontsize_label=8):
-    """De-cluttered axes matching the DecoyState figures."""
+               fontsize_title=9, fontsize_label=8, title_pad=5):
+    """De-cluttered axes matching the DecoyState figures.
+
+    title_pad is raised by panels that annotate the downtime gaps just above
+    the axes, so the label and the title do not sit in the same strip.
+    """
     if title:
         ax.set_title(title, fontsize=fontsize_title, fontweight="bold",
-                     color=NAVY, pad=5)
+                     color=NAVY, pad=title_pad)
     if xlabel:
         ax.set_xlabel(xlabel, fontsize=fontsize_label)
     if ylabel:
@@ -86,9 +90,12 @@ def _draw_mode_bands(ax, run, label_gaps=False):
 
     Only session exports carry segments; a plain collector run has none and
     this is a no-op, leaving those figures byte-identical to before.
+
+    Returns the number of gap labels drawn, so the caller can make room for
+    them above the axes.
     """
     if not run.segments:
-        return
+        return 0
     t0 = run.t_start
     for seg in run.segments:
         x0 = float(seg.get("t_start", t0)) - t0
@@ -98,35 +105,62 @@ def _draw_mode_bands(ax, run, label_gaps=False):
         ax.axvspan(x0, x1, lw=0, alpha=0.55,
                    color=MODE_BAND.get(seg.get("protocol"), MODE_BAND["pm"]))
     x_last = float(run.t[-1]) if len(run.t) else 0.0
+    labels = 0
     for gap in run.gaps:
         x0 = max(float(gap.get("t_start", t0)) - t0, 0.0)
-        x1 = float(gap.get("t_end", 0.0)) - t0
-        if x1 <= 0.0:
-            x1 = x_last
+        # t_end == 0.0 means "still down": run the band out to the last sample.
+        # The sentinel must be tested on the RAW value -- the first Apply's
+        # downtime ends exactly at the first sample, whose SHIFTED value is
+        # 0.0 and would be misread as "still down", greying the whole figure.
+        raw_end = float(gap.get("t_end", 0.0))
+        x1 = (raw_end - t0) if raw_end > 0.0 else x_last
         if x1 <= x0:
-            continue
+            continue          # entirely before the first sample, or empty
         ax.axvspan(x0, x1, color=DOWNTIME_BAND, alpha=0.9, lw=0)
-        if label_gaps:
+        if label_gaps and raw_end > 0.0:
             ax.annotate("%s %.0fs" % ("switch" if gap.get("is_switch")
-                                      else "down", x1 - x0),
+                                      else "down", raw_end - float(
+                                          gap.get("t_start", t0))),
                         xy=((x0 + x1) / 2, 1.0),
                         xycoords=("data", "axes fraction"),
                         ha="center", va="bottom", fontsize=6.5,
                         color="#666666")
+            labels += 1
+    return labels
 
 
 def _segment_slices(run):
-    """(protocol, slice, death_qber) per segment, clamped to the samples."""
+    """(protocol, slice, death_qber) per segment, clamped to the samples.
+
+    A segment without both sample indices is skipped rather than defaulted to
+    the whole run: defaulting would draw a trace bridging the downtime, the
+    very artefact the per-segment split exists to prevent.
+    """
     out = []
     n = len(run.t)
     for seg in run.segments:
-        i0 = max(int(seg.get("i0", 0)), 0)
-        i1 = min(int(seg.get("i1", n - 1)), n - 1)
+        if seg.get("i0") is None or seg.get("i1") is None:
+            continue
+        i0 = max(int(seg["i0"]), 0)
+        i1 = min(int(seg["i1"]), n - 1)
         if i1 < i0:
             continue
         out.append((seg.get("protocol", "pm"), slice(i0, i1 + 1),
                     seg.get("death_qber")))
     return out
+
+
+def _once(seen, protocol):
+    """Legend label for a protocol the first time it is drawn, else None.
+
+    A session alternates modes (PM -> ENT -> PM), so labelling every segment
+    would repeat entries in the legend.
+    """
+    key = str(protocol).lower()
+    if key in seen:
+        return None
+    seen.add(key)
+    return str(protocol).upper()
 
 
 def panel_qber(ax, run, death_qber=None, eve=()):
@@ -136,14 +170,15 @@ def panel_qber(ax, run, death_qber=None, eve=()):
     a stepped threshold; a plain run keeps the single trace and single line it
     has always had.
     """
-    _draw_mode_bands(ax, run, label_gaps=True)
+    n_labels = _draw_mode_bands(ax, run, label_gaps=True)
     _shade_eve(ax, run, eve)
     if len(run) and run.segments:
+        seen = set()
         for protocol, sl, seg_death in _segment_slices(run):
             ax.plot(run.t[sl], 100.0 * run.qber[sl], lw=1.6, marker=".",
                     markersize=3,
                     color=MODE_LINE.get(protocol, MODE_LINE["pm"]),
-                    label=protocol.upper())
+                    label=_once(seen, protocol))
             if seg_death:
                 ax.hlines(100.0 * float(seg_death), run.t[sl][0],
                           run.t[sl][-1], color=RED, lw=1.0, ls="--")
@@ -154,18 +189,20 @@ def panel_qber(ax, run, death_qber=None, eve=()):
                    label=r"death threshold %.2f%%" % (100.0 * death_qber))
     if ax.get_legend_handles_labels()[0]:
         ax.legend(fontsize=7.5, loc="best")
-    style_axis(ax, title="1. QBER", xlabel="time (s)", ylabel="QBER (%)")
+    style_axis(ax, title="1. QBER", xlabel="time (s)", ylabel="QBER (%)",
+               title_pad=14 if n_labels else 5)
 
 
 def panel_rate(ax, run):
     """Sifted bits per window, annotated with the mean detection rate."""
     _draw_mode_bands(ax, run)
     if len(run) and run.segments:
+        seen = set()
         for protocol, sl, _ in _segment_slices(run):
             ax.plot(run.t[sl], run.sifted[sl], lw=1.6, marker=".",
                     markersize=3,
                     color=MODE_LINE.get(protocol, MODE_LINE["pm"]),
-                    label=protocol.upper())
+                    label=_once(seen, protocol))
     elif len(run):
         ax.plot(run.t, run.sifted, color=BLUE, lw=1.6, label="sifted / window")
     if len(run):
@@ -178,6 +215,7 @@ def panel_rate(ax, run):
                     va="bottom",
                     bbox=dict(boxstyle="round,pad=0.3", fc="#F5F5F5",
                               ec="#DDDDDD", lw=0.5))
+    if ax.get_legend_handles_labels()[0]:
         ax.legend(fontsize=7.5, loc="best")
     style_axis(ax, title="2. Sifted rate", xlabel="time (s)",
                ylabel="bits / window")
@@ -267,7 +305,8 @@ def _subtitle(run, latex=True):
         ell = format(int(forecast["l_predict"]), ",")
         bits.append((r"$\ell_{predict}=%s$" if latex else "l_predict=%s") % ell)
     if run.segments:
-        modes = " → ".join(
+        # "->" for the terminal listing: a non-UTF-8 console cannot print "→".
+        modes = (" → " if latex else " -> ").join(
             "%s %.0fs" % (str(s.get("protocol", "?")).upper(),
                           float(s.get("t_end", 0)) - float(s.get("t_start", 0)))
             for s in run.segments)
