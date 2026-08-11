@@ -94,6 +94,15 @@ class Timeline:
             return                 # already down; keep the earlier start time
         self._gaps.append(Gap(t_start=now))
 
+    def set_pending_death_qber(self, death_qber):
+        """Attach the death threshold to the segment that is about to open.
+
+        _apply() only learns the threshold after an expensive bisection that
+        runs once the stack is already restarting, so it arrives later than
+        begin_downtime().
+        """
+        self._pending.death_qber = death_qber
+
     def add_sample(self, unix_t, qber_pct, sifted, secret_bits):
         """One streaming poll tick."""
         seg = self._current_segment()

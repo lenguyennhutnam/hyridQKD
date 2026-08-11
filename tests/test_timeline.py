@@ -200,6 +200,15 @@ class TestReset(unittest.TestCase):
         self.assertIsNone(tl.latest_protocol)
 
 
+class TestPendingDeathQber(unittest.TestCase):
+    def test_threshold_set_after_downtime_reaches_the_segment(self):
+        tl = Timeline()
+        tl.begin_downtime(100.0, "ent", None)
+        tl.set_pending_death_qber(0.0994)
+        tl.add_sample(110.0, 6.0, 900, 0)
+        self.assertAlmostEqual(tl.segments[0].death_qber, 0.0994)
+
+
 class TestUnknownProtocol(unittest.TestCase):
     def test_unknown_protocol_falls_back_to_pm_bucket(self):
         # secret_by_protocol must not raise on an unexpected string.
