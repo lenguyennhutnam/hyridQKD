@@ -18,6 +18,7 @@ import json
 import os
 from collections import OrderedDict
 
+import panelstate
 from channel import EntEnvParams, EnvParams
 
 PRESET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets")
@@ -32,6 +33,12 @@ def _load(protocol):
     for fname in sorted(os.listdir(PRESET_DIR)):
         if not fname.endswith(".json"):
             continue
+        if fname[:-5] == panelstate.RESERVED_NAME:
+            # The panel dropdown lists this name for the saved panel state
+            # (panelstate.py); a preset sharing it would appear twice.
+            raise ValueError("preset name %r is reserved for the saved panel "
+                             "state -- rename presets/%s"
+                             % (panelstate.RESERVED_NAME, fname))
         with open(os.path.join(PRESET_DIR, fname)) as f:
             data = json.load(f)
         if data.pop("protocol", "pm") != protocol:

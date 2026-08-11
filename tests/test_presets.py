@@ -52,5 +52,25 @@ class TestEntPresets(unittest.TestCase):
                          & set(presets.load_ent_presets()))
 
 
+class TestReservedName(unittest.TestCase):
+    """"default" belongs to the saved panel state, not to a preset file."""
+
+    def test_default_json_is_rejected(self):
+        path = os.path.join(presets.PRESET_DIR, "default.json")
+        self.assertFalse(os.path.exists(path), "real default.json must not exist")
+        with open(path, "w") as f:
+            f.write('{"d_km": 1.0}\n')
+        try:
+            with self.assertRaises(ValueError):
+                presets.load_presets()
+            with self.assertRaises(ValueError):
+                presets.load_ent_presets()
+        finally:
+            os.remove(path)
+
+    def test_loaders_work_once_it_is_gone(self):
+        self.assertIn("aurea", presets.load_presets())
+
+
 if __name__ == "__main__":
     unittest.main()

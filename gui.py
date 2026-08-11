@@ -8,6 +8,7 @@ buffer), status light, forecast line, log pane. Closing the window stops
 every child process.
 """
 
+import os
 import tkinter as tk
 from collections import deque
 from tkinter import ttk
@@ -17,6 +18,7 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 
+import panelstate  # noqa: E402
 from channel import EntEnvParams, EnvParams, death_qber, death_qber_ent  # noqa: E402
 from presets import load_ent_presets, load_presets  # noqa: E402
 
@@ -29,6 +31,7 @@ DEATH_LINE_SHOW_FRAC = 0.5
 BUFFER_FILL = "#4a90d9"       # key-buffer bar fill (filling)
 BUFFER_FULL = "#d9534f"       # key-buffer bar fill (at B_max)
 BUFFER_TRACK = "#e0e0e0"      # key-buffer bar background track
+NOTICE_COLOR = "#31708f"      # transient confirmations (not failures)
 STATUS_COLORS = {"down": "#9e9e9e", "starting": "#f0ad4e",
                  "streaming": "#5cb85c", "error": "#d9534f"}
 
@@ -73,6 +76,13 @@ class App(tk.Tk):
         # the last _load_preset() also selects the starting mode (PM).
         self._load_preset("chapman_current")
         self._load_preset("aurea")
+        # Then overlay the user's saved panel state, if any. Seeding first
+        # means a default written before some field existed still leaves that
+        # field with a sane preset value rather than blank.
+        saved = panelstate.load_default()
+        if saved is not None:
+            self._apply_panel_state(saved)
+            self.preset_box.set(panelstate.RESERVED_NAME)
         self.after(POLL_MS, self._poll)
 
     # ---------------- left: form ----------------
@@ -114,25 +124,29 @@ class App(tk.Tk):
         self.block_entry.bind("<KeyRelease>", lambda *_: self._schedule_forecast())
         row += 1
         ttk.Label(left, text="preset").grid(row=row, column=0, sticky="w")
-        self.preset_box = ttk.Combobox(
-            left, values=list(load_presets()) + list(load_ent_presets()),
-            state="readonly", width=11)
+        self.preset_box = ttk.Combobox(left, state="readonly", width=11)
         self.preset_box.grid(row=row, column=1, pady=4)
         self.preset_box.bind("<<ComboboxSelected>>",
                              lambda *_: self._load_preset(self.preset_box.get()))
+        self._refresh_preset_list()
         self.apply_btn = ttk.Button(left, text="Apply & Restart", command=self._apply)
         self.apply_btn.grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=2)
         ttk.Button(left, text="Stop", command=self._stop).grid(
             row=row + 2, column=0, columnspan=2, sticky="ew")
+        # Saves the whole panel (both regions + block + B_max + mode) so the
+        # next launch starts where this one left off. Not an Apply: it touches
+        # no config and no process.
+        ttk.Button(left, text="Save as default", command=self._save_default).grid(
+            row=row + 3, column=0, columnspan=2, sticky="ew", pady=2)
         # Eve controls: fraction input + toggle. NOT an EnvParams field; acts
         # live (no stack restart), so it is separate from Apply.
-        ttk.Label(left, text="Eve f (0..1)").grid(row=row + 3, column=0, sticky="w")
+        ttk.Label(left, text="Eve f (0..1)").grid(row=row + 4, column=0, sticky="w")
         self.eve_entry = ttk.Entry(left, width=12)
-        self.eve_entry.grid(row=row + 3, column=1, pady=1)
+        self.eve_entry.grid(row=row + 4, column=1, pady=1)
         self.eve_entry.insert(0, "0.1")
         self.eve_entry.bind("<KeyRelease>", lambda *_: self._schedule_forecast())
         self.eve_btn = tk.Button(left, text="Eve: OFF", command=self._toggle_eve)
-        self.eve_btn.grid(row=row + 4, column=0, columnspan=2, sticky="ew", pady=2)
+        self.eve_btn.grid(row=row + 5, column=0, columnspan=2, sticky="ew", pady=2)
         # Capture the platform default colors once so the OFF branch in
         # _poll() can restore them instead of hardcoding a Windows-only
         # name like "SystemButtonFace" (this app runs on Linux/X11 via WSLg).
@@ -140,16 +154,16 @@ class App(tk.Tk):
         self.forecast_var = tk.StringVar(value="forecast: -")
         self.forecast_lbl = ttk.Label(left, textvariable=self.forecast_var,
                                       wraplength=180, foreground="#333")
-        self.forecast_lbl.grid(row=row + 5, column=0, columnspan=2,
+        self.forecast_lbl.grid(row=row + 6, column=0, columnspan=2,
                                sticky="w", pady=6)
         # Key-buffer config, separated from the system params above by a rule.
         # B_max is the buffer capacity [bits]; NOT an EnvParams field (display
         # only, updates the bar live, no Apply needed).
         ttk.Separator(left, orient="horizontal").grid(
-            row=row + 6, column=0, columnspan=2, sticky="ew", pady=6)
-        ttk.Label(left, text="B_max [bits]").grid(row=row + 7, column=0, sticky="w")
+            row=row + 7, column=0, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(left, text="B_max [bits]").grid(row=row + 8, column=0, sticky="w")
         self.bmax_entry = ttk.Entry(left, width=12)
-        self.bmax_entry.grid(row=row + 7, column=1, pady=1)
+        self.bmax_entry.grid(row=row + 8, column=1, pady=1)
         self.bmax_entry.insert(0, "10000000")
 
     # ---------------- right: plots + status + log ----------------
@@ -188,12 +202,34 @@ class App(tk.Tk):
         self.canvas.draw_idle()
 
     # ---------------- helpers ----------------
+    def _refresh_preset_list(self):
+        """(Re)fill the preset dropdown. The saved panel state leads the list,
+        but only once it exists -- offering it before the first save would just
+        produce an error on selection."""
+        names = list(load_presets()) + list(load_ent_presets())
+        if panelstate.default_exists():
+            names.insert(0, panelstate.RESERVED_NAME)
+        self.preset_box.config(values=names)
+
+    def _set_entry(self, widget, value):
+        widget.delete(0, "end")
+        widget.insert(0, value)
+
     def _load_preset(self, name):
         """Fill the shared region + the preset's own region, and select its mode.
 
         Only the matching protocol's region is touched, so loading a PM preset
         leaves the ENT entries at their last (seeded) values and vice versa.
+        The saved panel state is the exception: it restores the WHOLE form.
         """
+        if name == panelstate.RESERVED_NAME:
+            state = panelstate.load_default()
+            if state is None:
+                self.error_var.set("no saved default to load")
+                self._refresh_preset_list()   # it vanished; stop offering it
+                return
+            self._apply_panel_state(state)
+            return
         pm, ent = load_presets(), load_ent_presets()
         if name in ent:
             env = ent[name]
@@ -205,9 +241,62 @@ class App(tk.Tk):
             self.proto_var.set("pm")
         for field, _ in fields:
             attr = field[4:] if field.startswith("ent_") else field
-            self.entries[field].delete(0, "end")
-            self.entries[field].insert(0, repr(getattr(env, attr)))
+            self._set_entry(self.entries[field], repr(getattr(env, attr)))
         self._schedule_forecast()
+
+    # ---------------- saved panel state ----------------
+    def _collect_panel_state(self):
+        """Snapshot the whole form as a panelstate dict.
+
+        Values are parsed to float/int here so a malformed entry raises before
+        anything is written -- the saved file never holds unusable text.
+        """
+        fields = {}
+        for field, _ in FIELDS_SHARED + FIELDS_PM + FIELDS_ENT:
+            fields[field] = float(self.entries[field].get())
+        return {"protocol": self.proto_var.get(),
+                "block": self._read_n_z_block(),
+                "b_max": self._read_b_max(),
+                "fields": fields}
+
+    def _apply_panel_state(self, state):
+        """Restore a saved snapshot. Keys absent from `state` are left alone,
+        so an older file written before a field existed still loads."""
+        for field, value in state.get("fields", {}).items():
+            if field in self.entries:      # dropped/renamed field: skip it
+                self._set_entry(self.entries[field], repr(value))
+        if "protocol" in state:
+            self.proto_var.set(state["protocol"])
+        if "block" in state:
+            self._set_entry(self.block_entry, str(state["block"]))
+        if "b_max" in state:
+            self._set_entry(self.bmax_entry, str(state["b_max"]))
+        self._schedule_forecast()
+
+    def _save_default(self):
+        try:
+            path = panelstate.save_default(self._collect_panel_state())
+        except Exception as exc:   # bad entry or unwritable file: say so
+            self.error_var.set("Save as default failed: %s" % exc)
+            return
+        self._refresh_preset_list()   # the "default" entry may be new
+        self._flash_notice("saved as default -> %s" % os.path.basename(path))
+
+    def _flash_notice(self, text, ms=4000):
+        """Transient, non-alarming message in the sticky error area."""
+        self.error_lbl.config(fg=NOTICE_COLOR)
+        self.error_var.set(text)
+        if getattr(self, "_notice_job", None):
+            self.after_cancel(self._notice_job)
+
+        def clear():
+            self._notice_job = None
+            # Only clear our own message; an error raised meanwhile wins.
+            if self.error_var.get() == text:
+                self.error_var.set("")
+            self.error_lbl.config(fg=STATUS_COLORS["error"])
+
+        self._notice_job = self.after(ms, clear)
 
     def _read_env(self):
         kwargs = {}

@@ -110,6 +110,15 @@ class TestGuiFieldsCoverage(unittest.TestCase):
         # No entry key may be claimed twice (eta_bob collision guard).
         self.assertFalse(shared_pm & {f for f, _ in gui.FIELDS_ENT})
 
+    def test_no_duplicate_field_keys_within_the_form(self):
+        # Set equality above cannot see a key listed in two regions, which
+        # would build two widgets and keep only the last in self.entries.
+        gui = self._gui()
+        all_fields = [f for f, _ in
+                      gui.FIELDS_SHARED + gui.FIELDS_PM + gui.FIELDS_ENT]
+        self.assertEqual(len(all_fields), len(set(all_fields)))
+
+
 
 if __name__ == "__main__":
     unittest.main()
