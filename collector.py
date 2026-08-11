@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Realtime extractor for the qline QKD stack (PM / BB84 decoy mode).
+"""Realtime extractor for the qline QKD stack (PM/BB84-decoy or ENT/BBM92).
 
 This is the first building block of the main app. It takes the role of
 `qber_alice` in the VeriQloud stack: it talks to gc-alice (Start/Stop over its
@@ -14,8 +14,13 @@ A "key" is plain bookkeeping for now: every KEY_BLOCK_BITS sifted bits = 1 key
 (e.g. 10e6+1000 bits -> 1 key, 1000 bits leftover). Tune the knobs in the
 PARAMETERS block below, or override per-run with the CLI flags.
 
+--protocol picks the finite-key bound and what a block is filled from: `pm`
+(default) distils the Z-basis subset with the Rusca 1-decoy bound, `ent` keys
+BOTH sifted bases with the Chapman BBM92 bound (no decoy states involved).
+
 Run inside WSL with the stack already up (see run_stack.sh):
-    python3 collector.py [--interval 2.0] [--key-block-bits 10000000] [--csv out.csv]
+    python3 collector.py [--protocol pm|ent] [--interval 2.0]
+                         [--key-block-bits 10000000] [--csv out.csv]
 Stop with Ctrl-C (sends Stop to gc and prints a cumulative summary).
 Pass --detail for the extra per-intensity line (mu1/mu2 split) each window.
 """
@@ -30,9 +35,10 @@ import time
 import numpy as np
 
 from keyrate import KeyParams, secret_key_length
+from keyrate_ent import secret_key_length_ent
 
 # ==================== PARAMETERS (chinh o day) ====================
-KEY_BLOCK_BITS = 10_000_000   # so sifted bit (basis khoa Z) cho 1 block finite-key
+KEY_BLOCK_BITS = 10_000_000   # so sifted bit cho 1 block finite-key (PM: basis Z; ENT: ca hai basis)
 PRINT_INTERVAL_S = 2.0        # chu ky in ra terminal (giay)
 
 # Tham so giao thuc dung cho cong thuc key length (phai khop hw_sim config).
@@ -141,6 +147,18 @@ class Stats:
         return self.errors / self.sifted if self.sifted else float("nan")
 
 
+def block_attrs(protocol):
+    """Which Stats counters feed the finite-key block.
+
+    PM keys only the Z basis (n_z/m_z). ENT/BBM92 keys BOTH bases
+    (Chapman: bases chosen with p=1/2 each, both generate key), so the
+    block fills from the full sifted count.
+    """
+    if protocol == "ent":
+        return "sifted", "errors"
+    return "n_z", "m_z"
+
+
 def crunch(aa, ab, rr, exp):
     """Turn raw window bytes into Stats.
 
@@ -174,12 +192,15 @@ def crunch(aa, ab, rr, exp):
     return s
 
 
-def fmt_key_row(t, s, cum, blk, block_bits, blocks, secret_bits):
+def fmt_key_row(t, s, cum, block_fill, block_bits, blocks, secret_bits):
     """Main line: sifted totals, progress of the block being filled, and the
-    secret key distilled so far."""
+    secret key distilled so far.
+
+    block_fill is the active protocol's fill counter (see block_attrs).
+    """
     return (
         f"[{t:7.1f}s] sifted +{s.sifted:>9,} (tot {cum.sifted:>11,}) | "
-        f"block {blk.n_z:>10,}/{block_bits:,} | QBER {100*s.qber:5.2f}% | "
+        f"block {block_fill:>10,}/{block_bits:,} | QBER {100*s.qber:5.2f}% | "
         f"keys {blocks:>2} secret {secret_bits:>10,} b"
     )
 
@@ -210,7 +231,11 @@ def main():
     ap.add_argument("--interval", type=float, default=PRINT_INTERVAL_S,
                     help="print period in seconds")
     ap.add_argument("--key-block-bits", type=int, default=KEY_BLOCK_BITS,
-                    help="key-basis sifted bits per finite-key block (default 10e6)")
+                    help="sifted bits per finite-key block (default 10e6); "
+                         "key basis only for pm, both bases for ent")
+    ap.add_argument("--protocol", choices=("pm", "ent"), default="pm",
+                    help="finite-key bound: pm=Rusca 1-decoy (Z basis), "
+                         "ent=Chapman BBM92 (both bases)")
     ap.add_argument("--mu1", type=float, default=MU1, help="signal intensity")
     ap.add_argument("--mu2", type=float, default=MU2, help="decoy intensity")
     ap.add_argument("--p1", type=float, default=P1, help="P(signal intensity)")
@@ -252,16 +277,31 @@ def main():
     bob.settimeout(None)
 
     params = KeyParams(mu1=args.mu1, mu2=args.mu2, p1=args.p1, eta=args.eta)
+    bits_attr, err_attr = block_attrs(args.protocol)
+    if args.protocol == "ent":
+        def compute_len(n, q):
+            return secret_key_length_ent(n, q)
+    else:
+        def compute_len(n, q):
+            return secret_key_length(n, q, params)
+
     cum = Stats()
     t0 = time.monotonic()
     win_t0 = t0
-    blk = Stats()          # key-basis bits accumulated toward the current block
+    blk = Stats()          # bits accumulated toward the current block
     blocks = 0
     secret_bits = 0
     aa_buf, ab_buf, rr_buf = bytearray(), bytearray(), bytearray()
 
-    print(f"streaming... 1 block = {args.key_block_bits:,} key-basis sifted bits, "
-          f"mu1={args.mu1} mu2={args.mu2} p1={args.p1} eta={args.eta}, "
+    if args.protocol == "ent":
+        proto_line = ("protocol ENT/BBM92 (Chapman), 1 block = "
+                      f"{args.key_block_bits:,} sifted bits (both bases)")
+    else:
+        proto_line = ("protocol PM/BB84 (Rusca 1-decoy), 1 block = "
+                      f"{args.key_block_bits:,} key-basis sifted bits, "
+                      f"mu1={args.mu1} mu2={args.mu2} p1={args.p1} "
+                      f"eta={args.eta}")
+    print(f"streaming... {proto_line}, "
           f"printing every {args.interval:.1f}s (Ctrl-C to stop)")
     try:
         with open(args.fifo, "rb") as fifo:
@@ -277,25 +317,29 @@ def main():
                     cum.add(s)
                     blk.add(s)
 
-                    # A block is ready once enough key-basis bits have piled up.
+                    # A block is ready once enough bits have piled up (key
+                    # basis for PM, both bases for ENT — see block_attrs).
                     # The overshoot (and its share of the errors) carries over to
                     # the next block so no bit is counted twice.
-                    while blk.n_z >= args.key_block_bits:
-                        n_z = args.key_block_bits
-                        over = blk.n_z - n_z
-                        m_carry = round(blk.m_z * over / blk.n_z)
-                        m_z = blk.m_z - m_carry
-                        q_blk = m_z / n_z
-                        ell = secret_key_length(n_z, q_blk, params)
+                    while getattr(blk, bits_attr) >= args.key_block_bits:
+                        fill = getattr(blk, bits_attr)
+                        fill_err = getattr(blk, err_attr)
+                        n_blk = args.key_block_bits
+                        over = fill - n_blk
+                        m_carry = round(fill_err * over / fill)
+                        m_blk = fill_err - m_carry
+                        q_blk = m_blk / n_blk
+                        ell = compute_len(n_blk, q_blk)
                         blocks += 1
                         secret_bits += ell
                         verdict = (f"{ell:,} secret bits" if ell
-                                   else "NO KEY (QBER above the decoy bound)")
+                                   else "NO KEY (QBER above the finite-key bound)")
                         print(f"          *** block #{blocks}: "
                               f"QBER {100*q_blk:.2f}% -> {verdict} ***")
-                        blk.n_z, blk.m_z = over, m_carry
+                        setattr(blk, bits_attr, over)
+                        setattr(blk, err_attr, m_carry)
 
-                    print(fmt_key_row(now - t0, s, cum, blk,
+                    print(fmt_key_row(now - t0, s, cum, getattr(blk, bits_attr),
                                       args.key_block_bits, blocks, secret_bits),
                           flush=True)
                     if args.detail:
@@ -305,7 +349,7 @@ def main():
                                   f"{s.clicks},{s.sifted},{s.errors},"
                                   f"{s.qber:.6f},{s.n_sig},{s.m_sig},"
                                   f"{s.n_dec},{s.m_dec},{cum.sifted},{blocks},"
-                                  f"{blk.n_z},{secret_bits}\n")
+                                  f"{getattr(blk, bits_attr)},{secret_bits}\n")
                     aa_buf, ab_buf, rr_buf = bytearray(), bytearray(), bytearray()
                     win_t0 = now
     except (KeyboardInterrupt, SystemExit):
@@ -338,7 +382,8 @@ def main():
               f"QBER {100*cum.qber:.2f}% ===")
         print(f"=== blocks {blocks} -> secret {secret_bits:,} bits"
               f"{f' ({secret_bits/dt/1000:.1f} kbit/s)' if dt > 0 else ''}, "
-              f"block in progress {blk.n_z:,}/{args.key_block_bits:,} ===")
+              f"block in progress {getattr(blk, bits_attr):,}"
+              f"/{args.key_block_bits:,} ===")
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+import keyrate_ent
 from keyrate import KeyParams, secret_key_length
 
 
@@ -136,6 +137,95 @@ def death_qber(env, n_z_block=10_000_000, lo=0.0, hi=0.15, iters=25):
         while probe < hi and not alive(probe):
             probe *= 10
         lo = probe
+    if not alive(lo):
+        return 0.0
+    if alive(hi):
+        return hi
+    for _ in range(iters):
+        mid = (lo + hi) / 2.0
+        if alive(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+@dataclass
+class EntEnvParams:
+    """Environment + protocol parameters for ENT (BBM92) mode.
+
+    Source-at-Alice model (Chapman 2022 App. A1): eta_a is Alice's LOCAL
+    efficiency (never sees the channel), only eta_b carries the fiber loss.
+    Defaults: channel params match the PM defaults; device params follow
+    Chapman Table I (current system) with Alice's total efficiency 0.3
+    (Fig. 8) and e_intr = mean of the two measured basis QBERs
+    (0.88%, 1.85%).
+    """
+
+    d_km: float = 0.0          # Alice-Bob fiber length
+    alpha: float = 0.23        # fiber attenuation [dB/km]
+    odr_losses: float = 13.0   # fixed optics/receiver losses [dB]
+    eta_a: float = 0.3         # Alice total efficiency (local arm)
+    eta_bob: float = 0.4       # Bob detector efficiency (x channel = eta_b)
+    xi_a: float = 1e-5         # background prob / pump pulse, Alice
+    xi_b: float = 1e-5         # background prob / pump pulse, Bob
+    e_intr: float = 0.0136     # intrinsic basis error e2
+    mu: float = 0.045          # mean pairs per pump pulse (= 2*gamma)
+    f_rep: float = 80e6        # pump repetition rate [Hz]
+    qber_sigma: float = 0.001  # Gaussian jitter std_dev on qberr (0 = fixed)
+
+
+@dataclass
+class EntDerived:
+    """Derived ENT quantities for hw_sim plain configs and the panel."""
+
+    eta_b: float           # channel x detector transmittance, Bob's arm
+    r_coinc: float         # coincidence prob per pulse -> hw_sim eta
+    q2: float              # modeled QBER Q_2,est -> hw_sim qberr
+    clicks_per_s: float    # expected coincidence rate (display only)
+    pulse_distance: float  # 1/f_rep -> hw_sim pulse_distance
+    l_predict: int         # forecast secret bits per block (0 = no key)
+    n_z_block: int         # block size the forecast is for
+
+
+def derive_ent(env, n_z_block=10_000_000):
+    """Map ENT environment parameters to hw_sim plain-mode knobs + forecast.
+
+    hw_sim knows nothing about photon pairs; we make its two knobs carry the
+    BBM92 meaning: eta := R so the stream rate equals the coincidence rate,
+    qberr := Q_2,est so the measured QBER fluctuates around the model value.
+    Writing eta := R verbatim is correct because plain (non-decoy) mode uses
+    the configured eta *directly* as the per-pulse click probability -- no
+    transform to invert (mod.rs:236 `decoy_effective_eta().unwrap_or(self.eta)`,
+    mod.rs:237-238 `BATCH_SIZE / effective_eta` pulses per batch).
+    hw_sim's uniform angle choice sifts 50% -- exactly Chapman's basis-match
+    probability (2 MUB chosen with p=1/2 each), so the collector's sifted
+    count IS the raw key m with no correction factor.
+    """
+    eta_b = 10 ** (-(env.alpha * env.d_km + env.odr_losses) / 10) * env.eta_bob
+    gamma = env.mu / 2.0
+    r = keyrate_ent.coincidence_prob(gamma, env.eta_a, eta_b,
+                                     env.xi_a, env.xi_b)
+    q2 = keyrate_ent.q2_est(gamma, env.eta_a, eta_b,
+                            env.xi_a, env.xi_b, env.e_intr)
+    l_predict = keyrate_ent.secret_key_length_ent(n_z_block, q2)
+    return EntDerived(eta_b=float(eta_b), r_coinc=float(r), q2=float(q2),
+                      clicks_per_s=float(r * env.f_rep),
+                      pulse_distance=1.0 / env.f_rep,
+                      l_predict=int(l_predict), n_z_block=int(n_z_block))
+
+
+def death_qber_ent(env, n_z_block=10_000_000, lo=0.0, hi=0.25, iters=25):
+    """Bisect for the highest QBER with a nonzero ENT key.
+
+    Unlike the PM bound, secret_key_length_ent is well-behaved at QBER=0
+    (h2(0)=0), so no low-end probing is needed. env is accepted for
+    signature symmetry with death_qber() but the ENT bound depends only on
+    the block size.
+    """
+    def alive(q):
+        return keyrate_ent.secret_key_length_ent(n_z_block, q) > 0
+
     if not alive(lo):
         return 0.0
     if alive(hi):

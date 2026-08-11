@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Read/update hw_sim decoy config files for Alice and Bob.
+"""Read/update hw_sim config files for Alice and Bob (both PM decoy and
+ENT plain pairs).
 
 Bob's eta/qberr drive the observed physics (Alice's copies are ignored by the
 simulator), but seed/angles/decoy_states MUST be identical on both sides or the
@@ -15,6 +16,10 @@ DEFAULT_ALICE = os.path.join(_WORKSPACE, "hw_sim", "config_files", "alice",
                              "hw_sim_decoy_config.json")
 DEFAULT_BOB = os.path.join(_WORKSPACE, "hw_sim", "config_files", "bob",
                            "hw_sim_decoy_config.json")
+DEFAULT_ALICE_PLAIN = os.path.join(_WORKSPACE, "hw_sim", "config_files",
+                                   "alice", "hw_sim_config.json")
+DEFAULT_BOB_PLAIN = os.path.join(_WORKSPACE, "hw_sim", "config_files",
+                                 "bob", "hw_sim_config.json")
 
 # Fields whose mismatch breaks Alice-Bob correlation.
 _MATCH_KEYS = ("seed", "angles")
@@ -78,4 +83,39 @@ def update_hw_sim_configs(eta, qberr, mu1, mu2, p1, pulse_distance,
             f.write("\n")
 
     # Final guard: verify after writing
+    check_matched(read_config(alice_path), read_config(bob_path))
+
+
+def update_hw_sim_plain_configs(eta, qberr, pulse_distance, qber_sigma=0.0,
+                                alice_path=DEFAULT_ALICE_PLAIN,
+                                bob_path=DEFAULT_BOB_PLAIN):
+    """ENT-mode variant: write eta/qberr/pulse_distance into BOTH plain
+    (non-decoy) configs, preserving other fields.
+
+    For ENT the caller passes eta = R (coincidence probability per pulse)
+    and qberr = Q_2,est (see channel.derive_ent). Any decoy_states key is
+    dropped defensively: plain mode must have none on either side, or the
+    preshared-seed RNG desyncs (measured: QBER 50%).
+    """
+    qberr_value = qberr
+    if qber_sigma > 0:
+        qberr_value = {"type": "Gaussian", "mean": qberr,
+                       "std_dev": qber_sigma}
+
+    alice_cfg = read_config(alice_path)
+    bob_cfg = read_config(bob_path)
+
+    for cfg in (alice_cfg, bob_cfg):
+        cfg["backend_config"]["eta"] = eta
+        cfg["backend_config"]["qberr"] = qberr_value
+        cfg["backend_config"]["pulse_distance"] = pulse_distance
+        cfg["backend_config"].pop("decoy_states", None)
+
+    check_matched(alice_cfg, bob_cfg)
+
+    for path, cfg in [(alice_path, alice_cfg), (bob_path, bob_cfg)]:
+        with open(path, "w") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+
     check_matched(read_config(alice_path), read_config(bob_path))

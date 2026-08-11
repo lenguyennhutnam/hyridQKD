@@ -3,7 +3,8 @@ import os
 import tempfile
 import unittest
 
-from channel import EnvParams
+import presets
+from channel import EntEnvParams, EnvParams
 from presets import load_presets, save_preset
 
 
@@ -25,6 +26,30 @@ class TestPresets(unittest.TestCase):
             self.assertEqual(p["_tmp_test"].e_det, 0.02)
         finally:
             os.remove(path)
+
+
+class TestEntPresets(unittest.TestCase):
+    def test_pm_loader_skips_ent_files(self):
+        names = set(presets.load_presets())
+        self.assertNotIn("chapman_current", names)
+        self.assertNotIn("chapman_future", names)
+        self.assertIn("aurea", names)  # PM presets untouched
+
+    def test_ent_loader_returns_ent_params(self):
+        ent = presets.load_ent_presets()
+        self.assertIn("chapman_current", ent)
+        self.assertIn("chapman_future", ent)
+        cur = ent["chapman_current"]
+        self.assertIsInstance(cur, EntEnvParams)
+        self.assertAlmostEqual(cur.eta_a, 0.3)
+        self.assertAlmostEqual(cur.eta_bob, 0.24)
+        fut = ent["chapman_future"]
+        self.assertAlmostEqual(fut.f_rep, 400e6)
+        self.assertAlmostEqual(fut.xi_b, 1e-6)
+
+    def test_loaders_are_disjoint(self):
+        self.assertFalse(set(presets.load_presets())
+                         & set(presets.load_ent_presets()))
 
 
 if __name__ == "__main__":

@@ -48,7 +48,8 @@ class TestRefresh(unittest.TestCase):
         self._orig_apply = (backend_mod.stackctl.stop_all,
                             backend_mod.stackctl.start_stack,
                             backend_mod.stackctl.start_collector,
-                            backend_mod.configio.update_hw_sim_configs)
+                            backend_mod.configio.update_hw_sim_configs,
+                            backend_mod.configio.update_hw_sim_plain_configs)
         # collector "not running" by default
         backend_mod.stackctl.collector_running = lambda: False
         # no-op stop_all so stop() doesn't try to kill real processes
@@ -58,7 +59,8 @@ class TestRefresh(unittest.TestCase):
         backend_mod.stackctl.collector_running = self._orig
         (backend_mod.stackctl.stop_all, backend_mod.stackctl.start_stack,
          backend_mod.stackctl.start_collector,
-         backend_mod.configio.update_hw_sim_configs) = self._orig_apply
+         backend_mod.configio.update_hw_sim_configs,
+         backend_mod.configio.update_hw_sim_plain_configs) = self._orig_apply
         if os.path.exists(self.csv):
             os.remove(self.csv)
 
@@ -126,6 +128,49 @@ class TestRefresh(unittest.TestCase):
         snap = self.b.refresh()
         self.assertTrue(snap.eve_active)
         self.assertAlmostEqual(snap.eve_f, 0.3)
+
+    def test_apply_ent_uses_plain_path(self):
+        order = []
+        calls = {}
+        self.b.eve = _FakeEve(order)
+        backend_mod.stackctl.stop_all = lambda: order.append("stop_all")
+        backend_mod.stackctl.start_stack = (
+            lambda mode="decoy", **k: calls.setdefault("mode", mode))
+        backend_mod.stackctl.start_collector = (
+            lambda csv, args: calls.setdefault("collector_args", list(args)))
+        backend_mod.configio.update_hw_sim_configs = (
+            lambda *a, **k: order.append("decoy_cfg"))
+        backend_mod.configio.update_hw_sim_plain_configs = (
+            lambda *a, **k: order.append("plain_cfg"))
+        d = self.b.apply(channel_mod.EntEnvParams(), 1000, protocol="ent")
+        self.assertIn("plain_cfg", order)
+        self.assertNotIn("decoy_cfg", order)
+        self.assertEqual(calls["mode"], "plain")
+        self.assertIn("--protocol", calls["collector_args"])
+        self.assertIn("ent", calls["collector_args"])
+        self.assertGreaterEqual(d.r_coinc, 0.0)  # EntDerived came back
+
+    def test_apply_pm_default_unchanged(self):
+        order = []
+        calls = {}
+        self.b.eve = _FakeEve(order)
+        backend_mod.stackctl.stop_all = lambda: None
+        backend_mod.stackctl.start_stack = (
+            lambda mode="decoy", **k: calls.setdefault("mode", mode))
+        backend_mod.stackctl.start_collector = lambda csv, args: None
+        backend_mod.configio.update_hw_sim_configs = (
+            lambda *a, **k: order.append("decoy_cfg"))
+        backend_mod.configio.update_hw_sim_plain_configs = (
+            lambda *a, **k: order.append("plain_cfg"))
+        self.b.apply(channel_mod.EnvParams(), 1000)
+        self.assertIn("decoy_cfg", order)
+        self.assertNotIn("plain_cfg", order)
+        self.assertEqual(calls["mode"], "decoy")
+
+    def test_snapshot_reports_protocol(self):
+        self.assertEqual(self.b.refresh().protocol, "pm")
+        self.b._protocol = "ent"
+        self.assertEqual(self.b.refresh().protocol, "ent")
 
 
 if __name__ == "__main__":
