@@ -9,8 +9,8 @@ every child process.
 """
 
 import os
+import time
 import tkinter as tk
-from collections import deque
 from tkinter import ttk
 
 import matplotlib
@@ -21,16 +21,20 @@ from matplotlib.figure import Figure  # noqa: E402
 import panelstate  # noqa: E402
 from channel import EntEnvParams, EnvParams, death_qber, death_qber_ent  # noqa: E402
 from presets import load_ent_presets, load_presets  # noqa: E402
+from timeline import Timeline  # noqa: E402
 
 POLL_MS = 2000
-HISTORY = 300  # plot points kept (~10 min at 2 s)
 # Only draw the death-QBER line once the window's QBER climbs to this fraction
 # of it; below that the line would flatten a low-QBER trace, so we hide it and
 # let matplotlib autoscale to the data (jitter/Eve variation becomes visible).
 DEATH_LINE_SHOW_FRAC = 0.5
-BUFFER_FILL = "#4a90d9"       # key-buffer bar fill (filling)
 BUFFER_FULL = "#d9534f"       # key-buffer bar fill (at B_max)
 BUFFER_TRACK = "#e0e0e0"      # key-buffer bar background track
+# Per-mode background tints for the session timeline, plus the grey used for
+# stack-down stretches (whose width is the switch cost t_switch).
+MODE_BAND = {"pm": "#D6E4F7", "ent": "#E2F0D9"}
+MODE_LINE = {"pm": "#2E75B6", "ent": "#70AD47"}
+DOWNTIME_BAND = "#DDDDDD"
 NOTICE_COLOR = "#31708f"      # transient confirmations (not failures)
 STATUS_COLORS = {"down": "#9e9e9e", "starting": "#f0ad4e",
                  "streaming": "#5cb85c", "error": "#d9534f"}
@@ -62,13 +66,12 @@ class App(tk.Tk):
         self.backend = backend
         self.title("QKD Control Panel (PM / ENT)")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.hist_t = deque(maxlen=HISTORY)
-        self.hist_qber = deque(maxlen=HISTORY)
-        self.hist_rate = deque(maxlen=HISTORY)
+        # Session-long history: kept across Apply/Stop and mode switches, and
+        # only ever reset by exiting the app (spec: 2026-08-11-gui-timeline).
+        self.timeline = Timeline()
         self._death_qber = None  # set once per Apply (expensive), see _apply()
         self._n_z_block = 10_000_000  # block size in effect, for the status line
         self._b_max = 10_000_000  # key-buffer capacity [bits], from the B_max input
-        self._secret_now = 0       # latest cumulative secret bits, for the buffer bar
         self._build_left()
         self._build_right()
         # Seed the ENT region too, so its entries are never empty if the user
@@ -406,6 +409,10 @@ class App(tk.Tk):
         try:
             proto, env = self._read_proto_env()
             n_z_block = self._read_n_z_block()
+            # Mark the stack going down before the restart: the width of this
+            # gap is the real switch cost, so it must start now, not after
+            # apply() returns 5-15 s later.
+            self.timeline.begin_downtime(time.time(), proto, None)
             self.backend.apply(env, n_z_block, protocol=proto)
             self._n_z_block = n_z_block
             # Expensive (~25 finite-key evaluations) -- computed once here,
@@ -414,10 +421,11 @@ class App(tk.Tk):
                 self._death_qber = death_qber_ent(env, self._n_z_block)
             else:
                 self._death_qber = death_qber(env, self._n_z_block)
-            for h in (self.hist_t, self.hist_qber, self.hist_rate):
-                h.clear()
-            self._secret_now = 0  # fresh run: buffer starts empty
+            # The threshold is only known after the (expensive) bisection
+            # above, so hand it to the pending segment now.
+            self.timeline.set_pending_death_qber(self._death_qber)
         except Exception as exc:
+            self._cancel_downtime_if_still_up()
             self.status_var.set("error")
             self.error_var.set("Apply failed: %s" % exc)
             self.status_lbl.config(bg=STATUS_COLORS["error"])
@@ -427,14 +435,43 @@ class App(tk.Tk):
     def _stop(self):
         self.status_var.set("stopping...")
         self.update_idletasks()
+        # The stack goes down whether or not stop() reports an error, so open
+        # the gap unconditionally, before the call.
+        self.timeline.begin_downtime(time.time())
         try:
             self.backend.stop()
         except Exception as exc:
+            self._cancel_downtime_if_still_up()
             self.status_var.set("error")
             self.error_var.set("Stop failed: %s" % exc)
             self.status_lbl.config(bg=STATUS_COLORS["error"])
 
+    def _cancel_downtime_if_still_up(self):
+        """Withdraw an optimistically recorded downtime after Apply/Stop failed.
+
+        backend.apply() validates params and rewrites configs BEFORE stopping
+        the stack, so a bad entry raises while the old stack is still
+        streaming. Keeping the gap then invents a switch episode and makes the
+        next segment double-count the running collector's cumulative key
+        count. A LATE failure (stack already down) does not report streaming,
+        so the gap correctly stays.
+        """
+        try:
+            if self.backend.refresh().status == "streaming":
+                self.timeline.cancel_downtime()
+        except Exception:
+            pass          # cannot tell: keep the gap, it is the safer lie
+
     def _poll(self):
+        """Timer tick: refresh once, then queue the next tick."""
+        try:
+            self._poll_once()
+        finally:
+            self.after(POLL_MS, self._poll)
+
+    def _poll_once(self):
+        """One refresh + repaint. Split out of _poll() so tests can drive a
+        single tick without scheduling real Tk timers."""
         try:
             snap = self.backend.refresh()
             # Lead with the protocol the STACK is actually running (from the
@@ -442,7 +479,7 @@ class App(tk.Tk):
             # flipped after an Apply, and without this the panel would show PM
             # forecast text over an ENT trace with nothing to tell them apart.
             self.status_var.set(
-                "[%s] %s   QBER %.2f%%   keys %d   block %s/%s   secret %s b"
+                "[%s] %s   QBER %.2f%%   keys %d   block %s/%s   secret %s b (run)"
                 % (snap.protocol.upper(), snap.status, 100 * snap.qber,
                    snap.blocks, format(snap.block_progress, ","),
                    format(self._n_z_block, ","), format(snap.secret_bits, ",")))
@@ -455,10 +492,8 @@ class App(tk.Tk):
                                     bg=self._eve_btn_defaults[0],
                                     fg=self._eve_btn_defaults[1])
             if snap.status == "streaming":
-                self.hist_t.append(snap.unix_time)
-                self.hist_qber.append(100 * snap.qber)
-                self.hist_rate.append(snap.sifted)
-                self._secret_now = snap.secret_bits  # cumulative, for the buffer bar
+                self.timeline.add_sample(snap.unix_time, 100 * snap.qber,
+                                         snap.sifted, snap.secret_bits)
                 self._redraw()
             else:
                 # Keep the buffer bar rendered (empty/last state) before the
@@ -478,42 +513,96 @@ class App(tk.Tk):
             self.log.delete("1.0", "end")
             self.log.insert("end", "Poll error: %s" % exc)
             self.log.config(state="disabled")
-        finally:
-            self.after(POLL_MS, self._poll)
 
     def _redraw(self):
-        t0 = self.hist_t[0]
-        xs = [t - t0 for t in self.hist_t]
-        self.ax_qber.clear()
-        self.ax_qber.plot(xs, list(self.hist_qber))
-        # Only draw the death-QBER line once the trace climbs near it, so a
-        # low-QBER run isn't flattened by a far-away line (spec: user request).
-        if self._death_qber is not None and self.hist_qber:
-            death_pct = 100 * self._death_qber
-            if max(self.hist_qber) >= death_pct * DEATH_LINE_SHOW_FRAC:
-                self.ax_qber.axhline(death_pct, color="red",
-                                     linestyle="--", linewidth=1)
-        # Shade intervals when Eve was ON (episodes are in unix time, same as
-        # hist_t). Open episodes (t_end==0) extend to the latest sample.
-        try:
-            now = self.hist_t[-1]
-            for ep in self.backend.eve.episodes():
-                end = ep.t_end if ep.t_end > 0 else now
-                x0, x1 = ep.t_start - t0, end - t0
-                if x1 >= xs[0] and x0 <= xs[-1]:
-                    self.ax_qber.axvspan(max(x0, xs[0]), min(x1, xs[-1]),
-                                         color="red", alpha=0.12)
-        except Exception:
-            pass
-        self._mark_current(self.ax_qber, xs, self.hist_qber, "%.2f%%")
+        tl = self.timeline
+        if not len(tl):
+            # Nothing sampled yet (e.g. Stop before the first stream): keep
+            # the buffer bar rendered instead of touching an empty history.
+            self._draw_buffer()
+            self.canvas.draw_idle()
+            return
+        t0 = tl.t0
+        xs = [t - t0 for t in tl.t]
+        for ax in (self.ax_qber, self.ax_rate):
+            ax.clear()
+            self._draw_bands(ax, tl, t0, xs[-1])
+        # One line PER SEGMENT: a single line over the whole history would
+        # draw a straight fake trace across every downtime.
+        for seg in tl.segments:
+            sl = slice(seg.i0, seg.i1 + 1)
+            color = MODE_LINE.get(seg.protocol, MODE_LINE["pm"])
+            self.ax_qber.plot(xs[sl], tl.qber[sl], color=color, lw=1.5,
+                              marker=".", markersize=3)
+            self.ax_rate.plot(xs[sl], tl.sifted[sl], color=color, lw=1.5,
+                              marker=".", markersize=3)
+            self._draw_segment_threshold(seg, tl, xs)
+        self._shade_eve(self.ax_qber, tl, t0, xs)
+        self._mark_current(self.ax_qber, xs, tl.qber, "%.2f%%")
         self.ax_qber.set_ylabel("QBER %")
-        self.ax_rate.clear()
-        self.ax_rate.plot(xs, list(self.hist_rate))
-        self._mark_current(self.ax_rate, xs, self.hist_rate,
+        self._mark_current(self.ax_rate, xs, tl.sifted,
                            lambda v: format(int(v), ","))
         self.ax_rate.set_ylabel("sifted/win")
         self._draw_buffer()
         self.canvas.draw_idle()
+
+    def _draw_bands(self, ax, tl, t0, x_last):
+        """Background: one tint per mode stretch, grey while the stack is down.
+
+        Every span is clamped to x >= 0: t0 is the first SAMPLE, but the first
+        Apply's downtime starts before any sample exists, so that gap's raw
+        x0 is negative and would drag the axis into negative time.
+        """
+        for seg in tl.segments:
+            ax.axvspan(max(seg.t_start - t0, 0.0), max(seg.t_end - t0, 0.0),
+                       color=MODE_BAND.get(seg.protocol, MODE_BAND["pm"]),
+                       alpha=0.55, lw=0)
+        for gap in tl.gaps:
+            x0 = max(gap.t_start - t0, 0.0)
+            # t_end == 0.0 means "still down": run the band out to the latest
+            # sample rather than back to the origin.
+            x1 = (gap.t_end - t0) if gap.t_end > 0 else x_last
+            if x1 <= x0:
+                continue          # entirely before the first sample, or empty
+            ax.axvspan(x0, x1, color=DOWNTIME_BAND, alpha=0.9, lw=0)
+            if ax is self.ax_qber and gap.t_end > 0:
+                ax.annotate("%s %.0fs" % ("switch" if gap.is_switch else "down",
+                                          gap.t_end - gap.t_start),
+                            xy=((x0 + x1) / 2, 1.0),
+                            xycoords=("data", "axes fraction"),
+                            ha="center", va="bottom", fontsize=6.5,
+                            color="#666666")
+
+    def _draw_segment_threshold(self, seg, tl, xs):
+        """Death-QBER line for one segment only, so the step at a mode change
+        is visible (PM ~5.2% vs ENT ~9.9%)."""
+        if seg.death_qber is None:
+            return
+        death_pct = 100 * seg.death_qber
+        window = tl.qber[seg.i0:seg.i1 + 1]
+        # Same "don't flatten a quiet trace" rule as before, judged per
+        # segment rather than over the whole session.
+        if not window or max(window) < death_pct * DEATH_LINE_SHOW_FRAC:
+            return
+        self.ax_qber.hlines(death_pct, xs[seg.i0], xs[seg.i1],
+                            color="red", linestyle="--", linewidth=1)
+
+    def _shade_eve(self, ax, tl, t0, xs):
+        """Red bands for Eve's jamming episodes (unchanged behaviour).
+
+        Episodes are in unix time, same as tl.t; an open episode (t_end == 0)
+        extends to the latest sample.
+        """
+        try:
+            now = tl.t[-1]
+            for ep in self.backend.eve.episodes():
+                end = ep.t_end if ep.t_end > 0 else now
+                x0, x1 = ep.t_start - t0, end - t0
+                if x1 >= xs[0] and x0 <= xs[-1]:
+                    ax.axvspan(max(x0, xs[0]), min(x1, xs[-1]),
+                               color="red", alpha=0.12)
+        except Exception:
+            pass
 
     def _mark_current(self, ax, xs, ys, fmt):
         """Mark the latest value: a faint horizontal dashed line at its level
@@ -528,27 +617,40 @@ class App(tk.Tk):
                     fontsize=8, color="#c00", clip_on=False)
 
     def _draw_buffer(self):
-        """Key buffer as a horizontal fill bar: filled = min(secret, B_max),
-        capped and recoloured at B_max, with 'current / max' above the right end."""
+        """Key buffer as a horizontal fill bar, split by which protocol
+        distilled each part; capped and recoloured at B_max."""
         b_max = self._read_b_max()
-        fill = min(self._secret_now, b_max)
-        full = self._secret_now >= b_max
+        total = self.timeline.total_secret
+        by_proto = self.timeline.secret_by_protocol
+        full = total >= b_max
         ax = self.ax_buffer
         ax.clear()
-        ax.barh(0, b_max, height=1.0, color=BUFFER_TRACK)                     # track
-        ax.barh(0, fill, height=1.0,
-                color=BUFFER_FULL if full else BUFFER_FILL)                  # fill
-        if 0 < fill < b_max:
-            ax.axvline(fill, color="#333", linestyle="--", linewidth=0.8)    # current mark
+        ax.barh(0, b_max, height=1.0, color=BUFFER_TRACK)                # track
+        left = 0
+        for proto in ("pm", "ent"):
+            width = min(by_proto.get(proto, 0), max(b_max - left, 0))
+            if width <= 0:
+                continue
+            ax.barh(0, width, left=left, height=1.0,
+                    color=BUFFER_FULL if full else MODE_LINE[proto],
+                    label=proto.upper())
+            left += width
+        if 0 < left < b_max:
+            ax.axvline(left, color="#333", linestyle="--", linewidth=0.8)
         ax.set_xlim(0, b_max)
         ax.set_ylim(-0.5, 0.5)
         ax.set_yticks([])
         ax.set_xlabel("key buffer [bits]")
-        label = "%s / %s%s" % (format(self._secret_now, ","),
-                               format(b_max, ","), "  FULL" if full else "")
+        label = "%s / %s%s" % (format(total, ","), format(b_max, ","),
+                               "  FULL" if full else "")
         ax.text(0.99, 1.08, label, transform=ax.transAxes, ha="right",
                 va="bottom", fontsize=9,
                 color=BUFFER_FULL if full else "#333")
+        if by_proto.get("pm") and by_proto.get("ent"):
+            ax.text(0.01, 1.08, "PM %s  •  ENT %s"
+                    % (format(by_proto["pm"], ","), format(by_proto["ent"], ",")),
+                    transform=ax.transAxes, ha="left", va="bottom",
+                    fontsize=7.5, color="#555555")
 
     def _on_close(self):
         self.backend.stop()

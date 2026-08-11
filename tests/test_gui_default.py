@@ -38,6 +38,7 @@ class TestSaveAsDefault(unittest.TestCase):
     def tearDown(self):
         self.panelstate.DEFAULT_PATH = self._orig_path
         if getattr(self, "app", None) is not None:
+            self.app.update_idletasks()
             self.app.destroy()
         if os.path.exists(self.path):
             os.remove(self.path)
@@ -123,6 +124,7 @@ class TestStartupLoadsDefault(unittest.TestCase):
     def tearDown(self):
         self.panelstate.DEFAULT_PATH = self._orig_path
         if self.app is not None:
+            self.app.update_idletasks()
             self.app.destroy()
         if os.path.exists(self.path):
             os.remove(self.path)
