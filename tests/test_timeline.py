@@ -209,6 +209,36 @@ class TestPendingDeathQber(unittest.TestCase):
         self.assertAlmostEqual(tl.segments[0].death_qber, 0.0994)
 
 
+class TestCancelDowntime(unittest.TestCase):
+    """A restart that fails before the stack was stopped never went down."""
+
+    def test_cancelled_downtime_leaves_no_gap_and_no_offset_jump(self):
+        tl = Timeline()
+        tl.begin_downtime(100.0, "pm", 0.0522)
+        tl.add_sample(110.0, 1.0, 500, 1000)
+        tl.begin_downtime(120.0, "ent", 0.0994)   # Apply pressed...
+        tl.cancel_downtime()                      # ...but it raised early
+        # Only the original (closed) startup gap survives: no new one is left
+        # open, so the record shows uninterrupted streaming.
+        self.assertEqual(tl.gaps, [Gap(t_start=100.0, t_end=110.0,
+                                       is_switch=False)])
+        # The still-running collector keeps counting: same segment, no offset.
+        tl.add_sample(130.0, 1.0, 500, 1200)
+        self.assertEqual(len(tl.segments), 1)
+        self.assertEqual(tl.total_secret, 1200)
+        self.assertEqual(tl.segments[0].protocol, "pm")   # no phantom switch
+
+    def test_cancel_without_an_open_downtime_is_a_no_op(self):
+        tl = Timeline()
+        tl.cancel_downtime()                      # empty timeline
+        self.assertEqual(tl.gaps, [])
+        tl.begin_downtime(100.0, "pm", 0.0522)
+        tl.add_sample(110.0, 1.0, 500, 1000)      # closes the gap
+        tl.cancel_downtime()                      # must not eat a real gap
+        self.assertEqual(len(tl.gaps), 1)
+        self.assertEqual(tl.gaps[0].t_end, 110.0)
+
+
 class TestUnknownProtocol(unittest.TestCase):
     def test_unknown_protocol_falls_back_to_pm_bucket(self):
         # secret_by_protocol must not raise on an unexpected string.

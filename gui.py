@@ -421,6 +421,7 @@ class App(tk.Tk):
             # above, so hand it to the pending segment now.
             self.timeline.set_pending_death_qber(self._death_qber)
         except Exception as exc:
+            self._cancel_downtime_if_still_up()
             self.status_var.set("error")
             self.error_var.set("Apply failed: %s" % exc)
             self.status_lbl.config(bg=STATUS_COLORS["error"])
@@ -436,9 +437,26 @@ class App(tk.Tk):
         try:
             self.backend.stop()
         except Exception as exc:
+            self._cancel_downtime_if_still_up()
             self.status_var.set("error")
             self.error_var.set("Stop failed: %s" % exc)
             self.status_lbl.config(bg=STATUS_COLORS["error"])
+
+    def _cancel_downtime_if_still_up(self):
+        """Withdraw an optimistically recorded downtime after Apply/Stop failed.
+
+        backend.apply() validates params and rewrites configs BEFORE stopping
+        the stack, so a bad entry raises while the old stack is still
+        streaming. Keeping the gap then invents a switch episode and makes the
+        next segment double-count the running collector's cumulative key
+        count. A LATE failure (stack already down) does not report streaming,
+        so the gap correctly stays.
+        """
+        try:
+            if self.backend.refresh().status == "streaming":
+                self.timeline.cancel_downtime()
+        except Exception:
+            pass          # cannot tell: keep the gap, it is the safer lie
 
     def _poll(self):
         """Timer tick: refresh once, then queue the next tick."""

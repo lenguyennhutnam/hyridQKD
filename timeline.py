@@ -94,6 +94,19 @@ class Timeline:
             return                 # already down; keep the earlier start time
         self._gaps.append(Gap(t_start=now))
 
+    def cancel_downtime(self):
+        """Undo a downtime that never happened.
+
+        _apply() declares downtime optimistically BEFORE restarting the stack
+        (the gap's width is the switch cost, so it must start when the button
+        is pressed). If the restart then fails early -- bad parameters raise
+        before the stack is stopped -- the stack is still streaming and the
+        recorded gap is a lie: it would fake a switch episode and make the
+        next segment double-count the running collector's key total.
+        """
+        if self._gaps and self._gaps[-1].t_end == 0.0:
+            self._gaps.pop()
+
     def set_pending_death_qber(self, death_qber):
         """Attach the death threshold to the segment that is about to open.
 
