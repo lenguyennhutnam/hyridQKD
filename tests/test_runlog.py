@@ -220,5 +220,63 @@ class TestEveEpisodes(_TmpDirCase):
         self.assertEqual(len(runlog.load_eve_episodes(1000.0, 2000.0, path)), 1)
 
 
+class TestSessionExtras(_TmpDirCase):
+    """Reading the extra bits a GUI session export carries."""
+
+    def _write_session(self, sidecar=None):
+        path = os.path.join(self.tmp, "session.csv")
+        with open(path, "w") as f:
+            f.write(HEADER.rstrip("\n") + ",protocol\n")
+            f.write(_row(1000.0).rstrip("\n") + ",pm\n")
+            f.write(_row(1002.0).rstrip("\n") + ",ent\n")
+        if sidecar is not None:
+            with open(path[:-4] + ".json", "w") as f:
+                f.write(sidecar)
+        return path
+
+    def test_protocol_column_is_read(self):
+        run = runlog.load_run(self._write_session())
+        self.assertEqual(list(run.protocol), ["pm", "ent"])
+
+    def test_missing_protocol_column_is_not_an_error(self):
+        # Every auto-archived run predates this column.
+        self._write([_row(1000.0), _row(1002.0)])
+        run = runlog.load_run(self.csv)
+        self.assertEqual(len(run.t), 2)
+        self.assertEqual(list(run.protocol), ["", ""])
+
+    def test_segments_and_gaps_come_from_the_sidecar(self):
+        run = runlog.load_run(self._write_session(json.dumps({
+            "segments": [{"protocol": "pm", "t_start": 1000.0,
+                          "t_end": 1000.0, "death_qber": 0.0522,
+                          "i0": 0, "i1": 0},
+                         {"protocol": "ent", "t_start": 1002.0,
+                          "t_end": 1002.0, "death_qber": 0.0994,
+                          "i0": 1, "i1": 1}],
+            "gaps": [{"t_start": 1000.5, "t_end": 1001.5, "is_switch": True}],
+        })))
+        self.assertEqual([s["protocol"] for s in run.segments], ["pm", "ent"])
+        self.assertAlmostEqual(run.segments[1]["death_qber"], 0.0994)
+        self.assertTrue(run.gaps[0]["is_switch"])
+
+    def test_no_sidecar_means_no_segments(self):
+        run = runlog.load_run(self._write_session())
+        self.assertEqual(run.segments, [])
+        self.assertEqual(run.gaps, [])
+
+    def test_corrupt_sidecar_does_not_raise(self):
+        run = runlog.load_run(self._write_session("{not json"))
+        self.assertEqual(run.segments, [])
+        self.assertEqual(len(run.t), 2)
+
+    def test_malformed_segment_entries_are_dropped(self):
+        run = runlog.load_run(self._write_session(json.dumps({
+            "segments": ["not a dict", {"protocol": "pm", "i0": 0, "i1": 0}],
+            "gaps": "not a list",
+        })))
+        self.assertEqual(len(run.segments), 1)
+        self.assertEqual(run.gaps, [])
+
+
 if __name__ == "__main__":
     unittest.main()
