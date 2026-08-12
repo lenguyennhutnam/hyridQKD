@@ -262,6 +262,27 @@ class TestSegmentDrawing(_AppCase):
             self.assertFalse(before and after,
                              "a single line bridges the downtime gap")
 
+    def test_mode_band_reaches_the_apply_press_not_the_last_sample(self):
+        # PM's last sample is at unix 112 but Apply was pressed at 120; the
+        # tint must reach 120 (x=10) or an untinted sliver appears before the
+        # grey band, reading as "stopped" while the link was still streaming.
+        import matplotlib.colors as mcolors
+        want = mcolors.to_rgb(self.gui.MODE_BAND["pm"])
+        pm = [p for p in self.app.ax_qber.patches
+              if tuple(p.get_facecolor()[:3]) == want]
+        self.assertEqual(len(pm), 1)
+        xs = [pt[0] for pt in pm[0].get_xy()]
+        self.assertAlmostEqual(max(xs), 10.0, places=6)   # unix 120 - t0 110
+
+    def test_the_running_segment_still_ends_at_its_last_sample(self):
+        import matplotlib.colors as mcolors
+        want = mcolors.to_rgb(self.gui.MODE_BAND["ent"])
+        ent = [p for p in self.app.ax_qber.patches
+               if tuple(p.get_facecolor()[:3]) == want]
+        self.assertEqual(len(ent), 1)
+        xs = [pt[0] for pt in ent[0].get_xy()]
+        self.assertAlmostEqual(max(xs), 27.0, places=6)   # unix 137 - t0 110
+
     def test_mode_bands_and_a_grey_downtime_band_are_drawn(self):
         facecolors = {tuple(p.get_facecolor()[:3])
                      for p in self.app.ax_qber.patches}

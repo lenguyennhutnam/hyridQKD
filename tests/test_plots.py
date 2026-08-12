@@ -241,6 +241,43 @@ class TestSessionFigure(unittest.TestCase):
         self.assertIn("switch", text.lower())
 
 
+class TestModeBandReachesTheDowntime(unittest.TestCase):
+    """No white sliver between a mode's tint and the downtime that ended it."""
+
+    def _band(self, ax, colour):
+        import matplotlib.colors as mcolors
+        want = mcolors.to_rgb(colour)
+        for patch in ax.patches:
+            if tuple(patch.get_facecolor()[:3]) == want:
+                xs = [pt[0] for pt in patch.get_xy()]
+                return min(xs), max(xs)
+        return None
+
+    def test_band_runs_to_the_apply_press_not_the_last_sample(self):
+        # A segment's t_end is its last RECORDED sample, but the stack kept
+        # running that mode until Apply was pressed (the gap's t_start). Ending
+        # the tint at the last sample leaves a gap-of-nothing up to one window
+        # wide that reads as "stopped" when it was still streaming.
+        run = _session_run()
+        gap_start = run.gaps[0]["t_start"]
+        self.assertGreater(gap_start, run.segments[0]["t_end"],
+                           "fixture must have Apply land after the last sample")
+        ax = plots.figure_run(run).axes[0]
+        pm = self._band(ax, plots.MODE_BAND["pm"])
+        self.assertIsNotNone(pm)
+        self.assertAlmostEqual(pm[1], gap_start - run.t_start, places=6)
+
+    def test_the_last_segment_still_ends_at_its_last_sample(self):
+        # Nothing follows it, so the future is unknown -- do not extrapolate.
+        run = _session_run()
+        ax = plots.figure_run(run).axes[0]
+        ent = self._band(ax, plots.MODE_BAND["ent"])
+        self.assertIsNotNone(ent)
+        self.assertAlmostEqual(ent[1],
+                               run.segments[-1]["t_end"] - run.t_start,
+                               places=6)
+
+
 class TestSessionGapEdges(unittest.TestCase):
     """Gaps whose end lands on, or after, the run's own time window."""
 

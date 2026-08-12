@@ -85,6 +85,26 @@ def _shade_eve(ax, run, eve):
         labelled = True
 
 
+def band_end(seg_end, gap_starts):
+    """Where a mode's tint should stop, in the same clock as `seg_end`.
+
+    A segment's t_end is its last RECORDED sample, but the stack kept running
+    that mode until Apply was pressed -- the following gap's t_start. Stopping
+    the tint at the last sample leaves an untinted sliver up to one collector
+    window wide, which reads as "stopped" when the link was still streaming.
+
+    A segment with no gap after it is the one still running: it ends at its
+    last sample, because the future is not known yet.
+
+    Shared by plots.py and gui.py so the exported figure and the live panel
+    cannot disagree about where a mode ended.
+    """
+    for start in gap_starts:
+        if start >= seg_end:
+            return start
+    return seg_end
+
+
 def _draw_mode_bands(ax, run, label_gaps=False):
     """Tint each mode's stretch and grey out the stack-down intervals.
 
@@ -97,9 +117,10 @@ def _draw_mode_bands(ax, run, label_gaps=False):
     if not run.segments:
         return 0
     t0 = run.t_start
+    gap_starts = sorted(float(g.get("t_start", 0.0)) for g in run.gaps)
     for seg in run.segments:
         x0 = float(seg.get("t_start", t0)) - t0
-        x1 = float(seg.get("t_end", t0)) - t0
+        x1 = band_end(float(seg.get("t_end", t0)), gap_starts) - t0
         if x1 <= x0:
             continue
         ax.axvspan(x0, x1, lw=0, alpha=0.55,

@@ -26,7 +26,7 @@ from channel import EntEnvParams, EnvParams, death_qber, death_qber_ent  # noqa:
 # Per-mode background tints for the session timeline, plus the grey used for
 # stack-down stretches (whose width is the switch cost t_switch). Owned by
 # plots.py so the live panel and the exported figures cannot drift apart.
-from plots import DOWNTIME_BAND, MODE_BAND, MODE_LINE  # noqa: E402
+from plots import DOWNTIME_BAND, MODE_BAND, MODE_LINE, band_end  # noqa: E402
 from presets import load_ent_presets, load_presets  # noqa: E402
 from timeline import Timeline  # noqa: E402
 
@@ -645,8 +645,14 @@ class App(tk.Tk):
         Apply's downtime starts before any sample exists, so that gap's raw
         x0 is negative and would drag the axis into negative time.
         """
+        # A segment ends at its last SAMPLE, but the mode kept running until
+        # Apply was pressed; band_end() carries the tint to that moment so no
+        # untinted sliver appears before the grey band (shared with plots.py
+        # so the panel and the exported figure agree).
+        gap_starts = sorted(gap.t_start for gap in tl.gaps)
         for seg in tl.segments:
-            ax.axvspan(max(seg.t_start - t0, 0.0), max(seg.t_end - t0, 0.0),
+            ax.axvspan(max(seg.t_start - t0, 0.0),
+                       max(band_end(seg.t_end, gap_starts) - t0, 0.0),
                        color=MODE_BAND.get(seg.protocol, MODE_BAND["pm"]),
                        alpha=0.55, lw=0)
         for gap in tl.gaps:
