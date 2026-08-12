@@ -20,17 +20,28 @@ def _load_gui():
 
 
 class _StubSnapshot:
+    """Mirrors backend.Snapshot -- every field _poll_once() reads.
+
+    window_s/errors are not shown anywhere in the panel, but the GUI forwards
+    them into the Timeline for the session export, so a stub without them
+    turns every poll into a caught AttributeError.
+    """
+
     def __init__(self, status="streaming", protocol="pm", unix_time=0.0,
-                 qber=0.01, sifted=1000, secret_bits=0):
+                 qber=0.01, sifted=1000, secret_bits=0, clicks=None,
+                 window_s=2.0, errors=0, total_sifted=None, blocks=0,
+                 block_progress=0):
         self.status = status
         self.protocol = protocol
         self.unix_time = unix_time
+        self.window_s = window_s
         self.qber = qber
-        self.clicks = 2 * sifted
+        self.clicks = 2 * sifted if clicks is None else clicks
         self.sifted = sifted
-        self.total_sifted = sifted
-        self.blocks = 0
-        self.block_progress = 0
+        self.errors = errors
+        self.total_sifted = sifted if total_sifted is None else total_sifted
+        self.blocks = blocks
+        self.block_progress = block_progress
         self.secret_bits = secret_bits
         self.log_lines = []
         self.eve_active = False
@@ -115,6 +126,37 @@ class _AppCase(unittest.TestCase):
                 status="streaming", protocol=protocol, unix_time=unix_t,
                 qber=0.01, sifted=1000, secret_bits=secret)
             self.app._poll_once()
+
+
+class TestSnapshotForwarding(_AppCase):
+    """_poll_once() must hand the Timeline the WHOLE snapshot.
+
+    The Timeline carries ten collector columns but defaults six of them to 0,
+    so a GUI that forwards only the four plotted values still passes every
+    Timeline and sessionio test -- and exports a file whose clicks, block fill
+    and block count are flat zeros. This seam is the one place that catches it.
+    """
+
+    def test_poll_forwards_every_collector_column(self):
+        self.backend.snapshot = _StubSnapshot(
+            status="streaming", protocol="pm", unix_time=1000.0, qber=0.0531,
+            sifted=123_456, secret_bits=777, clicks=246_912, window_s=2.5,
+            errors=6_555, total_sifted=987_654, blocks=3,
+            block_progress=444_555)
+        self.app._poll_once()
+        self.assertEqual(self.app.error_var.get(), "",
+                         "the poll itself failed, so this proves nothing")
+        tl = self.app.timeline
+        self.assertEqual(tl.t[-1], 1000.0)
+        self.assertAlmostEqual(tl.qber[-1], 5.31)
+        self.assertEqual(tl.sifted[-1], 123_456)
+        self.assertEqual(tl.secret_total[-1], 777)
+        self.assertEqual(tl.clicks[-1], 246_912)
+        self.assertEqual(tl.window_s[-1], 2.5)
+        self.assertEqual(tl.errors[-1], 6_555)
+        self.assertEqual(tl.total_sifted[-1], 987_654)
+        self.assertEqual(tl.blocks[-1], 3)
+        self.assertEqual(tl.block_progress[-1], 444_555)
 
 
 class TestTimelineAcrossSwitch(_AppCase):

@@ -24,9 +24,11 @@ class Snapshot:
 
     status: str = "down"        # down | starting | streaming | error
     unix_time: float = 0.0
+    window_s: float = 0.0       # length of the last window, in seconds
     qber: float = float("nan")
     clicks: int = 0             # clicks in the last window
     sifted: int = 0             # sifted bits in the last window
+    errors: int = 0             # sifted bits that disagreed, in the last window
     total_sifted: int = 0
     blocks: int = 0
     block_progress: int = 0
@@ -153,9 +155,14 @@ class Backend:
             snap.status = "starting" if running else "down"
             return snap
         snap.unix_time = float(row["unix_time"])
+        # window_s/errors are not shown in the panel, but the GUI forwards the
+        # whole row into the session Timeline so an export can be written as a
+        # complete collector-shaped CSV.
+        snap.window_s = float(row["window_s"])
         snap.qber = float(row["qber"])
         snap.clicks = int(row["clicks"])
         snap.sifted = int(row["sifted"])
+        snap.errors = int(row["errors"])
         snap.total_sifted = int(row["total_sifted"])
         snap.blocks = int(row["blocks"])
         snap.block_progress = int(row["block_progress"])

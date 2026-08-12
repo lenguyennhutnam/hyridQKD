@@ -222,9 +222,21 @@ def panel_rate(ax, run):
 
 
 def panel_secret(ax, run, b_max=None):
-    """Cumulative distilled secret bits; flat stretches are blocks that died."""
+    """Cumulative distilled secret bits; flat stretches are blocks that died.
+
+    A session export is stepped once per segment, coloured by the mode that
+    produced those bits, so the panel says WHICH protocol filled the buffer;
+    a plain run keeps the single green step it has always had.
+    """
     _draw_mode_bands(ax, run)
-    if len(run):
+    if len(run) and run.segments:
+        seen = set()
+        for protocol, sl, _ in _segment_slices(run):
+            ax.step(run.t[sl], run.secret_bits[sl], where="post", lw=1.8,
+                    color=MODE_LINE.get(protocol, MODE_LINE["pm"]),
+                    label=_once(seen, protocol))
+        _mark_dead_blocks(ax, run)
+    elif len(run):
         ax.step(run.t, run.secret_bits, where="post", color=GREEN, lw=1.8,
                 label="secret bits")
         _mark_dead_blocks(ax, run)
@@ -238,31 +250,60 @@ def panel_secret(ax, run, b_max=None):
 
 
 def _mark_dead_blocks(ax, run):
-    """Cross where a block completed but distilled nothing (QBER over bound)."""
-    new_block = run.blocks[1:] > run.blocks[:-1]
-    no_key = run.secret_bits[1:] == run.secret_bits[:-1]
-    dead = new_block & no_key
-    if not dead.any():
+    """Cross where a block completed but distilled nothing (QBER over bound).
+
+    On a session export the difference is taken WITHIN each segment. Every
+    collector process restarts the blocks counter from zero, so the pair
+    straddling a downtime compares two unrelated counters: it reads as "a
+    block completed and produced nothing" whenever the new collector's first
+    count happens to exceed the old one's last, planting a phantom cross at
+    the first sample after the gap.
+    """
+    spans = ([sl for _, sl, _ in _segment_slices(run)] if run.segments
+             else [slice(0, len(run))])
+    idx = []
+    for sl in spans:
+        blocks = run.blocks[sl]
+        secret = run.secret_bits[sl]
+        dead = (blocks[1:] > blocks[:-1]) & (secret[1:] == secret[:-1])
+        idx.extend(sl.start + i + 1 for i, flag in enumerate(dead) if flag)
+    if not idx:
         return
-    idx = [i + 1 for i, flag in enumerate(dead) if flag]
     ax.plot(run.t[idx], run.secret_bits[idx], "x", color=RED, ms=7, mew=1.6,
             ls="none", label="block with no key")
 
 
+def _blocks_caption(ax, n_blocks, total):
+    """Corner box counting the finished blocks and the bits they distilled."""
+    ax.text(0.02, 0.90,
+            "%d block(s) completed — %s secret bits"
+            % (n_blocks, format(total, ",")),
+            transform=ax.transAxes, fontsize=7, color="#555555", va="top",
+            bbox=dict(boxstyle="round,pad=0.3", fc="#F5F5F5", ec="#DDDDDD",
+                      lw=0.5))
+
+
 def panel_blocks(ax, run):
-    """Fill level of the block being accumulated: each drop is a finished block."""
+    """Fill level of the block being accumulated: each drop is a finished block.
+
+    Split per segment on a session export, like the panels above it: one trace
+    over the whole run interpolates the fill level straight across the grey
+    downtime band, asserting the block kept filling while the stack was down.
+    """
     _draw_mode_bands(ax, run)
-    if len(run):
-        ax.plot(run.t, run.block_progress, color=TEAL, lw=1.4)
-        n_blocks = int(run.blocks[-1])
+    if len(run) and run.segments:
+        slices = _segment_slices(run)
+        for protocol, sl, _ in slices:
+            ax.plot(run.t[sl], run.block_progress[sl], lw=1.4,
+                    color=MODE_LINE.get(protocol, MODE_LINE["pm"]))
+        # Each collector restarts the blocks counter, so the session total is
+        # the sum of the per-segment finals, not the last value in the column.
+        n_blocks = sum(int(run.blocks[sl][-1]) for _, sl, _ in slices)
         total = int(run.secret_bits[-1])
-        ax.text(0.02, 0.90,
-                "%d block(s) completed — %s secret bits"
-                % (n_blocks, format(total, ",")),
-                transform=ax.transAxes, fontsize=7, color="#555555",
-                va="top",
-                bbox=dict(boxstyle="round,pad=0.3", fc="#F5F5F5",
-                          ec="#DDDDDD", lw=0.5))
+        _blocks_caption(ax, n_blocks, total)
+    elif len(run):
+        ax.plot(run.t, run.block_progress, color=TEAL, lw=1.4)
+        _blocks_caption(ax, int(run.blocks[-1]), int(run.secret_bits[-1]))
     style_axis(ax, title="4. Block fill progress", xlabel="time (s)",
                ylabel="bits in block")
 
@@ -331,8 +372,12 @@ def figure_run(run, death_qber=None, b_max=None, eve=(), figsize=(9, 10)):
     if subtitle:
         fig.text(0.5, 0.957, subtitle, ha="center", fontsize=8.5,
                  color="#444444")
+    # A session pads every panel title upwards to clear the gap labels
+    # (style_axis's title_pad), which pushes the FIRST panel's title into the
+    # parameter subtitle above it. Drop the grid to give that pad somewhere to
+    # go; a plain run has no labels, no pad, and keeps its original geometry.
     gs = fig.add_gridspec(4, 1, hspace=0.42, left=0.10, right=0.97,
-                          top=0.93, bottom=0.06)
+                          top=0.915 if run.segments else 0.93, bottom=0.06)
     for i, (_, draw) in enumerate(_panels_for(run, death_qber, b_max, eve)):
         draw(fig.add_subplot(gs[i]))
     return fig

@@ -351,7 +351,13 @@ class App(tk.Tk):
             csv_path, json_path = sessionio.export_session(
                 self.timeline, name, runs_dir=runs_dir, extra_meta=extra_meta)
             run = runlog.load_run(csv_path)
-            png_path = plots.save_run_figures(run, figs_dir)[0]
+            # Same overlays the CLI draws by default, so `plots.py <file>` and
+            # this button never disagree about the same run: the buffer
+            # capacity the panel is holding, and any jamming episode that
+            # explains a QBER excursion in the trace.
+            png_path = plots.save_run_figures(
+                run, figs_dir, b_max=extra_meta["b_max"],
+                eve=runlog.load_eve_episodes(run.t_start, run.t_end))[0]
         except Exception as exc:
             self.error_var.set("Export failed: %s" % exc)
             return None
@@ -570,8 +576,16 @@ class App(tk.Tk):
                                     bg=self._eve_btn_defaults[0],
                                     fg=self._eve_btn_defaults[1])
             if snap.status == "streaming":
-                self.timeline.add_sample(snap.unix_time, 100 * snap.qber,
-                                         snap.sifted, snap.secret_bits)
+                # Forward the WHOLE row, not just the four plotted values: the
+                # session export writes a collector-shaped CSV, and
+                # runlog.load_run drops any row missing a column, so anything
+                # not forwarded here would export as zeros.
+                self.timeline.add_sample(
+                    snap.unix_time, 100 * snap.qber, snap.sifted,
+                    snap.secret_bits, clicks=snap.clicks,
+                    window_s=snap.window_s, errors=snap.errors,
+                    total_sifted=snap.total_sifted, blocks=snap.blocks,
+                    block_progress=snap.block_progress)
                 self._redraw()
             else:
                 # Keep the buffer bar rendered (empty/last state) before the

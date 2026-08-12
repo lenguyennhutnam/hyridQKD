@@ -187,10 +187,53 @@ class TestSessionFigure(unittest.TestCase):
                      for c in ax.collections if c.get_segments()})
         self.assertEqual(ys, [5.22, 9.94])
 
-    def test_buffer_panel_splits_by_protocol(self):
-        fig = plots.figure_run(_session_run())
-        # panel 3 is the cumulative secret bits
-        self.assertGreaterEqual(len(fig.axes[2].lines), 1)
+    def test_buffer_panel_steps_once_per_segment_in_mode_colours(self):
+        # Panel 3 is the cumulative secret bits. "At least one line" is not a
+        # test: a run with NO segments draws one line too, so the old
+        # assertion passed whether or not the split existed.
+        run = _session_run()
+        ax = plots.figure_run(run).axes[2]
+        steps = [ln for ln in ax.lines if ln.get_marker() != "x"]
+        self.assertEqual(len(steps), len(run.segments))
+        self.assertEqual([ln.get_color() for ln in steps],
+                         [plots.MODE_LINE["pm"], plots.MODE_LINE["ent"]])
+
+    def test_block_progress_does_not_span_the_downtime(self):
+        # One plot() over the whole run interpolates the fill level straight
+        # through the grey band, asserting the block kept filling while the
+        # stack was down.
+        run = _session_run()
+        ax = plots.figure_run(run).axes[3]
+        t0 = run.t_start
+        gap_lo = run.gaps[0]["t_start"] - t0
+        gap_hi = run.gaps[0]["t_end"] - t0
+        traces = [ln for ln in ax.lines if len(ln.get_xdata()) > 1]
+        self.assertEqual(len(traces), len(run.segments))
+        for line in traces:
+            xs = list(line.get_xdata())
+            self.assertFalse(min(xs) < gap_lo and max(xs) > gap_hi,
+                             "block fill is interpolated across the downtime")
+
+    def test_no_phantom_dead_block_at_the_segment_boundary(self):
+        # Each collector restarts its blocks counter, so the pair straddling
+        # the downtime compares two unrelated counters. Here segment 2's first
+        # window already reports a block while the session total is still
+        # flat: differenced across the whole array that reads as "a block
+        # completed and distilled nothing" and plants a cross in the gap.
+        run = _session_run(n=20, split=10)
+        blocks = np.zeros(20, dtype=np.int64)
+        blocks[10:] = 1          # segment 2's own counter, from zero again
+        blocks[17:] = 2          # ... and it really does waste a block here
+        secret = np.zeros(20, dtype=np.int64)
+        secret[14:] = 500
+        run.blocks = blocks
+        run.secret_bits = secret
+        ax = plots.figure_run(run).axes[2]
+        crosses = [ln for ln in ax.lines if ln.get_marker() == "x"]
+        self.assertEqual(len(crosses), 1, "the genuine dead block is missing")
+        self.assertEqual([float(x) for x in crosses[0].get_xdata()],
+                         [float(run.t[17])],
+                         "a cross was planted at the segment boundary")
 
     def test_subtitle_mentions_the_switch_cost(self):
         fig = plots.figure_run(_session_run())
@@ -259,6 +302,22 @@ class TestSessionGapEdges(unittest.TestCase):
             box = text.get_window_extent(renderer)
             self.assertLess(box.y1, title.y0 + 0.5,
                             "gap label overlaps the title")
+
+    def test_panel_title_does_not_collide_with_the_figure_subtitle(self):
+        # Making room for the gap labels raises the FIRST panel's title, which
+        # is what actually ran into the parameter subtitle above it -- the
+        # gap label itself was never the collision.
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        fig = plots.figure_run(_session_run())
+        canvas = FigureCanvasAgg(fig)
+        canvas.draw()
+        renderer = canvas.get_renderer()
+        title = fig.axes[0].title.get_window_extent(renderer)
+        subtitles = [t for t in fig.texts if "switch" in t.get_text()]
+        self.assertTrue(subtitles, "no parameter subtitle to test against")
+        self.assertGreater(subtitles[0].get_window_extent(renderer).y0,
+                           title.y1,
+                           "the subtitle sits on top of the '1. QBER' title")
 
 
 class TestSessionSegmentHygiene(unittest.TestCase):

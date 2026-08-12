@@ -108,6 +108,26 @@ class TestExportSession(unittest.TestCase):
         self.assertIn("fields", meta["panel"])
         self.assertGreater(meta["b_max"], 0)
 
+    def test_figure_gets_the_panel_b_max_and_the_run_eve_episodes(self):
+        """The button and `python3 plots.py <file>` must draw the same overlays.
+
+        Without them a session where Eve jammed exports a figure with an
+        unexplained QBER excursion and no red bands, and no buffer capacity
+        line even though b_max went into the sidecar.
+        """
+        import plots
+        from unittest import mock
+        self._session()
+        episode = self.runlog.EveEpisode(110.0, 114.0, 1.0)
+        with mock.patch.object(plots, "save_run_figures",
+                               wraps=plots.save_run_figures) as spy, \
+                mock.patch.object(self.runlog, "load_eve_episodes",
+                                  return_value=[episode]):
+            self.app._export_session(name="demo", confirm_overwrite=False)
+        kwargs = spy.call_args[1]
+        self.assertGreater(kwargs["b_max"], 0)
+        self.assertEqual(list(kwargs["eve"]), [episode])
+
     def test_empty_session_writes_nothing(self):
         result = self.app._export_session(name="demo", confirm_overwrite=False)
         self.assertIsNone(result)
