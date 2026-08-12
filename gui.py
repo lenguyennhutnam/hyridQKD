@@ -11,7 +11,7 @@ every child process.
 import os
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, simpledialog, ttk
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -19,7 +19,14 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 
 import panelstate  # noqa: E402
+import plots  # noqa: E402
+import runlog  # noqa: E402
+import sessionio  # noqa: E402
 from channel import EntEnvParams, EnvParams, death_qber, death_qber_ent  # noqa: E402
+# Per-mode background tints for the session timeline, plus the grey used for
+# stack-down stretches (whose width is the switch cost t_switch). Owned by
+# plots.py so the live panel and the exported figures cannot drift apart.
+from plots import DOWNTIME_BAND, MODE_BAND, MODE_LINE, band_end  # noqa: E402
 from presets import load_ent_presets, load_presets  # noqa: E402
 from timeline import Timeline  # noqa: E402
 
@@ -30,14 +37,18 @@ POLL_MS = 2000
 DEATH_LINE_SHOW_FRAC = 0.5
 BUFFER_FULL = "#d9534f"       # key-buffer bar fill (at B_max)
 BUFFER_TRACK = "#e0e0e0"      # key-buffer bar background track
-# Per-mode background tints for the session timeline, plus the grey used for
-# stack-down stretches (whose width is the switch cost t_switch).
-MODE_BAND = {"pm": "#D6E4F7", "ent": "#E2F0D9"}
-MODE_LINE = {"pm": "#2E75B6", "ent": "#70AD47"}
-DOWNTIME_BAND = "#DDDDDD"
 NOTICE_COLOR = "#31708f"      # transient confirmations (not failures)
 STATUS_COLORS = {"down": "#9e9e9e", "starting": "#f0ad4e",
                  "streaming": "#5cb85c", "error": "#d9534f"}
+# Names sessionio.export_session writes into the sidecar itself. It merges
+# extra_meta AFTER setting them, so anything the panel sends under one of these
+# would silently overwrite the file's own honesty flags. The export's payload
+# (b_max / n_z_block / panel) avoids them, and _export_session checks that it
+# still does if that payload ever grows.
+SIDECAR_RESERVED_KEYS = ("kind", "exported_at", "exported_at_iso",
+                         "secret_bits_are_cumulative",
+                         "per_intensity_columns_are_zero", "segments", "gaps",
+                         "secret_by_protocol")
 
 # (field, label) per region; names must match the dataclass field names
 # (ENT keys carry an "ent_" prefix in self.entries because eta_bob exists
@@ -72,6 +83,10 @@ class App(tk.Tk):
         self._death_qber = None  # set once per Apply (expensive), see _apply()
         self._n_z_block = 10_000_000  # block size in effect, for the status line
         self._b_max = 10_000_000  # key-buffer capacity [bits], from the B_max input
+        # Where "Export session…" writes. Tests point these elsewhere; None
+        # means the real logs/ directories (logs/runs and logs/figures).
+        self._export_runs_dir = None
+        self._export_figs_dir = None
         self._build_left()
         self._build_right()
         # Seed the ENT region too, so its entries are never empty if the user
@@ -141,15 +156,21 @@ class App(tk.Tk):
         # no config and no process.
         ttk.Button(left, text="Save as default", command=self._save_default).grid(
             row=row + 3, column=0, columnspan=2, sticky="ew", pady=2)
+        # Exports the whole session (every mode) as a run file and renders it
+        # with plots.py. The live panel stays plain on purpose; the pretty
+        # figure is produced from the file, by the one drawing implementation.
+        ttk.Button(left, text="Export session…",
+                   command=self._export_session).grid(
+            row=row + 4, column=0, columnspan=2, sticky="ew", pady=2)
         # Eve controls: fraction input + toggle. NOT an EnvParams field; acts
         # live (no stack restart), so it is separate from Apply.
-        ttk.Label(left, text="Eve f (0..1)").grid(row=row + 4, column=0, sticky="w")
+        ttk.Label(left, text="Eve f (0..1)").grid(row=row + 5, column=0, sticky="w")
         self.eve_entry = ttk.Entry(left, width=12)
-        self.eve_entry.grid(row=row + 4, column=1, pady=1)
+        self.eve_entry.grid(row=row + 5, column=1, pady=1)
         self.eve_entry.insert(0, "0.1")
         self.eve_entry.bind("<KeyRelease>", lambda *_: self._schedule_forecast())
         self.eve_btn = tk.Button(left, text="Eve: OFF", command=self._toggle_eve)
-        self.eve_btn.grid(row=row + 5, column=0, columnspan=2, sticky="ew", pady=2)
+        self.eve_btn.grid(row=row + 6, column=0, columnspan=2, sticky="ew", pady=2)
         # Capture the platform default colors once so the OFF branch in
         # _poll() can restore them instead of hardcoding a Windows-only
         # name like "SystemButtonFace" (this app runs on Linux/X11 via WSLg).
@@ -157,16 +178,16 @@ class App(tk.Tk):
         self.forecast_var = tk.StringVar(value="forecast: -")
         self.forecast_lbl = ttk.Label(left, textvariable=self.forecast_var,
                                       wraplength=180, foreground="#333")
-        self.forecast_lbl.grid(row=row + 6, column=0, columnspan=2,
+        self.forecast_lbl.grid(row=row + 7, column=0, columnspan=2,
                                sticky="w", pady=6)
         # Key-buffer config, separated from the system params above by a rule.
         # B_max is the buffer capacity [bits]; NOT an EnvParams field (display
         # only, updates the bar live, no Apply needed).
         ttk.Separator(left, orient="horizontal").grid(
-            row=row + 7, column=0, columnspan=2, sticky="ew", pady=6)
-        ttk.Label(left, text="B_max [bits]").grid(row=row + 8, column=0, sticky="w")
+            row=row + 8, column=0, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(left, text="B_max [bits]").grid(row=row + 9, column=0, sticky="w")
         self.bmax_entry = ttk.Entry(left, width=12)
-        self.bmax_entry.grid(row=row + 8, column=1, pady=1)
+        self.bmax_entry.grid(row=row + 9, column=1, pady=1)
         self.bmax_entry.insert(0, "10000000")
 
     # ---------------- right: plots + status + log ----------------
@@ -284,6 +305,69 @@ class App(tk.Tk):
             return
         self._refresh_preset_list()   # the "default" entry may be new
         self._flash_notice("saved as default -> %s" % os.path.basename(path))
+
+    def _export_session(self, name=None, confirm_overwrite=True):
+        """Write the whole session as a run file and render it with plots.py.
+
+        Returns (csv_path, json_path, png_path), or None when nothing was
+        written. `name`/`confirm_overwrite` exist so tests can drive this
+        without a modal dialog.
+        """
+        if not len(self.timeline):
+            self.error_var.set("nothing to export yet: no samples recorded")
+            return None
+        if name is None:
+            name = simpledialog.askstring(
+                "Export session", "File name:",
+                initialvalue=time.strftime("session_%Y%m%d-%H%M%S"),
+                parent=self)
+            if name is None:
+                return None            # cancelled
+        runs_dir = self._export_runs_dir or runlog.RUNS_DIR
+        figs_dir = self._export_figs_dir or os.path.join(runlog.LOG_DIR,
+                                                         "figures")
+        try:
+            csv_path, json_path = sessionio.session_paths(name, runs_dir)
+        except ValueError as exc:
+            self.error_var.set("Export failed: %s" % exc)
+            return None
+        if confirm_overwrite and os.path.exists(csv_path):
+            if not messagebox.askyesno(
+                    "Export session",
+                    "%s already exists. Overwrite?"
+                    % os.path.basename(csv_path), parent=self):
+                return None
+        try:
+            # _collect_panel_state() raises on a malformed entry box; that is
+            # caught below and reported, so a bad form value costs the export,
+            # not the app.
+            extra_meta = {"b_max": self._read_b_max(),
+                          "n_z_block": self._n_z_block,
+                          "panel": self._collect_panel_state()}
+            clash = sorted(set(extra_meta) & set(SIDECAR_RESERVED_KEYS))
+            if clash:
+                raise ValueError("panel metadata would overwrite the sidecar's "
+                                 "own key(s): %s" % ", ".join(clash))
+            csv_path, json_path = sessionio.export_session(
+                self.timeline, name, runs_dir=runs_dir, extra_meta=extra_meta)
+            run = runlog.load_run(csv_path)
+            # Same overlays the CLI draws by default, so `plots.py <file>` and
+            # this button never disagree about the same run: the buffer
+            # capacity the panel is holding, and any jamming episode that
+            # explains a QBER excursion in the trace.
+            png_path = plots.save_run_figures(
+                run, figs_dir, b_max=extra_meta["b_max"],
+                eve=runlog.load_eve_episodes(run.t_start, run.t_end))[0]
+        except Exception as exc:
+            self.error_var.set("Export failed: %s" % exc)
+            return None
+        # Report the RESOLVED filename: sanitize_name may have rewritten what
+        # the user typed (".." becomes "dot"), and the notice must name the
+        # file that actually exists.
+        self._flash_notice("exported %s + %s"
+                           % (os.path.basename(csv_path),
+                              os.path.basename(png_path)))
+        return csv_path, json_path, png_path
 
     def _flash_notice(self, text, ms=4000):
         """Transient, non-alarming message in the sticky error area."""
@@ -492,8 +576,16 @@ class App(tk.Tk):
                                     bg=self._eve_btn_defaults[0],
                                     fg=self._eve_btn_defaults[1])
             if snap.status == "streaming":
-                self.timeline.add_sample(snap.unix_time, 100 * snap.qber,
-                                         snap.sifted, snap.secret_bits)
+                # Forward the WHOLE row, not just the four plotted values: the
+                # session export writes a collector-shaped CSV, and
+                # runlog.load_run drops any row missing a column, so anything
+                # not forwarded here would export as zeros.
+                self.timeline.add_sample(
+                    snap.unix_time, 100 * snap.qber, snap.sifted,
+                    snap.secret_bits, clicks=snap.clicks,
+                    window_s=snap.window_s, errors=snap.errors,
+                    total_sifted=snap.total_sifted, blocks=snap.blocks,
+                    block_progress=snap.block_progress)
                 self._redraw()
             else:
                 # Keep the buffer bar rendered (empty/last state) before the
@@ -553,8 +645,14 @@ class App(tk.Tk):
         Apply's downtime starts before any sample exists, so that gap's raw
         x0 is negative and would drag the axis into negative time.
         """
+        # A segment ends at its last SAMPLE, but the mode kept running until
+        # Apply was pressed; band_end() carries the tint to that moment so no
+        # untinted sliver appears before the grey band (shared with plots.py
+        # so the panel and the exported figure agree).
+        gap_starts = sorted(gap.t_start for gap in tl.gaps)
         for seg in tl.segments:
-            ax.axvspan(max(seg.t_start - t0, 0.0), max(seg.t_end - t0, 0.0),
+            ax.axvspan(max(seg.t_start - t0, 0.0),
+                       max(band_end(seg.t_end, gap_starts) - t0, 0.0),
                        color=MODE_BAND.get(seg.protocol, MODE_BAND["pm"]),
                        alpha=0.55, lw=0)
         for gap in tl.gaps:

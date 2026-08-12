@@ -88,6 +88,12 @@ class TestRefresh(unittest.TestCase):
         self.assertAlmostEqual(snap.qber, 0.02)
         self.assertEqual(snap.total_sifted, 2500000)
         self.assertEqual(snap.blocks, 1)
+        # window_s/errors are not shown in the panel; they exist so the GUI can
+        # forward a COMPLETE collector row into the session Timeline, which is
+        # written back out as a run file by the export button.
+        self.assertEqual(snap.window_s, 2.0)
+        self.assertEqual(snap.clicks, 5000000)
+        self.assertEqual(snap.errors, 25000)
 
     def test_error_when_rows_stale_but_running(self):
         backend_mod.stackctl.collector_running = lambda: True

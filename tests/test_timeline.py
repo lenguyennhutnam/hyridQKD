@@ -248,5 +248,48 @@ class TestUnknownProtocol(unittest.TestCase):
         self.assertEqual(tl.secret_by_protocol["pm"], 700)
 
 
+class TestExtraColumns(unittest.TestCase):
+    """The export needs every collector CSV column, not just the plotted four."""
+
+    def setUp(self):
+        self.tl = Timeline()
+        self.tl.begin_downtime(100.0, "pm", 0.0522)
+
+    def test_extra_columns_are_stored(self):
+        self.tl.add_sample(110.0, 1.5, 500, 7, clicks=1000, window_s=2.0,
+                           errors=8, total_sifted=500, blocks=1,
+                           block_progress=250)
+        self.assertEqual(self.tl.clicks[0], 1000)
+        self.assertAlmostEqual(self.tl.window_s[0], 2.0)
+        self.assertEqual(self.tl.errors[0], 8)
+        self.assertEqual(self.tl.total_sifted[0], 500)
+        self.assertEqual(self.tl.blocks[0], 1)
+        self.assertEqual(self.tl.block_progress[0], 250)
+
+    def test_extra_columns_default_to_zero(self):
+        # Existing call sites pass only the four plotted values.
+        self.tl.add_sample(110.0, 1.5, 500, 7)
+        self.assertEqual(self.tl.clicks[0], 0)
+        self.assertAlmostEqual(self.tl.window_s[0], 0.0)
+        self.assertEqual(self.tl.errors[0], 0)
+        self.assertEqual(self.tl.total_sifted[0], 0)
+        self.assertEqual(self.tl.blocks[0], 0)
+        self.assertEqual(self.tl.block_progress[0], 0)
+
+    def test_every_column_list_stays_the_same_length(self):
+        for i in range(4):
+            self.tl.add_sample(110.0 + 2 * i, 1.5, 500, 100 * i, clicks=1000)
+        names = ("t", "qber", "sifted", "secret_total", "clicks", "window_s",
+                 "errors", "total_sifted", "blocks", "block_progress")
+        lengths = {name: len(getattr(self.tl, name)) for name in names}
+        self.assertEqual(set(lengths.values()), {4}, lengths)
+
+    def test_reset_clears_the_extra_columns_too(self):
+        self.tl.add_sample(110.0, 1.5, 500, 7, clicks=1000)
+        self.tl.reset()
+        self.assertEqual(self.tl.clicks, [])
+        self.assertEqual(self.tl.block_progress, [])
+
+
 if __name__ == "__main__":
     unittest.main()

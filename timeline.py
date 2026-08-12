@@ -73,6 +73,15 @@ class Timeline:
         self.qber = []             # PERCENT, as the GUI already stores it
         self.sifted = []
         self.secret_total = []
+        # Remaining collector CSV columns. Not plotted, but sessionio needs
+        # them: runlog.load_run silently DROPS any row missing a column, so
+        # an export without these would read back as an empty file.
+        self.clicks = []
+        self.window_s = []
+        self.errors = []
+        self.total_sifted = []
+        self.blocks = []
+        self.block_progress = []
         self._segments = []
         self._gaps = []
         self._pending = _Pending()
@@ -116,8 +125,15 @@ class Timeline:
         """
         self._pending.death_qber = death_qber
 
-    def add_sample(self, unix_t, qber_pct, sifted, secret_bits):
-        """One streaming poll tick."""
+    def add_sample(self, unix_t, qber_pct, sifted, secret_bits, clicks=0,
+                   window_s=0.0, errors=0, total_sifted=0, blocks=0,
+                   block_progress=0):
+        """One streaming poll tick.
+
+        The first four values drive the live plots; the rest are carried only
+        so a session can be exported as a complete collector-shaped CSV. They
+        default to 0 so callers that only plot need not pass them.
+        """
         seg = self._current_segment()
         if seg is None:
             seg = self._open_segment(unix_t)
@@ -136,6 +152,12 @@ class Timeline:
         self.qber.append(qber_pct)
         self.sifted.append(sifted)
         self.secret_total.append(seg.secret_offset + int(secret_bits))
+        self.clicks.append(int(clicks))
+        self.window_s.append(float(window_s))
+        self.errors.append(int(errors))
+        self.total_sifted.append(int(total_sifted))
+        self.blocks.append(int(blocks))
+        self.block_progress.append(int(block_progress))
         seg.secret_final = int(secret_bits)
         seg.t_end = unix_t
         seg.i1 = len(self.t) - 1

@@ -75,6 +75,12 @@ class RunData:
     block_progress: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=int))
     secret_bits: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=int))
 
+    # Session exports (sessionio.py) carry these; auto-archived collector runs
+    # do not, and then they stay empty so plots.py draws exactly as before.
+    protocol: list = field(default_factory=list)
+    segments: list = field(default_factory=list)
+    gaps: list = field(default_factory=list)
+
     def __len__(self):
         return len(self.t)
 
@@ -193,6 +199,7 @@ def load_run(path=LIVE_CSV):
     rather than an exception -- plotting a partial run beats refusing to plot.
     """
     rows = {name: [] for name in _COLUMNS}
+    protocol = []
     try:
         with open(path, newline="") as f:
             for raw in csv.DictReader(f):
@@ -202,6 +209,7 @@ def load_run(path=LIVE_CSV):
                     continue           # damaged/truncated row: skip it
                 for name, value in parsed.items():
                     rows[name].append(value)
+                protocol.append(raw.get("protocol") or "")
     except OSError:
         pass
 
@@ -216,6 +224,9 @@ def load_run(path=LIVE_CSV):
     run.qber = np.asarray(rows["qber"], dtype=float)
     for name in _INT_COLUMNS:
         setattr(run, name, np.asarray(rows[name], dtype=float).astype(np.int64))
+    run.protocol = protocol
+    run.segments = _clean_dicts(run.meta.get("segments"))
+    run.gaps = _clean_dicts(run.meta.get("gaps"))
     return run
 
 
@@ -226,6 +237,17 @@ def _load_meta(csv_path):
     except (OSError, ValueError):
         return {}
     return meta if isinstance(meta, dict) else {}
+
+
+def _clean_dicts(value):
+    """Keep only the dict entries of a sidecar list.
+
+    Sidecars are machine-written but may be hand-edited or truncated; a
+    malformed entry must cost that entry, not the whole figure.
+    """
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
 
 
 def list_runs(runs_dir=RUNS_DIR):
