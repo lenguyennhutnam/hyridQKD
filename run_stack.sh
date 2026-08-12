@@ -27,23 +27,42 @@ if [ ! -x "$BIN/simulator" ]; then
     exit 1
 fi
 
-# teardown leftovers
+source "$APP_DIR/wait_ready.sh"
+
+# Size the simulator gives /tmp/fpga_* (hw_sim/configs/src/ipc/mod.rs:
+# 0x12000 + 0x1000). gc mmaps len 0x1000 at offset 0x1000, so starting gc
+# against a shorter file is a SIGBUS, not a retry.
+FPGA_BYTES=77824
+QBER_PORT=58000   # matches ip_listen in bob/qber_config.json
+
+# teardown leftovers -- wait for them to actually die before unlinking, or the
+# old inode stays alive and the next run reuses a stale pipe
 pkill -x simulator 2>/dev/null
 pkill -x gc_alice 2>/dev/null; pkill -x gc_bob 2>/dev/null
 pkill -x qber_alice 2>/dev/null; pkill -x qber_bob 2>/dev/null
-sleep 0.5
+for _ in $(seq 1 200); do
+    pgrep -x 'simulator|gc_alice|gc_bob|qber_bob' > /dev/null || break
+    sleep 0.01
+done
 rm -f /tmp/fpga_alice /tmp/fpga_bob /tmp/gc_alice_* /tmp/gc_bob_* \
       /tmp/hw_params_alice.txt /tmp/hw_params_bob.txt
-sleep 0.3
 
 "$BIN/simulator" --config-path "$CFG/alice/$HW_CFG" > "$LOG/hwsim_alice.log" 2>&1 &
 "$BIN/simulator" --config-path "$CFG/bob/$HW_CFG"   > "$LOG/hwsim_bob.log"   2>&1 &
-sleep 1
+# The fpga file is the LAST thing setup_ipc creates on both sides (fifos and
+# hw_params come first), so gating on its size covers the whole setup.
+wait_file_size /tmp/fpga_alice "$FPGA_BYTES" 10 || exit 1
+wait_file_size /tmp/fpga_bob   "$FPGA_BYTES" 10 || exit 1
+wait_exists /tmp/hw_params_alice.txt 10 || exit 1
+wait_exists /tmp/hw_params_bob.txt   10 || exit 1
+
 "$BIN/gc_alice" -c "$CFG/alice/gc_config.json" > "$LOG/gc_alice.log" 2>&1 &
 "$BIN/gc_bob"   -c "$CFG/bob/gc_config.json"   > "$LOG/gc_bob.log"   2>&1 &
-sleep 1
+wait_exists /tmp/gc_alice_command.socket 10 || exit 1
+wait_exists /tmp/gc_bob_command.socket   10 || exit 1
+
 "$BIN/qber_bob" -c "$CFG/bob/qber_config.json" > "$LOG/qber_bob.log" 2>&1 &
-sleep 1
+wait_tcp_listen "$QBER_PORT" 10 || exit 1
 
 # Show the config actually in use. Bob's qberr/eta drive the observed physics;
 # Alice's are ignored, but seed/angles/decoy-mode must match on both sides.
