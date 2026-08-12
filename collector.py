@@ -40,6 +40,11 @@ from keyrate_ent import secret_key_length_ent
 # ==================== PARAMETERS (chinh o day) ====================
 KEY_BLOCK_BITS = 10_000_000   # so sifted bit cho 1 block finite-key (PM: basis Z; ENT: ca hai basis)
 PRINT_INTERVAL_S = 2.0        # chu ky in ra terminal (giay)
+FIRST_WINDOW_S = 0.3          # cua so dau ngan hon, de panel co dong dau tien ngay
+MIN_FIRST_EVENTS = 4_000      # ...nhung phai du mau, khong lay 1 batch lam thong ke
+# 4000 click ~ 2000 sifted -> sai so chuan cua QBER ~0.5%, nho so voi cac
+# nguong chet dang ve (PM 4.2-5.2%, ENT 8.6-9.9%). Cao hon (vd 20000) thi
+# cua so dau doi gan het 1 interval o link toc do trung binh -> mat y nghia.
 
 # Tham so giao thuc dung cho cong thuc key length (phai khop hw_sim config).
 MU1, MU2, P1 = 0.5, 0.1, 0.7  # cuong do signal/decoy va P(signal)
@@ -60,6 +65,35 @@ RESULT_BYTES = BATCH       # 1 byte per event (0 or 1)
 GC_START, GC_STOP = 0, 1
 GC_RESPONSES = {0: "Done", 1: "DidNothing", 2: "HwReady", 3: "HwNotReady"}
 QBER_SEND_ANGLES = 0
+
+
+def window_closed(window_index, elapsed, events, interval,
+                  first=None, min_events=None):
+    """True when the window holding `events` events after `elapsed` seconds
+    should be emitted.
+
+    The first window is cut short so a restarted collector produces a row
+    without a full interval of silence -- the GUI has nothing to plot until
+    then, and that silence is a sizeable share of what a mode switch costs.
+
+    But time alone is the wrong rule. The loop only consults the clock after
+    reading a whole batch, and the first batch takes ~1s to arrive, so a
+    time-only shortcut closes the first window on that one batch: 256 events,
+    a QBER estimated from 128 bits, plotted as though it were a measurement.
+    Hence the event floor.
+
+    The floor cannot be a hard requirement either: a long-link ENT run
+    collects events far too slowly to reach it in any reasonable time, so a
+    full interval closes the window regardless -- which is exactly the
+    behaviour every window had before.
+    """
+    if window_index > 0:
+        return elapsed >= interval
+    if elapsed >= interval:
+        return True
+    floor = MIN_FIRST_EVENTS if min_events is None else min_events
+    short = min(FIRST_WINDOW_S if first is None else first, interval)
+    return elapsed >= short and events >= floor
 
 
 def recv_exact_sock(sock, n):
@@ -289,6 +323,7 @@ def main():
     t0 = time.monotonic()
     win_t0 = t0
     blk = Stats()          # bits accumulated toward the current block
+    windows = 0            # only the first window is shortened
     blocks = 0
     secret_bits = 0
     aa_buf, ab_buf, rr_buf = bytearray(), bytearray(), bytearray()
@@ -312,7 +347,8 @@ def main():
                 rr_buf += recv_exact_sock(bob, RESULT_BYTES)
 
                 now = time.monotonic()
-                if now - win_t0 >= args.interval:
+                if window_closed(windows, now - win_t0, len(rr_buf),
+                                 args.interval):
                     s = crunch(bytes(aa_buf), bytes(ab_buf), bytes(rr_buf), exp)
                     cum.add(s)
                     blk.add(s)
@@ -351,6 +387,7 @@ def main():
                                   f"{s.n_dec},{s.m_dec},{cum.sifted},{blocks},"
                                   f"{getattr(blk, bits_attr)},{secret_bits}\n")
                     aa_buf, ab_buf, rr_buf = bytearray(), bytearray(), bytearray()
+                    windows += 1
                     win_t0 = now
     except (KeyboardInterrupt, SystemExit):
         pass
