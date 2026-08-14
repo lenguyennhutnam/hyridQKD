@@ -96,6 +96,33 @@ class TestLowMuPreset(unittest.TestCase):
         self.assertLess(channel.derive_ent(self.low, 1_000_000).r_coinc,
                         channel.derive_ent(self.cur, 1_000_000).r_coinc)
 
+    def test_its_throughput_stays_level_with_pm(self):
+        """mu is tuned so ENT distils secret bits at about PM's rate.
+
+        Lowering mu buys QBER with pair rate, but the two effects fight: a
+        lower QBER lifts l/block. The hybrid comparison is only meaningful
+        while both modes are in the same throughput league, so mu sits at the
+        point where ENT draws level with the PM reference (aurea), not at the
+        point where QBER is prettiest.
+
+        Block fill differs per protocol: PM keys the Z basis only (a quarter
+        of clicks), ENT keys both sifted bases (half). Model rates agree with
+        the stack to <0.5%, so deriving them here is safe.
+        """
+        import channel
+        pm = presets.load_presets()["aurea"]
+        d_pm = channel.derive(pm, 10_000_000)
+        pm_bps = d_pm.l_predict * d_pm.clicks_per_s * 0.25 / 10_000_000
+
+        d_ent = channel.derive_ent(self.low, 1_000_000)
+        ent_bps = d_ent.l_predict * d_ent.clicks_per_s * 0.5 / 1_000_000
+
+        self.assertGreater(ent_bps, 0.95 * pm_bps,
+                           "ENT fell behind PM: %.0f vs %.0f bit/s"
+                           % (ent_bps, pm_bps))
+        self.assertLess(ent_bps, 1.10 * pm_bps,
+                        "mu could be lowered further for a better QBER")
+
 
 class TestReservedName(unittest.TestCase):
     """"default" belongs to the saved panel state, not to a preset file."""
