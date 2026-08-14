@@ -291,5 +291,54 @@ class TestExtraColumns(unittest.TestCase):
         self.assertEqual(self.tl.block_progress, [])
 
 
+class TestSecretBySegment(unittest.TestCase):
+    """Chronological view: what each stretch of streaming contributed.
+
+    secret_by_protocol collapses the session into two totals, which is all the
+    key-buffer bar had to work with -- so the bar drew PM before ENT even when
+    ENT ran first, and never showed more than two blocks however many times
+    the operator switched. A buffer built up over a session is a history, so
+    the order has to survive.
+    """
+
+    def _switching_session(self, order):
+        tl = Timeline()
+        t = 100.0
+        for i, proto in enumerate(order):
+            tl.begin_downtime(t, proto, 0.05)
+            t += 10.0
+            tl.add_sample(t, 5.0, 900, 1000 * (i + 1))
+            t += 10.0
+        return tl
+
+    def test_it_lists_segments_in_the_order_they_ran(self):
+        tl = self._switching_session(["ent", "pm"])
+        self.assertEqual([p for p, _ in tl.secret_by_segment], ["ent", "pm"])
+
+    def test_every_switch_gets_its_own_entry(self):
+        tl = self._switching_session(["pm", "ent", "pm", "ent"])
+        self.assertEqual([p for p, _ in tl.secret_by_segment],
+                         ["pm", "ent", "pm", "ent"])
+
+    def test_the_entries_sum_to_the_protocol_totals(self):
+        tl = self._switching_session(["ent", "pm", "ent"])
+        totals = {"pm": 0, "ent": 0}
+        for proto, bits in tl.secret_by_segment:
+            totals[proto] += bits
+        self.assertEqual(totals, tl.secret_by_protocol)
+
+    def test_it_counts_bits_banked_before_a_mid_segment_respawn(self):
+        # A collector that dies and respawns restarts secret_bits at 0; those
+        # earlier bits are banked and must not vanish from the bar.
+        tl = Timeline()
+        tl.begin_downtime(100.0, "pm", 0.05)
+        tl.add_sample(110.0, 1.0, 900, 4000)
+        tl.add_sample(112.0, 1.0, 900, 500)      # respawned: counter reset
+        self.assertEqual(tl.secret_by_segment, [("pm", 4500)])
+
+    def test_an_empty_session_has_no_segments(self):
+        self.assertEqual(Timeline().secret_by_segment, [])
+
+
 if __name__ == "__main__":
     unittest.main()
