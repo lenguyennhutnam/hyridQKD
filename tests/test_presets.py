@@ -52,6 +52,51 @@ class TestEntPresets(unittest.TestCase):
                          & set(presets.load_ent_presets()))
 
 
+class TestLowMuPreset(unittest.TestCase):
+    """chapman_lowmu trades pair rate for a lower QBER.
+
+    ENT's QBER is dominated by E_MPE, the multi-pair bound, which scales with
+    the mean pair number mu -- the only knob that touches it. These assert the
+    preset actually delivers that, not merely that the file parses.
+    """
+
+    def setUp(self):
+        ent = presets.load_ent_presets()
+        self.cur = ent["chapman_current"]
+        self.low = ent["chapman_lowmu"]
+
+    def test_it_differs_from_chapman_current_only_in_mu(self):
+        # Anything else changing would confound the comparison below.
+        import dataclasses
+        self.assertLess(self.low.mu, self.cur.mu)
+        self.assertEqual(dataclasses.replace(self.low, mu=self.cur.mu),
+                         self.cur)
+
+    def test_it_roughly_halves_the_forecast_qber(self):
+        import channel
+        q_cur = channel.derive_ent(self.cur, 1_000_000).q2
+        q_low = channel.derive_ent(self.low, 1_000_000).q2
+        self.assertLess(q_low, 0.6 * q_cur)
+
+    def test_the_saving_comes_from_the_multi_pair_term(self):
+        import keyrate_ent as k
+
+        def mpe_share(env):
+            g = env.mu / 2.0
+            eta_b = env.eta_bob * 10 ** (
+                -(env.alpha * env.d_km + env.odr_losses) / 10)
+            r = k.coincidence_prob(g, env.eta_a, eta_b, env.xi_a, env.xi_b)
+            return k._multi_pair_errors(g, env.eta_a, eta_b) / r
+
+        self.assertLess(mpe_share(self.low), 0.5 * mpe_share(self.cur))
+
+    def test_it_costs_pair_rate(self):
+        # The trade is real and must stay visible: fewer pairs per pulse.
+        import channel
+        self.assertLess(channel.derive_ent(self.low, 1_000_000).r_coinc,
+                        channel.derive_ent(self.cur, 1_000_000).r_coinc)
+
+
 class TestReservedName(unittest.TestCase):
     """"default" belongs to the saved panel state, not to a preset file."""
 
