@@ -715,8 +715,15 @@ class App(tk.Tk):
                     fontsize=8, color="#c00", clip_on=False)
 
     def _draw_buffer(self):
-        """Key buffer as a horizontal fill bar, split by which protocol
-        distilled each part; capped and recoloured at B_max."""
+        """Key buffer as a horizontal fill bar, one block per stretch of
+        streaming in the order they ran; capped and recoloured at B_max.
+
+        Blocks follow the session's chronology rather than per-protocol
+        totals. Totalling by protocol drew the modes in a fixed order -- PM
+        first even for a session that opened with ENT -- and collapsed every
+        switch into at most two blocks, hiding the interleaving that a
+        hybrid session is meant to show.
+        """
         b_max = self._read_b_max()
         total = self.timeline.total_secret
         by_proto = self.timeline.secret_by_protocol
@@ -725,12 +732,13 @@ class App(tk.Tk):
         ax.clear()
         ax.barh(0, b_max, height=1.0, color=BUFFER_TRACK)                # track
         left = 0
-        for proto in ("pm", "ent"):
-            width = min(by_proto.get(proto, 0), max(b_max - left, 0))
+        for proto, bits in self.timeline.secret_by_segment:
+            width = min(bits, max(b_max - left, 0))
             if width <= 0:
                 continue
             ax.barh(0, width, left=left, height=1.0,
-                    color=BUFFER_FULL if full else MODE_LINE[proto],
+                    color=(BUFFER_FULL if full
+                           else MODE_LINE.get(proto, MODE_LINE["pm"])),
                     label=proto.upper())
             left += width
         if 0 < left < b_max:

@@ -236,6 +236,49 @@ class TestFailedRestartLeavesNoPhantomGap(_AppCase):
         self.assertEqual(self.app.timeline.gaps[0].t_end, 0.0)
 
 
+class TestBufferAcrossManySwitches(_AppCase):
+    """Switching back and forth must keep producing new blocks in the bar.
+
+    Aggregating by protocol capped the bar at two blocks (one PM, one ENT)
+    however many times the operator switched, hiding the very interleaving
+    the panel exists to show.
+    """
+
+    def setUp(self):
+        super().setUp()
+        tl = self.app.timeline
+        t = 100.0
+        for i, proto in enumerate(("ent", "pm", "ent", "pm")):
+            tl.begin_downtime(t, proto, 0.05)
+            t += 10.0
+            tl.add_sample(t, 5.0, 900, 1000 * (i + 1))
+            t += 10.0
+        self.app._draw_buffer()
+
+    def test_each_stretch_gets_its_own_block(self):
+        widths = [p.get_width() for p in self.app.ax_buffer.patches
+                  if p.get_width() < self.app._read_b_max()]
+        self.assertEqual(len(widths), 4)
+        self.assertEqual(sorted(widths), [1000.0, 2000.0, 3000.0, 4000.0])
+
+    def test_the_first_block_is_the_mode_that_ran_first(self):
+        first = min((p for p in self.app.ax_buffer.patches
+                     if p.get_width() < self.app._read_b_max()),
+                    key=lambda p: p.get_xy()[0])
+        self.assertEqual(tuple(first.get_facecolor()[:3]),
+                         mcolors.to_rgb(self.gui.MODE_LINE["ent"]))
+
+    def test_the_blocks_tile_without_gaps_or_overlap(self):
+        blocks = sorted(((p.get_xy()[0], p.get_width())
+                         for p in self.app.ax_buffer.patches
+                         if p.get_width() < self.app._read_b_max()))
+        edge = 0.0
+        for x0, width in blocks:
+            self.assertAlmostEqual(x0, edge)
+            edge += width
+        self.assertAlmostEqual(edge, self.app.timeline.total_secret)
+
+
 class TestSegmentDrawing(_AppCase):
     def setUp(self):
         super().setUp()
@@ -320,6 +363,31 @@ class TestSegmentDrawing(_AppCase):
         self.assertEqual(self.app.timeline.total_secret, 5000)
         self.assertEqual(self.app.timeline.secret_by_protocol,
                          {"pm": 3000, "ent": 2000})
+
+    def test_buffer_blocks_follow_the_order_the_modes_ran(self):
+        # This session ran PM first, then ENT, so PM's block must start at 0.
+        # The bar used to iterate a fixed ("pm", "ent") tuple, which drew PM
+        # first even for a session that began with ENT.
+        self.app._draw_buffer()
+        blocks = self._buffer_blocks()
+        self.assertEqual([b[0] for b in blocks],
+                         [mcolors.to_rgb(self.gui.MODE_LINE["pm"]),
+                          mcolors.to_rgb(self.gui.MODE_LINE["ent"])])
+        self.assertAlmostEqual(blocks[0][1], 0.0)          # PM starts at 0
+        self.assertAlmostEqual(blocks[1][1], 3000.0)       # ENT follows it
+
+    def _buffer_blocks(self):
+        """[(facecolor, x_left, width)] of the bar's fill, left to right,
+        skipping the full-width background track."""
+        out = []
+        for patch in self.app.ax_buffer.patches:
+            x0, _ = patch.get_xy()
+            width = patch.get_width()
+            if width >= self.app._read_b_max():
+                continue                                   # the track
+            out.append((tuple(patch.get_facecolor()[:3]), x0, width))
+        out.sort(key=lambda b: b[1])
+        return out
 
     def test_no_band_reaches_left_of_the_first_sample(self):
         # The session's FIRST gap opens on Apply, before any sample exists, so

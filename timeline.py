@@ -209,6 +209,22 @@ class Timeline:
         return self._segments[-1].protocol if self._segments else None
 
     @property
+    def secret_by_segment(self):
+        """[(protocol, bits), ...] in the order the segments ran.
+
+        secret_by_protocol answers "how much did each mode contribute"; this
+        answers "what happened, in order". The key-buffer bar needs the
+        latter: collapsing to per-protocol totals draws the modes in a fixed
+        order regardless of which ran first, and can never show more than one
+        block per protocol no matter how many times the operator switched.
+
+        Per-segment production is banked + final, for the same reason as in
+        secret_by_protocol -- see its docstring.
+        """
+        return [(seg.protocol, seg.secret_banked + seg.secret_final)
+                for seg in self._segments]
+
+    @property
     def secret_by_protocol(self):
         """Session secret bits split by which protocol distilled them.
 
