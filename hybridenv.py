@@ -241,18 +241,42 @@ class HybridEnv:
                         int(d_ent.clicks_per_s * 0.5 * p.delta_t))
         self._e_floor = (d_pm.e_avg, d_ent.q2)
 
-    def reset(self):
-        """Start a fresh episode; return the first observation."""
+    def reset(self, seed=None):
+        """Start a fresh episode; return the first observation.
+
+        seed=None reseeds from params.seed and leaves Eve on her own
+        configured seed, so repeated calls replay ONE trajectory byte for
+        byte. That is what lets two envs sharing an EveParams be compared on
+        identical jamming, and every determinism guarantee in the tests rests
+        on it -- but it also means a training loop that calls reset() bare
+        sees the same episode over and over.
+
+        Pass an integer to draw a different episode deterministically: both
+        RNG streams and Eve's chain are reseeded from it. Task 6 MUST call
+        reset(episode_seed) with a fresh seed per episode, and evaluation MUST
+        draw its seeds from a set disjoint from training's -- otherwise the
+        agent is scored on trajectories it memorised.
+
+        reset(params.seed) is deliberately NOT identical to reset(): the bare
+        form is the only one that leaves Eve's trajectory fixed by EveParams.
+        """
         p = self.params
-        # Two independent streams. Sharing one would make the arrival process
-        # depend on how many uniforms numpy's binomial happened to consume for
-        # this slot's error draw -- which varies with the mode -- so two
-        # policies on the same seed would face different message traffic and
-        # could not be compared (nor could an Oracle bound them).
-        err_seed, arr_seed = np.random.SeedSequence(p.seed).generate_state(2)
-        self._rng = np.random.RandomState(err_seed)
-        self._arrivals_rng = np.random.RandomState(arr_seed)
-        self.eve.reset()
+        # Independent streams for errors, arrivals and jamming. Sharing one
+        # would make the arrival process depend on how many uniforms numpy's
+        # binomial happened to consume for this slot's error draw -- which
+        # varies with the mode -- so two policies on the same seed would face
+        # different message traffic and could not be compared (nor could an
+        # Oracle bound them). SeedSequence(s).generate_state(3) has
+        # generate_state(2) as its prefix, so the None path is bit-for-bit
+        # what it was before the seed argument existed.
+        streams = np.random.SeedSequence(
+            p.seed if seed is None else int(seed)).generate_state(3)
+        self._rng = np.random.RandomState(streams[0])
+        self._arrivals_rng = np.random.RandomState(streams[1])
+        if seed is None:
+            self.eve.reset()
+        else:
+            self.eve.reset(int(streams[2]))
         self._queue = MessageQueue(p.t0_deadline)
         self._block = BlockAccumulator(p.n_x)
         self._buffer = KeyBuffer(p.b_max)
@@ -357,6 +381,16 @@ class HybridEnv:
     def error_floor(self):
         """(PM, ENT) intrinsic error rates e_m with no jamming."""
         return self._e_floor
+
+    @property
+    def served_total(self):
+        """Messages served so far this episode (numerator of eq 24)."""
+        return self._served_total
+
+    @property
+    def arrived_total(self):
+        """Messages that arrived so far this episode (denominator of eq 24)."""
+        return self._arrived_total
 
     @property
     def buffer_level(self):

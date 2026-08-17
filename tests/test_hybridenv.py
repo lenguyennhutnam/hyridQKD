@@ -482,10 +482,22 @@ class TestHybridEnv(unittest.TestCase):
         self.assertGreater(env.block_progress, 0)
         obs = env.reset()
         self.assertEqual(list(obs), [0.0] * OBS_DIM)
-        self.assertEqual(env.eta, 0.0)
         self.assertEqual(env.queue_length, 0)
         self.assertEqual(env.block_progress, 0)
         self.assertEqual(env.buffer_level, 0)
+        # Both eta counters, asserted directly. eta == 0.0 is NOT a proxy for
+        # this: drop the served reset and 0/A is still 0.0; drop the arrived
+        # reset and the zero-denominator guard returns 0.0 as well. Either
+        # deletion corrupts the only metric the study reports and would stay
+        # green behind that assertion.
+        self.assertEqual(env.served_total, 0)
+        self.assertEqual(env.arrived_total, 0)
+        self.assertEqual(env.eta, 0.0)
+        # And the counters must still work after the reset: one slot in, the
+        # arrivals of that slot are all that either counter has seen.
+        _, r, _, info = env.step(PM)
+        self.assertEqual(env.arrived_total, info["arrivals"])
+        self.assertEqual(env.served_total, r)
 
     def test_reset_rewinds_the_episode_so_one_env_can_replay_it(self):
         # test_same_seed_reproduces_the_run builds a fresh env each time, so
@@ -501,6 +513,78 @@ class TestHybridEnv(unittest.TestCase):
                 out.append((info["f"], info["arrivals"], r))
             return out
         self.assertEqual(episode(), episode())
+
+    def test_reset_with_a_seed_draws_a_different_episode(self):
+        # Without this, every episode from one env is byte-identical: a
+        # training loop calling reset() bare would fit 200 replays of a single
+        # trajectory and then be scored on a seed set containing it. The
+        # per-episode seed must move BOTH the sampling streams and Eve's
+        # chain, or the agent still memorises one jamming schedule.
+        env = HybridEnv(HybridParams(horizon=200, seed=1))
+
+        def episode(seed):
+            env.reset(seed)
+            out, done = [], False
+            while not done:
+                _, r, done, info = env.step(PM)
+                out.append((info["f"], info["arrivals"], r))
+            return out
+        first, again, other = episode(1234), episode(1234), episode(5678)
+        self.assertEqual(first, again)          # same seed: exact replay
+        self.assertNotEqual(first, other)       # different seed: new episode
+        # Specifically the jamming, not just the traffic.
+        self.assertNotEqual([f for f, _, _ in first],
+                            [f for f, _, _ in other])
+
+    def test_reset_without_a_seed_keeps_replaying_one_episode(self):
+        # The default must stay exactly as it was: two envs sharing an
+        # EveParams have to meet identical jamming, which is what makes
+        # AlwaysPM and AlwaysENT comparable at all.
+        env = HybridEnv(HybridParams(horizon=120, seed=1))
+
+        def episode():
+            env.reset()
+            out, done = [], False
+            while not done:
+                _, r, done, info = env.step(ENT)
+                out.append((info["f"], info["arrivals"], r))
+            return out
+        self.assertEqual(episode(), episode())
+        twin = HybridEnv(HybridParams(horizon=120, seed=1))
+        twin.reset()
+        done, out = False, []
+        while not done:
+            _, r, done, info = twin.step(ENT)
+            out.append((info["f"], info["arrivals"], r))
+        self.assertEqual(episode(), out)
+
+    def test_the_per_slot_key_rates_match_the_measured_kappa_table(self):
+        # kappa_m of eq (12) -- secret bits per slot -- is what every result in
+        # the study rests on, and what Task 8's "<2% against the real stack"
+        # gate compares to. Spec section 4: 23,336 (PM) and 1,137 (ENT) at
+        # 55 km with no jamming. Pinned only by the sifted rate and the error
+        # floor today, a 20% drift in the block -> key mapping would pass the
+        # whole suite in silence.
+        #
+        # Tolerance 2%, from two effects, both measured across seeds 1-3:
+        #   - binomial noise on a block's QBER moves its key length ~1.5%,
+        #     averaged down by sqrt(number of blocks) to ~0.1% here;
+        #   - the unfinished block at the end of the run is not counted, worth
+        #     up to one block (0.1% for PM, 0.7% for ENT at these horizons).
+        # Observed spread was 23,333-23,364 and 1,135.7-1,137.8.
+        quiet = EveParams(f_levels=(0.0, 0.0, 0.0), seed=1)
+        for action, horizon, kappa in ((PM, 1200, 23336), (ENT, 4000, 1137)):
+            env = HybridEnv(HybridParams(horizon=horizon, seed=1), quiet)
+            env.reset()
+            done, deposited = False, 0
+            while not done:
+                _, _, done, info = env.step(action)
+                deposited += info["deposited"]
+            measured = deposited / horizon
+            self.assertAlmostEqual(measured / kappa, 1.0, delta=0.02,
+                                   msg="kappa for action %d measured %.1f, "
+                                       "expected %d" % (action, measured,
+                                                        kappa))
 
     def test_every_arrival_is_served_expired_or_still_waiting(self):
         # eq (4) as an end-to-end invariant. ENT alone cannot keep up with the
