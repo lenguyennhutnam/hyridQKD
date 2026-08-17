@@ -160,6 +160,39 @@ class TestBufferAwareThreshold(unittest.TestCase):
         self.assertIn(ENT, actions)              # it really does switch early
         self.assertIn(PM, actions)               # and really does hold off
 
+    def test_an_empty_buffer_halves_the_threshold(self):
+        # Pins the FLOOR of the taper, not just its direction. Without this a
+        # floor of 0.85 (or 1.0) passes every other test here while collapsing
+        # this policy into GreedyThreshold -- and this policy is the bar the
+        # Task 6 agent has to clear, so a silently flattened baseline would
+        # manufacture a positive result for the study.
+        p = BufferAwareThreshold(threshold=0.04, reserve=0.5)
+        self.assertAlmostEqual(p.effective_threshold(0.0), 0.02, places=12)
+
+    def test_the_taper_is_linear_between_empty_and_the_reserve(self):
+        # Pins the SHAPE. Halfway to the reserve is halfway between the floor
+        # (0.5 x threshold) and the nominal threshold, i.e. 0.75 x threshold.
+        p = BufferAwareThreshold(threshold=0.04, reserve=0.5)
+        for fullness, expected in ((0.0, 0.020),      # 0.50 x threshold
+                                   (0.125, 0.025),    # 0.625 x
+                                   (0.25, 0.030),     # 0.75  x
+                                   (0.375, 0.035),    # 0.875 x
+                                   (0.5, 0.040)):     # 1.00  x, at the reserve
+            self.assertAlmostEqual(p.effective_threshold(fullness), expected,
+                                   places=12, msg="fullness=%s" % fullness)
+
+    def test_the_floor_shows_up_in_the_actions_too(self):
+        # The same floor, observed through act() rather than the helper, so a
+        # taper that is right in effective_threshold but unused by act() -- or
+        # a floor raised toward 1.0 -- is caught either way.
+        p = BufferAwareThreshold(threshold=0.04, reserve=0.5)
+        # Just above half the nominal threshold: switches only at the floor.
+        self.assertEqual(p.act(obs_with(qber=0.021, buffer=0.0)), ENT)
+        # Just below it: even a bone-dry buffer holds on to PM.
+        self.assertEqual(p.act(obs_with(qber=0.019, buffer=0.0)), PM)
+        # A floor of 0.85 would put the empty-buffer switch point at 0.034,
+        # so the 0.021 case above would read PM.
+
     def test_a_dying_link_switches_however_full_the_buffer(self):
         # Being buffer-aware must not become an excuse to sit on a dead link.
         p = BufferAwareThreshold(threshold=0.04, reserve=0.5)
@@ -212,8 +245,10 @@ class TestBlockLatencyIsWhatMakesTimingMatter(unittest.TestCase):
         self.assertGreater(self._starved_fraction(prefill_slots=0), 0)
 
     def test_switching_with_stock_does_not(self):
-        # 200 PM slots at ~69k bit/slot is far more than the ENT block gap
-        # needs, so the buffer carries the queue across it.
+        # 200 unjammed PM slots at ~23k *secret* bits/slot (kappa_PM; the
+        # sifted rate is ~69k/slot, which is NOT what the buffer banks --
+        # hybridenv.step deposits _key_length(), not the sifted count) is far
+        # more than the ENT block gap needs, so the buffer carries the queue.
         self.assertEqual(self._starved_fraction(prefill_slots=200), 0)
 
 
@@ -263,6 +298,43 @@ class TestRunEpisode(unittest.TestCase):
             return run_episode(HybridEnv(HybridParams(horizon=100, seed=9)),
                                AlwaysPM())["eta"]
         self.assertEqual(once(), once())
+
+    def test_no_seed_replays_one_trajectory_on_the_same_env(self):
+        # The default must stay byte-identical: Task 7 reuses a single env to
+        # score several policies on the SAME jamming, which only holds if the
+        # bare call keeps env.reset()'s no-argument semantics.
+        env = HybridEnv(HybridParams(horizon=100, seed=3))
+        self.assertEqual(run_episode(env, AlwaysENT())["eta"],
+                         run_episode(env, AlwaysENT())["eta"])
+
+    def test_a_seed_draws_a_different_episode_on_the_same_env(self):
+        # Task 6 trains on one env instance (rebuilding HybridEnv re-runs the
+        # expensive channel derivation) and must see a fresh trajectory per
+        # episode, so the seed has to reach env.reset().
+        env = HybridEnv(HybridParams(horizon=100, seed=3))
+        etas = {run_episode(env, AlwaysENT(), seed=s)["eta"]
+                for s in range(6)}
+        self.assertGreater(len(etas), 1)
+
+    def test_the_same_explicit_seed_replays_the_same_episode(self):
+        env = HybridEnv(HybridParams(horizon=100, seed=3))
+        self.assertEqual(run_episode(env, AlwaysENT(), seed=11)["eta"],
+                         run_episode(env, AlwaysENT(), seed=11)["eta"])
+
+    def test_the_seed_reaches_the_environment_not_just_the_policy(self):
+        # An implementation that accepted `seed` and dropped it would still
+        # pass the replay tests above. Compare against reset(seed) driven by
+        # hand: the runner must produce exactly that trajectory's eta.
+        env = HybridEnv(HybridParams(horizon=100, seed=3))
+        env.reset(11)
+        done = False
+        while not done:
+            _, _, done, _ = env.step(ENT)
+        expected = env.eta
+        self.assertEqual(run_episode(env, AlwaysENT(), seed=11)["eta"],
+                         expected)
+        # ... and the bare call must NOT reproduce it (different stream).
+        self.assertNotEqual(run_episode(env, AlwaysENT())["eta"], expected)
 
     def test_a_switching_policy_records_its_switches(self):
         heavy = EveParams(f_levels=(0.08, 0.08, 0.08), seed=1)

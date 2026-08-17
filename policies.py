@@ -106,7 +106,7 @@ class BufferAwareThreshold(Policy):
         return PM
 
 
-def run_episode(env, policy):
+def run_episode(env, policy, seed=None):
     """Run one full episode; return eta and the diagnostics that explain it.
 
     `eta` is read from the environment (eq 24: served / arrived), not
@@ -116,9 +116,21 @@ def run_episode(env, policy):
     A "switch" is a change of mode between consecutive slots. The first slot
     has no previous mode and therefore can never be one -- an episode of N
     slots has at most N-1 switches.
+
+    `seed` is handed straight to env.reset(). seed=None keeps reset()'s
+    no-argument semantics, which replay ONE trajectory byte for byte -- that
+    is what lets Task 7 score several policies against identical jamming on a
+    single env. An integer draws a different episode deterministically.
+
+    Task 6 MUST pass a fresh seed per training episode, or the agent trains
+    on one trajectory forever; Task 7 MUST evaluate on a seed set disjoint
+    from training's, or the agent is scored on what it memorised. The seed
+    goes here rather than through a new HybridEnv per episode because
+    constructing one re-runs channel.derive()/derive_ent(), which is by far
+    the most expensive thing in the loop and does not depend on the seed.
     """
     policy.reset()
-    obs = env.reset()
+    obs = env.reset() if seed is None else env.reset(seed)
     done = False
     switches = expired = deposited = 0
     slots_empty = 0
