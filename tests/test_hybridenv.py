@@ -1,7 +1,7 @@
 """Hybrid PM/ENT environment: eq (1)-(24) of system_model_v3_5."""
 import unittest
 
-from hybridenv import MessageQueue
+from hybridenv import BlockAccumulator, KeyBuffer, MessageQueue
 
 
 class TestMessageQueue(unittest.TestCase):
@@ -83,6 +83,133 @@ class TestMessageQueue(unittest.TestCase):
             served += q.serve(1)
             expired += q.age_and_expire()
         self.assertEqual(arrived, served + expired + q.length)
+
+
+class TestBlockAccumulator(unittest.TestCase):
+    """eq (5)-(7). Switching mode discards the partial block -- the intrinsic
+    switching cost the paper relies on instead of a penalty constant."""
+
+    def test_staying_in_one_mode_accumulates(self):
+        acc = BlockAccumulator(n_x=1000)
+        self.assertIsNone(acc.add(0, 400, 4))
+        self.assertIsNone(acc.add(0, 400, 4))
+        self.assertEqual(acc.progress, 800)
+
+    def test_switching_mode_throws_the_partial_block_away(self):
+        acc = BlockAccumulator(n_x=1000)
+        acc.add(0, 900, 9)
+        self.assertEqual(acc.progress, 900)
+        acc.add(1, 100, 1)          # switched: the 900 are gone
+        self.assertEqual(acc.progress, 100)
+        self.assertEqual(acc.mode, 1)
+
+    def test_a_completed_block_reports_its_size_and_errors(self):
+        acc = BlockAccumulator(n_x=1000)
+        acc.add(0, 600, 12)
+        done = acc.add(0, 600, 12)
+        self.assertIsNotNone(done)
+        n, errors = done
+        self.assertEqual(n, 1000)
+        # 24 errors over 1200 bits; the block keeps its proportional share.
+        self.assertEqual(errors, 20)
+
+    def test_the_overshoot_carries_into_the_next_block(self):
+        acc = BlockAccumulator(n_x=1000)
+        acc.add(0, 600, 12)
+        acc.add(0, 600, 12)
+        self.assertEqual(acc.progress, 200)     # 1200 - 1000
+        self.assertEqual(acc.errors, 4)         # 24 - 20
+
+    def test_a_block_completed_right_after_a_switch_is_pure(self):
+        # eq (5)-(6): every bit in a finished block came from one protocol.
+        acc = BlockAccumulator(n_x=1000)
+        acc.add(0, 999, 10)
+        done = acc.add(1, 1000, 50)
+        self.assertIsNotNone(done)
+        self.assertEqual(done, (1000, 50))      # none of PM's errors leaked in
+
+    def test_switching_mode_discards_the_partial_errors_too(self):
+        # An implementation that zeroes `progress` but keeps `_errors` looks
+        # correct to every progress-only assertion, then attributes the old
+        # mode's errors to the new mode's first block -- a QBER, hence a key
+        # length, that belongs to neither protocol.
+        acc = BlockAccumulator(n_x=1000)
+        acc.add(0, 900, 90)
+        acc.add(1, 100, 1)
+        self.assertEqual(acc.progress, 100)
+        self.assertEqual(acc.errors, 1)
+
+    def test_consecutive_blocks_stay_error_conserving(self):
+        # Three slots of 700 bits complete two blocks. Errors must be
+        # conserved across the hand-over: an implementation that recomputes
+        # the leftover from scratch (or drops it) passes the single-block
+        # tests and quietly biases every block after the first.
+        acc = BlockAccumulator(n_x=1000)
+        first = acc.add(0, 700, 70)
+        self.assertIsNone(first)
+        first = acc.add(0, 700, 70)
+        self.assertEqual(first, (1000, 100))    # 140 * 1000/1400
+        self.assertEqual(acc.progress, 400)
+        self.assertEqual(acc.errors, 40)
+        second = acc.add(0, 700, 70)
+        self.assertEqual(second, (1000, 100))   # 110 * 1000/1100 = 100
+        self.assertEqual(acc.progress, 100)
+        self.assertEqual(acc.errors, 10)
+
+
+class TestKeyBuffer(unittest.TestCase):
+    """eq (11)/(22): finite capacity, never negative."""
+
+    def test_deposits_accumulate(self):
+        buf = KeyBuffer(b_max=1000)
+        buf.deposit(300)
+        buf.deposit(200)
+        self.assertEqual(buf.level, 500)
+
+    def test_it_saturates_at_b_max(self):
+        # Overflow is discarded, which is why maximising raw key generation is
+        # NOT the same as maximising the objective.
+        buf = KeyBuffer(b_max=1000)
+        buf.deposit(1500)
+        self.assertEqual(buf.level, 1000)
+
+    def test_withdrawal_reduces_the_level(self):
+        buf = KeyBuffer(b_max=1000)
+        buf.deposit(800)
+        buf.withdraw(300)
+        self.assertEqual(buf.level, 500)
+
+    def test_it_refuses_to_go_negative(self):
+        buf = KeyBuffer(b_max=1000)
+        buf.deposit(100)
+        with self.assertRaises(ValueError):
+            buf.withdraw(200)
+
+    def test_saturation_caps_the_level_not_the_single_deposit(self):
+        # `self._level += min(b_max, bits)` caps each deposit instead of the
+        # pool and passes both tests above, yet lets the buffer grow without
+        # bound over many slots -- exactly the overflow the objective needs.
+        buf = KeyBuffer(b_max=1000)
+        buf.deposit(800)
+        buf.deposit(800)
+        self.assertEqual(buf.level, 1000)
+
+    def test_withdrawing_the_whole_level_is_allowed(self):
+        # Boundary: eq (2) sizes the withdrawal from `level`, so a `>=` guard
+        # would reject the legal maximum and stall service at full buffer.
+        buf = KeyBuffer(b_max=1000)
+        buf.deposit(400)
+        buf.withdraw(400)
+        self.assertEqual(buf.level, 0)
+
+    def test_a_refused_withdrawal_leaves_the_level_alone(self):
+        # Raising after mutating would leave the pool corrupted for the
+        # caller that catches the error.
+        buf = KeyBuffer(b_max=1000)
+        buf.deposit(100)
+        with self.assertRaises(ValueError):
+            buf.withdraw(200)
+        self.assertEqual(buf.level, 100)
 
 
 if __name__ == "__main__":

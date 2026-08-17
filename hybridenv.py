@@ -62,3 +62,75 @@ class MessageQueue:
             if self._ages[i] > 0:
                 return i
         return 0
+
+
+class BlockAccumulator:
+    """Sifted bits piling up toward one finite-key block (eq 5-7).
+
+    A block must be homogeneous in protocol, so changing mode discards
+    whatever was accumulated. That is the switching cost of the whole
+    problem: it is intrinsic, not a penalty term bolted on.
+    """
+
+    def __init__(self, n_x):
+        self.n_x = int(n_x)
+        self._progress = 0
+        self._errors = 0
+        self._mode = None
+
+    def add(self, mode, sifted, errors):
+        """Add one slot's harvest under `mode`.
+
+        Returns (n_x, block_errors) when a block completes, else None. The
+        overshoot and its proportional share of the errors carry over.
+        """
+        if self._mode is not None and mode != self._mode:
+            self._progress = 0        # eq (5): indicator 1{m_t == m_{t-1}}
+            self._errors = 0
+        self._mode = mode
+        self._progress += int(sifted)
+        self._errors += int(errors)
+        if self._progress < self.n_x:
+            return None
+        # Split errors in proportion to bits, so neither block is flattered.
+        block_errors = int(round(self._errors * self.n_x / self._progress))
+        self._progress -= self.n_x
+        self._errors -= block_errors
+        return self.n_x, block_errors
+
+    @property
+    def progress(self):
+        return self._progress
+
+    @property
+    def errors(self):
+        return self._errors
+
+    @property
+    def mode(self):
+        return self._mode
+
+
+class KeyBuffer:
+    """The key pool (eq 11/22): saturates at B_max, never goes negative."""
+
+    def __init__(self, b_max):
+        self.b_max = int(b_max)
+        self._level = 0
+
+    def deposit(self, bits):
+        """Add distilled key; anything above B_max is lost."""
+        self._level = min(self.b_max, self._level + int(bits))
+
+    def withdraw(self, bits):
+        """Consume key. Callers must size the withdrawal from `level` first
+        (eq 2 does exactly that), so asking for more is a caller bug."""
+        bits = int(bits)
+        if bits > self._level:
+            raise ValueError("withdraw %d from a buffer holding %d"
+                             % (bits, self._level))
+        self._level -= bits
+
+    @property
+    def level(self):
+        return self._level
