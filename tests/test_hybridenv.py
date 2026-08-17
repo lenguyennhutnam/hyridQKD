@@ -91,8 +91,8 @@ class TestBlockAccumulator(unittest.TestCase):
 
     def test_staying_in_one_mode_accumulates(self):
         acc = BlockAccumulator(n_x=1000)
-        self.assertIsNone(acc.add(0, 400, 4))
-        self.assertIsNone(acc.add(0, 400, 4))
+        self.assertEqual(acc.add(0, 400, 4), [])
+        self.assertEqual(acc.add(0, 400, 4), [])
         self.assertEqual(acc.progress, 800)
 
     def test_switching_mode_throws_the_partial_block_away(self):
@@ -107,8 +107,8 @@ class TestBlockAccumulator(unittest.TestCase):
         acc = BlockAccumulator(n_x=1000)
         acc.add(0, 600, 12)
         done = acc.add(0, 600, 12)
-        self.assertIsNotNone(done)
-        n, errors = done
+        self.assertEqual(len(done), 1)
+        n, errors = done[0]
         self.assertEqual(n, 1000)
         # 24 errors over 1200 bits; the block keeps its proportional share.
         self.assertEqual(errors, 20)
@@ -125,8 +125,7 @@ class TestBlockAccumulator(unittest.TestCase):
         acc = BlockAccumulator(n_x=1000)
         acc.add(0, 999, 10)
         done = acc.add(1, 1000, 50)
-        self.assertIsNotNone(done)
-        self.assertEqual(done, (1000, 50))      # none of PM's errors leaked in
+        self.assertEqual(done, [(1000, 50)])    # none of PM's errors leaked in
 
     def test_switching_mode_discards_the_partial_errors_too(self):
         # An implementation that zeroes `progress` but keeps `_errors` looks
@@ -145,16 +144,44 @@ class TestBlockAccumulator(unittest.TestCase):
         # the leftover from scratch (or drops it) passes the single-block
         # tests and quietly biases every block after the first.
         acc = BlockAccumulator(n_x=1000)
+        self.assertEqual(acc.add(0, 700, 70), [])
         first = acc.add(0, 700, 70)
-        self.assertIsNone(first)
-        first = acc.add(0, 700, 70)
-        self.assertEqual(first, (1000, 100))    # 140 * 1000/1400
+        self.assertEqual(first, [(1000, 100)])  # 140 * 1000/1400
         self.assertEqual(acc.progress, 400)
         self.assertEqual(acc.errors, 40)
         second = acc.add(0, 700, 70)
-        self.assertEqual(second, (1000, 100))   # 110 * 1000/1100 = 100
+        self.assertEqual(second, [(1000, 100)])  # 110 * 1000/1100 = 100
         self.assertEqual(acc.progress, 100)
         self.assertEqual(acc.errors, 10)
+
+    def test_one_slot_can_retire_several_blocks(self):
+        # A slot's harvest is not bounded by n_x, so add() must drain the pile
+        # until it is short of a block. Retiring only the first (or collapsing
+        # the surplus with progress %= n_x) destroys whole blocks of finished
+        # key, and leaves progress/n_x far outside [0, 1).
+        acc = BlockAccumulator(n_x=1000)
+        done = acc.add(0, 3500, 350)
+        self.assertEqual(done, [(1000, 100), (1000, 100), (1000, 100)])
+        self.assertEqual(acc.progress, 500)     # the true remainder
+        self.assertEqual(acc.errors, 50)
+
+    def test_a_realistic_pm_slot_retires_every_block_it_earned(self):
+        # The CRITICAL case: at d_km=0 PM harvests ~853,699 sifted per slot
+        # against n_X = 100,000. Eight blocks are earned, so eight must come
+        # back -- delivering one threw away ~88% of the key.
+        acc = BlockAccumulator(n_x=100000)
+        done = acc.add(0, 853699, 8537)         # ~1% QBER
+        self.assertEqual(len(done), 8)
+        self.assertEqual([n for n, _ in done], [100000] * 8)
+        self.assertEqual(acc.progress, 53699)   # 853699 - 8 * 100000
+        # Errors are conserved: what left in blocks plus what stayed behind is
+        # exactly what came in. No error invented, none lost.
+        self.assertEqual(sum(e for _, e in done) + acc.errors, 8537)
+        for _, e in done:
+            self.assertAlmostEqual(e, 1000, delta=2)
+        # progress is back inside one block, so a later switch can only ever
+        # discard a partial block.
+        self.assertLess(acc.progress, acc.n_x)
 
 
 class TestKeyBuffer(unittest.TestCase):
@@ -200,6 +227,19 @@ class TestKeyBuffer(unittest.TestCase):
         buf = KeyBuffer(b_max=1000)
         buf.deposit(400)
         buf.withdraw(400)
+        self.assertEqual(buf.level, 0)
+
+    def test_the_pool_is_clamped_at_zero_from_below(self):
+        # A negative deposit that drove level below zero would make every
+        # later positive withdraw() raise, stopping service permanently and
+        # silently: the pool must stay a physical quantity.
+        buf = KeyBuffer(b_max=1000)
+        buf.deposit(100)
+        buf.deposit(-500)
+        self.assertEqual(buf.level, 0)
+        # Still usable afterwards -- no permanent lockout.
+        buf.deposit(200)
+        buf.withdraw(200)
         self.assertEqual(buf.level, 0)
 
     def test_a_refused_withdrawal_leaves_the_level_alone(self):

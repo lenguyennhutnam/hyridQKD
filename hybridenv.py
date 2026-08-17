@@ -65,11 +65,18 @@ class MessageQueue:
 
 
 class BlockAccumulator:
-    """Sifted bits piling up toward one finite-key block (eq 5-7).
+    """Sifted bits piling up toward finite-key blocks (eq 5-7).
 
     A block must be homogeneous in protocol, so changing mode discards
     whatever was accumulated. That is the switching cost of the whole
     problem: it is intrinsic, not a penalty term bolted on.
+
+    One slot's harvest is not bounded by n_x -- at short range PM sifts
+    hundreds of thousands of bits per slot against an n_X of 1e5 -- so `add`
+    returns a *list* of every block the pile can pay for, and keeps only the
+    sub-block remainder. `progress / n_x` therefore always lies in [0, 1),
+    which is what makes "a switch discards a partial block" true rather than
+    "a switch discards fifteen finished blocks".
     """
 
     def __init__(self, n_x):
@@ -81,8 +88,10 @@ class BlockAccumulator:
     def add(self, mode, sifted, errors):
         """Add one slot's harvest under `mode`.
 
-        Returns (n_x, block_errors) when a block completes, else None. The
-        overshoot and its proportional share of the errors carry over.
+        Returns a list [(n_x, block_errors), ...] of the blocks this slot
+        completed -- empty when none did, and longer than one entry when the
+        slot was rich enough to pay for several. The remainder and its
+        proportional share of the errors carry over to the next block.
         """
         if self._mode is not None and mode != self._mode:
             self._progress = 0        # eq (5): indicator 1{m_t == m_{t-1}}
@@ -90,13 +99,14 @@ class BlockAccumulator:
         self._mode = mode
         self._progress += int(sifted)
         self._errors += int(errors)
-        if self._progress < self.n_x:
-            return None
-        # Split errors in proportion to bits, so neither block is flattered.
-        block_errors = int(round(self._errors * self.n_x / self._progress))
-        self._progress -= self.n_x
-        self._errors -= block_errors
-        return self.n_x, block_errors
+        blocks = []
+        while self._progress >= self.n_x:
+            # Split errors in proportion to bits, so no block is flattered.
+            block_errors = int(round(self._errors * self.n_x / self._progress))
+            self._progress -= self.n_x
+            self._errors -= block_errors
+            blocks.append((self.n_x, block_errors))
+        return blocks
 
     @property
     def progress(self):
@@ -119,8 +129,12 @@ class KeyBuffer:
         self._level = 0
 
     def deposit(self, bits):
-        """Add distilled key; anything above B_max is lost."""
-        self._level = min(self.b_max, self._level + int(bits))
+        """Add distilled key; anything above B_max is lost.
+
+        Clamped at 0 from below too: a pool driven negative would make every
+        later withdrawal raise, stopping service for good.
+        """
+        self._level = min(self.b_max, max(0, self._level + int(bits)))
 
     def withdraw(self, bits):
         """Consume key. Callers must size the withdrawal from `level` first
