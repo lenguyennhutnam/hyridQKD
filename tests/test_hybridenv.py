@@ -32,6 +32,35 @@ class TestMessageQueue(unittest.TestCase):
         self.assertEqual(q.age_and_expire(), 4)   # age 4 > T0 = 3
         self.assertEqual(q.length, 0)
 
+    def test_serving_crosses_a_bucket_boundary(self):
+        # serve() must keep draining into younger buckets once the oldest is
+        # empty. An implementation that stops at the first non-empty bucket
+        # returns 2 here, silently capping PM's service rate and depressing
+        # eta without failing any single-bucket test.
+        q = MessageQueue(deadline=5)
+        q.arrive(2)
+        q.age_and_expire()          # those two are now age 1
+        q.arrive(3)
+        self.assertEqual(q.serve(4), 4)   # 2 from age 1, then 2 from age 0
+        self.assertEqual(q.length, 1)
+        self.assertEqual(q.head_age, 0)
+
+    def test_only_the_expiring_cohort_is_dropped(self):
+        # Two cohorts of different ages coexist and the older one times out.
+        # An age_and_expire() that clears the whole queue is sum-conserving,
+        # so eq (4) cannot see it -- only checking the survivors can.
+        q = MessageQueue(deadline=3)
+        q.arrive(2)                 # cohort A
+        q.age_and_expire()          # A is age 1
+        q.arrive(5)                 # cohort B, age 0
+        self.assertEqual(q.age_and_expire(), 0)   # A age 2, B age 1
+        self.assertEqual(q.age_and_expire(), 0)   # A age 3, B age 2
+        self.assertEqual(q.age_and_expire(), 2)   # A expires, B age 3
+        self.assertEqual(q.length, 5)             # all of B survives
+        self.assertEqual(q.head_age, 3)
+        self.assertEqual(q.age_and_expire(), 5)   # now B goes too
+        self.assertEqual(q.length, 0)
+
     def test_head_age_tracks_the_oldest_waiting_message(self):
         q = MessageQueue(deadline=10)
         q.arrive(1)
