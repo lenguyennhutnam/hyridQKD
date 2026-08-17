@@ -10,7 +10,25 @@ so no security formula is reimplemented here.
 Spec: docs/superpowers/specs/2026-08-17-hybrid-policy-design.md
 """
 
+import dataclasses
 from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+
+import channel
+import keyrate
+import keyrate_ent
+import presets
+from evemarkov import EveChain, EveParams
+
+PM, ENT = 0, 1
+
+OBS_DIM = 6
+# Layout of the observation vector (eq 16). Defined here because _observe()
+# is what fixes the order; policies.py re-exports these so no policy ever
+# indexes the state with a bare integer.
+I_QBER, I_MODE, I_BLOCK, I_BUFFER, I_QUEUE, I_AGE = range(OBS_DIM)
 
 
 class MessageQueue:
@@ -148,3 +166,214 @@ class KeyBuffer:
     @property
     def level(self):
         return self._level
+
+
+@dataclass
+class HybridParams:
+    """Everything the numeric evaluation can sweep. Spec section 4."""
+
+    delta_t: float = 1.0            # slot length [s]
+    n_x: int = 100_000              # finite-key block size [sifted bits]
+    l0: int = 8192                  # key bits to encrypt one message (OTP)
+    lam: float = 1.0                # mean arrivals per slot (Poisson)
+    t0_deadline: int = 20           # message deadline [slots]
+    b_max: int = 10_000_000         # key buffer capacity [bits]
+    w_window: int = 5               # QBER estimation window [slots]
+    horizon: int = 3600             # slots per episode
+    d_km: float = 55.0              # shared fibre, both modes
+    alpha: float = 0.2
+    odr_losses: float = 0.0
+    seed: int = 0
+    # Which measured operating point each mode runs at. chapman_lowmu (mu =
+    # 0.015) rather than chapman_current: at mu = 0.045 ENT dies *before* PM
+    # does, so eq (14)'s crossover q* would not exist (spec section 2, #2).
+    pm_preset: str = "aurea"
+    ent_preset: str = "chapman_lowmu"
+
+
+class HybridEnv:
+    """eq (1)-(24). step() advances one slot and returns the usual RL tuple.
+
+    Per-mode physics is resolved ONCE at construction from the verified
+    channel/keyrate modules: the sifted rate ns_m and the intrinsic error
+    floor e_m. Per slot only the jamming fraction changes, so a step costs a
+    binomial draw plus (rarely) one finite-key evaluation.
+
+    Deliberate divergence from the qline stack: switching mode costs only the
+    partial block (eq 20), not the ~2.28 s the stack needs to restart. The
+    document's cost model has no dead time, and the measured 2.28 s is an
+    artifact of restarting Python/Rust processes rather than a property of a
+    hybrid device (spec section 8).
+    """
+
+    def __init__(self, params=None, eve_params=None):
+        self.params = params or HybridParams()
+        self.eve = EveChain(eve_params or EveParams())
+        self._setup_modes()
+        self.reset()
+
+    def _setup_modes(self):
+        """Resolve both modes' per-slot physics from the verified modules.
+
+        Both modes ride the SAME fibre, so d_km/alpha/odr_losses override
+        whatever the presets carried. Comparing presets with different
+        channels is the trap CLAUDE.md records having already been published
+        once and retracted.
+        """
+        p = self.params
+        pm_env = dataclasses.replace(presets.load_presets()[p.pm_preset],
+                                     d_km=p.d_km, alpha=p.alpha,
+                                     odr_losses=p.odr_losses)
+        ent_env = dataclasses.replace(
+            presets.load_ent_presets()[p.ent_preset],
+            d_km=p.d_km, alpha=p.alpha, odr_losses=p.odr_losses)
+        d_pm = channel.derive(pm_env, p.n_x)
+        d_ent = channel.derive_ent(ent_env, p.n_x)
+        # pdc is passed explicitly: KeyParams defaults it, and a preset with a
+        # different dark-count rate would otherwise be silently ignored here
+        # while channel.derive() honoured it.
+        self._key_params = keyrate.KeyParams(mu1=pm_env.mu1, mu2=pm_env.mu2,
+                                             p1=pm_env.p1, eta=d_pm.eta,
+                                             pdc=pm_env.pdc)
+        # PM keys the Z basis only (a quarter of clicks); ENT keys both
+        # sifted bases (half). Getting this wrong doubles ENT's apparent rate.
+        self._sifted = (int(d_pm.clicks_per_s * 0.25 * p.delta_t),
+                        int(d_ent.clicks_per_s * 0.5 * p.delta_t))
+        self._e_floor = (d_pm.e_avg, d_ent.q2)
+
+    def reset(self):
+        """Start a fresh episode; return the first observation."""
+        p = self.params
+        # Two independent streams. Sharing one would make the arrival process
+        # depend on how many uniforms numpy's binomial happened to consume for
+        # this slot's error draw -- which varies with the mode -- so two
+        # policies on the same seed would face different message traffic and
+        # could not be compared (nor could an Oracle bound them).
+        err_seed, arr_seed = np.random.SeedSequence(p.seed).generate_state(2)
+        self._rng = np.random.RandomState(err_seed)
+        self._arrivals_rng = np.random.RandomState(arr_seed)
+        self.eve.reset()
+        self._queue = MessageQueue(p.t0_deadline)
+        self._block = BlockAccumulator(p.n_x)
+        self._buffer = KeyBuffer(p.b_max)
+        self._slot = 0
+        self._served_total = 0
+        self._arrived_total = 0
+        self._last_mode = PM
+        self._qber_hist = deque(maxlen=max(1, p.w_window))
+        return self._observe()
+
+    def _observe(self):
+        """s_t of eq (16) -- nothing here may depend on slot t or later."""
+        p = self.params
+        q = (sum(self._qber_hist) / len(self._qber_hist)
+             if self._qber_hist else 0.0)
+        q_ref = max(p.lam * p.t0_deadline, 1.0)
+        # T0 = 0 (serve on arrival or never) is a legal sweep point; keep it
+        # from turning the urgency feature into a division by zero.
+        age_ref = max(p.t0_deadline, 1)
+        return np.array([
+            q,                                        # sliding-window QBER
+            float(self._last_mode),                   # m_{t-1}
+            self._block.progress / p.n_x,             # b_t / n_X
+            self._buffer.level / p.b_max,             # B_t / B_max
+            min(self._queue.length / q_ref, 2.0),     # queue pressure
+            self._queue.head_age / age_ref,           # urgency
+        ], dtype=float)
+
+    def _key_length(self, mode, n, errors):
+        """Secret bits from one finished block -- eq (8) for PM, (9) for ENT."""
+        qber = errors / n if n else 0.0
+        if mode == ENT:
+            return keyrate_ent.secret_key_length_ent(n, qber) or 0
+        return keyrate.secret_key_length(n, qber, self._key_params) or 0
+
+    def step(self, action):
+        """Advance one slot under `action` (PM or ENT).
+
+        Returns (obs, reward, done, info): reward is U_t, the messages served
+        before their deadline in this slot (eq 17), and info carries the
+        quantities the policy may NOT see -- f_t above all.
+        """
+        p = self.params
+        mode = ENT if int(action) == ENT else PM
+
+        # --- quantum side: this slot's harvest under the current jamming ---
+        f = self.eve.step()
+        e_eff = self._e_floor[mode] * (1.0 - f) + 0.5 * f
+        sifted = self._sifted[mode]
+        # Errors are a binomial draw, so the QBER estimate is noisy exactly in
+        # proportion to the sample size -- no invented observation noise.
+        errors = int(self._rng.binomial(sifted, min(e_eff, 1.0)))
+        self._qber_hist.append(errors / sifted if sifted else 0.0)
+
+        # A rich slot can pay for several blocks at once, so add() returns
+        # every block it retired (empty list when none did).
+        deposited = 0
+        blocks = self._block.add(mode, sifted, errors)
+        for n_block, block_errors in blocks:
+            bits = self._key_length(mode, n_block, block_errors)
+            deposited += bits
+            self._buffer.deposit(bits)
+
+        # --- classical side: arrivals, service, expiry (eq 2-4) ---
+        # This order is mandatory: arrive -> serve -> age_and_expire. Any
+        # other shifts the effective deadline by a slot.
+        arrivals = int(self._arrivals_rng.poisson(p.lam))
+        self._queue.arrive(arrivals)
+        capacity = self._buffer.level // p.l0
+        served = self._queue.serve(min(self._queue.length, capacity))
+        self._buffer.withdraw(served * p.l0)
+        expired = self._queue.age_and_expire()
+
+        self._served_total += served
+        self._arrived_total += arrivals
+        self._last_mode = mode
+        self._slot += 1
+        done = self._slot >= p.horizon
+        info = {"f": f, "eve_state": self.eve.state, "arrivals": arrivals,
+                "served": served, "expired": expired,
+                "buffer": self._buffer.level, "deposited": deposited,
+                "blocks": len(blocks), "mode": mode,
+                "qber": self._qber_hist[-1]}
+        return self._observe(), float(served), done, info
+
+    @property
+    def eta(self):
+        """eq (24): fraction of arrivals served before their deadline."""
+        if self._arrived_total == 0:
+            return 0.0
+        return self._served_total / self._arrived_total
+
+    # Read-only views of the internal state. Tests and the analysis scripts
+    # need these; nothing outside may mutate them.
+
+    @property
+    def sifted_per_slot(self):
+        """(PM, ENT) sifted bits harvested per slot at this channel."""
+        return self._sifted
+
+    @property
+    def error_floor(self):
+        """(PM, ENT) intrinsic error rates e_m with no jamming."""
+        return self._e_floor
+
+    @property
+    def buffer_level(self):
+        return self._buffer.level
+
+    @property
+    def queue_length(self):
+        return self._queue.length
+
+    @property
+    def queue_head_age(self):
+        return self._queue.head_age
+
+    @property
+    def block_progress(self):
+        return self._block.progress
+
+    @property
+    def block_mode(self):
+        return self._block.mode

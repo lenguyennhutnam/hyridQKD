@@ -1,7 +1,10 @@
 """Hybrid PM/ENT environment: eq (1)-(24) of system_model_v3_5."""
 import unittest
 
-from hybridenv import BlockAccumulator, KeyBuffer, MessageQueue
+from evemarkov import EveParams
+from hybridenv import (ENT, I_AGE, I_BLOCK, I_BUFFER, I_MODE, I_QBER, I_QUEUE,
+                       OBS_DIM, PM, BlockAccumulator, HybridEnv, HybridParams,
+                       KeyBuffer, MessageQueue)
 
 
 class TestMessageQueue(unittest.TestCase):
@@ -250,6 +253,363 @@ class TestKeyBuffer(unittest.TestCase):
         with self.assertRaises(ValueError):
             buf.withdraw(200)
         self.assertEqual(buf.level, 100)
+
+
+class TestHybridEnv(unittest.TestCase):
+    def setUp(self):
+        # Short horizon keeps the suite fast; dynamics are unchanged.
+        self.params = HybridParams(horizon=200, seed=3)
+        self.env = HybridEnv(self.params)
+
+    def test_reset_returns_an_observation_of_the_right_shape(self):
+        obs = self.env.reset()
+        self.assertEqual(obs.shape, (OBS_DIM,))
+
+    def test_the_observation_carries_exactly_the_documented_six_features(self):
+        # eq (16): the policy may not see f_t, A_t, or anything after slot
+        # t-1. Pinning each index to a known quantity is what catches the
+        # realistic regression -- someone appending f_t "just as a hint".
+        self.env.reset()
+        obs, _, _, info = self.env.step(ENT)
+        self.assertEqual(len(obs), OBS_DIM)
+        self.assertEqual(obs[I_MODE], float(ENT))
+        self.assertAlmostEqual(obs[I_BUFFER] * self.params.b_max,
+                               info["buffer"], places=6)
+        # f_t and the arrivals are reported for analysis but never observed.
+        self.assertIn("f", info)
+        self.assertIn("arrivals", info)
+
+    def test_every_observation_index_is_pinned_to_a_past_quantity(self):
+        # The test above pins two of the six entries, so an _observe() that
+        # writes f_t (or the arrival count) into any of the other four passes
+        # it, passes every shape check, and quietly destroys the causality
+        # constraint the whole research question rests on. Pin all six against
+        # independently readable state and there is nowhere left to hide.
+        #
+        # The conditions matter as much as the assertions: jamming is held at
+        # a distinctive non-zero level and messages are priced above B_max so
+        # the queue never empties. Checked on a quiet slot with an empty queue
+        # instead, four of the six entries are zero, f_t is zero, and a leak
+        # matches by coincidence -- which is exactly how the first draft of
+        # this test let that mutant through.
+        # f = 0.025 is jamming that PM still survives, so the buffer fills and
+        # that entry is non-zero too.
+        p = HybridParams(horizon=30, seed=7, w_window=3, l0=20_000_000)
+        env = HybridEnv(p, EveParams(f_levels=(0.025,) * 3, seed=1))
+        env.reset()
+        recent = []
+        for t in range(30):
+            action = ENT if t % 7 == 3 else PM
+            obs, _, _, info = env.step(action)
+            recent = (recent + [info["qber"]])[-3:]
+            self.assertEqual(len(obs), OBS_DIM)
+            self.assertAlmostEqual(obs[I_QBER], sum(recent) / len(recent))
+            self.assertEqual(obs[I_MODE], float(action))
+            self.assertAlmostEqual(obs[I_BLOCK] * p.n_x, env.block_progress)
+            self.assertAlmostEqual(obs[I_BUFFER] * p.b_max, info["buffer"])
+            self.assertAlmostEqual(obs[I_QUEUE] * (p.lam * p.t0_deadline),
+                                   env.queue_length)
+            self.assertAlmostEqual(obs[I_AGE] * p.t0_deadline,
+                                   env.queue_head_age)
+        # The run really did exercise non-trivial values in every slot that a
+        # leaked f_t could have impersonated.
+        self.assertGreater(env.queue_length, 0)
+        self.assertGreater(env.queue_head_age, 0)
+        self.assertGreater(env.buffer_level, 0)
+
+    def test_the_slot_qber_fluctuates_with_the_sample_size(self):
+        # Spec section 5: the ONLY observation noise is the binomial error
+        # draw. Replace it with its expected value and q_t becomes a noiseless
+        # function of Eve's state -- the environment stops being partially
+        # observable, which is the entire reason the problem needs a policy
+        # rather than a lookup table.
+        steady = EveParams(f_levels=(0.03, 0.03, 0.03), seed=1)
+        env = HybridEnv(HybridParams(horizon=60, seed=17), steady)
+        env.reset()
+        done, seen = False, set()
+        while not done:
+            _, _, done, info = env.step(PM)
+            seen.add(info["qber"])
+        self.assertGreater(len(seen), 30)
+
+    def test_the_qber_observation_averages_only_the_last_w_slots(self):
+        # The W-slot window is what makes the observation lag Eve's state.
+        # Drop the bound and q_t becomes a whole-episode mean that never
+        # recovers after a jamming burst, so the policy stops being able to
+        # see the channel clear -- and no shape or invariant test notices.
+        env = HybridEnv(HybridParams(horizon=20, seed=13, w_window=3))
+        env.reset()
+        recent = []
+        for _ in range(12):
+            obs, _, _, info = env.step(PM)
+            recent = (recent + [info["qber"]])[-3:]
+            self.assertAlmostEqual(obs[I_QBER], sum(recent) / len(recent))
+
+    def test_an_episode_ends_after_the_horizon(self):
+        self.env.reset()
+        done = False
+        steps = 0
+        while not done:
+            _, _, done, _ = self.env.step(0)
+            steps += 1
+        self.assertEqual(steps, self.params.horizon)
+
+    def test_reward_is_the_number_of_messages_served(self):
+        self.env.reset()
+        _, reward, _, info = self.env.step(0)
+        self.assertEqual(reward, info["served"])
+
+    def test_eta_is_a_fraction(self):
+        self.env.reset()
+        done = False
+        while not done:
+            _, _, done, _ = self.env.step(0)
+        self.assertGreaterEqual(self.env.eta, 0.0)
+        self.assertLessEqual(self.env.eta, 1.0)
+
+    def test_served_never_exceeds_arrivals(self):
+        self.env.reset()
+        done, served, arrived = False, 0, 0
+        while not done:
+            _, r, done, info = self.env.step(0)
+            served += r
+            arrived += info["arrivals"]
+        self.assertLessEqual(served, arrived)
+
+    def test_the_buffer_stays_within_bounds(self):
+        self.env.reset()
+        done = False
+        while not done:
+            _, _, done, info = self.env.step(0)
+            self.assertGreaterEqual(info["buffer"], 0)
+            self.assertLessEqual(info["buffer"], self.params.b_max)
+
+    def test_same_seed_reproduces_the_run(self):
+        def run():
+            env = HybridEnv(HybridParams(horizon=100, seed=42))
+            env.reset()
+            done, total = False, 0
+            while not done:
+                _, r, done, _ = env.step(0)
+                total += r
+            return total
+        self.assertEqual(run(), run())
+
+    def test_pm_beats_ent_when_nobody_is_jamming(self):
+        # Sanity check against the measured kappa table: with f == 0, PM
+        # distils ~20x more key per slot, so it must serve more messages.
+        quiet = EveParams(f_levels=(0.0, 0.0, 0.0), seed=1)
+        pm = HybridEnv(HybridParams(horizon=600, seed=1), quiet)
+        ent = HybridEnv(HybridParams(horizon=600, seed=1), quiet)
+        self.assertGreater(_run_fixed(pm, 0), _run_fixed(ent, 1))
+
+    def test_ent_beats_pm_under_heavy_jamming(self):
+        # f = 0.08 is inside the switching window: PM's key length hits zero
+        # while ENT still distils. This is the whole premise of the problem.
+        heavy = EveParams(f_levels=(0.08, 0.08, 0.08), seed=1)
+        pm = HybridEnv(HybridParams(horizon=1200, seed=1), heavy)
+        ent = HybridEnv(HybridParams(horizon=1200, seed=1), heavy)
+        self.assertGreater(_run_fixed(ent, 1), _run_fixed(pm, 0))
+
+    def test_switching_every_slot_wastes_every_block(self):
+        # eq (5): alternating modes means no block ever completes, so no key
+        # is ever distilled -- the cost that makes the decision sequential.
+        env = HybridEnv(HybridParams(horizon=400, seed=1))
+        env.reset()
+        done, action, served = False, 0, 0
+        while not done:
+            _, r, done, _ = env.step(action)
+            action = 1 - action
+            served += r
+        self.assertEqual(served, 0)
+
+    def test_holding_one_mode_accumulates_across_slots(self):
+        # BlockAccumulator compares modes with == only, so feeding it "pm" /
+        # "ent" instead of the integer constants reads as a switch on every
+        # slot: no block ever completes and the run silently yields zero key
+        # with nothing anywhere raising.
+        env = HybridEnv(HybridParams(horizon=10, seed=9))
+        env.reset()
+        env.step(ENT)
+        first = env.block_progress
+        env.step(ENT)
+        self.assertGreater(first, 0)
+        self.assertEqual(env.block_progress, 2 * first)
+        self.assertEqual(env.block_mode, ENT)
+
+    def test_the_per_slot_sifted_rates_match_the_measured_design_point(self):
+        # Spec section 4, measured at 55 km / 0.2 dB/km / 0 dB optics: PM
+        # distils its block from the Z basis only (a quarter of clicks) and
+        # BBM92 keys both sifted bases (half). Swap those two factors and
+        # every dynamics test still passes while ENT's rate doubles, which
+        # invalidates every PM-vs-ENT number the study reports.
+        env = HybridEnv(HybridParams(seed=0))
+        self.assertEqual(env.sifted_per_slot, (69422, 3485))
+        # e_PM = 1.02%, e_ENT = 3.18%: the intrinsic floors of spec section 5.
+        self.assertAlmostEqual(env.error_floor[PM], 0.0102, places=4)
+        self.assertAlmostEqual(env.error_floor[ENT], 0.0318, places=4)
+
+    def test_the_jamming_and_arrivals_do_not_depend_on_the_actions(self):
+        # Policies are compared on a shared seed, so the exogenous processes
+        # have to be common random numbers. Draw the errors and the arrivals
+        # from one stream and numpy's binomial consumes a mode-dependent
+        # number of uniforms, so every policy meets different traffic and a
+        # worse policy can win on luck alone.
+        def trace(actions):
+            env = HybridEnv(HybridParams(horizon=len(actions), seed=5))
+            env.reset()
+            out = []
+            for a in actions:
+                _, _, _, info = env.step(a)
+                out.append((info["f"], info["arrivals"]))
+            return out
+        n = 60
+        self.assertEqual(trace([PM] * n), trace([ENT] * n))
+        self.assertEqual(trace([PM] * n), trace([t % 2 for t in range(n)]))
+
+    def test_reset_clears_the_queue_the_block_and_the_buffer(self):
+        # Training reuses one env for thousands of episodes. State surviving
+        # reset() carries one episode's banked key into the next, so the
+        # learning curve measures the leak instead of the policy.
+        env = HybridEnv(HybridParams(horizon=400, seed=6))
+        env.reset()
+        for _ in range(120):
+            env.step(ENT)
+        # ENT deliberately: PM drains the queue every slot, so a reset that
+        # keeps the queue object would still read length 0 and survive.
+        self.assertGreater(env.queue_length, 0)
+        self.assertGreater(env.buffer_level, 0)
+        self.assertGreater(env.block_progress, 0)
+        obs = env.reset()
+        self.assertEqual(list(obs), [0.0] * OBS_DIM)
+        self.assertEqual(env.eta, 0.0)
+        self.assertEqual(env.queue_length, 0)
+        self.assertEqual(env.block_progress, 0)
+        self.assertEqual(env.buffer_level, 0)
+
+    def test_reset_rewinds_the_episode_so_one_env_can_replay_it(self):
+        # test_same_seed_reproduces_the_run builds a fresh env each time, so
+        # it cannot see a reset() that forgets to rewind the RNG streams or
+        # Eve's chain. Replaying on the SAME instance can.
+        env = HybridEnv(HybridParams(horizon=40, seed=8))
+
+        def episode():
+            env.reset()
+            out, done = [], False
+            while not done:
+                _, r, done, info = env.step(PM)
+                out.append((info["f"], info["arrivals"], r))
+            return out
+        self.assertEqual(episode(), episode())
+
+    def test_every_arrival_is_served_expired_or_still_waiting(self):
+        # eq (4) as an end-to-end invariant. ENT alone cannot keep up with the
+        # traffic, so this run really does exercise the expiry path.
+        env = HybridEnv(HybridParams(horizon=300, seed=11))
+        env.reset()
+        done, arrived, served, expired = False, 0, 0, 0
+        while not done:
+            _, r, done, info = env.step(ENT)
+            arrived += info["arrivals"]
+            served += r
+            expired += info["expired"]
+        self.assertGreater(expired, 0)
+        self.assertEqual(arrived, served + expired + env.queue_length)
+
+    def test_service_cannot_outrun_the_key_buffer(self):
+        # eq (2): a message costs l0 bits of one-time pad. Price it above
+        # B_max and nothing can ever be paid for, so an implementation that
+        # serves the queue without charging the buffer shows up as eta > 0.
+        env = HybridEnv(HybridParams(horizon=100, seed=2, l0=20_000_000))
+        env.reset()
+        done, arrived, served = False, 0, 0
+        while not done:
+            _, r, done, info = env.step(PM)
+            arrived += info["arrivals"]
+            served += r
+        self.assertGreater(arrived, 0)
+        self.assertEqual(served, 0)
+        self.assertEqual(env.eta, 0.0)
+
+    def test_distilled_key_is_either_banked_or_spent(self):
+        # Serving without withdrawing lets one distilled bit pay for every
+        # message ever sent -- eta goes to 1 and the objective stops meaning
+        # anything. The run is short enough that B_max never saturates, so
+        # the balance is an exact equality.
+        env = HybridEnv(HybridParams(horizon=200, seed=4))
+        env.reset()
+        done, deposited, served = False, 0, 0
+        while not done:
+            _, r, done, info = env.step(PM)
+            deposited += info["deposited"]
+            served += r
+        self.assertGreater(deposited, 0)
+        self.assertGreater(served, 0)
+        self.assertLess(deposited, env.params.b_max)
+        self.assertEqual(env.buffer_level,
+                         deposited - served * env.params.l0)
+
+    def test_no_message_expires_while_the_buffer_can_still_pay(self):
+        # The other half of the arrive -> serve -> age_and_expire order.
+        # Expiring first kills a message in the slot the deadline still
+        # allowed, even with key sitting unspent -- and every conservation
+        # identity balances either way, so only this invariant sees it:
+        # serve() drains the queue oldest-first up to what the buffer can
+        # afford, so anything left to expire means the buffer ran out.
+        #
+        # lam = 0.14 puts the demand (1,147 bits/slot) within 1% of ENT's key
+        # rate (1,137), so the buffer hovers around l0 and the queue stays a
+        # handful of messages. That is the only regime where the two orders
+        # differ: with a permanently starved buffer the expiring message is
+        # simply replaced by a younger one and the totals match either way.
+        env = HybridEnv(HybridParams(horizon=3000, seed=15, lam=0.14))
+        env.reset()
+        done, expired_total = False, 0
+        while not done:
+            _, _, done, info = env.step(ENT)
+            if info["expired"]:
+                self.assertLess(info["buffer"], env.params.l0)
+            expired_total += info["expired"]
+        self.assertGreater(expired_total, 0)
+
+    def test_a_rich_slot_banks_every_block_it_earned(self):
+        # At d_km = 0 -- a setting the panel actually uses -- PM sifts 853,699
+        # bits in one slot against n_X = 100,000, so a single slot retires
+        # eight blocks. Banking only the first throws away ~88% of the key,
+        # and at the 55 km design point (69,422 per slot, never more than one
+        # block per slot) nothing else in this file can tell the difference.
+        env = HybridEnv(HybridParams(horizon=5, seed=16, d_km=0.0))
+        env.reset()
+        _, _, _, info = env.step(PM)
+        self.assertEqual(env.sifted_per_slot[PM] // env.params.n_x, 8)
+        self.assertEqual(info["blocks"], 8)
+        # Eight blocks of real key, not one: a single block can never exceed
+        # its own n_X bits.
+        self.assertGreater(info["deposited"], 2 * env.params.n_x)
+
+    def test_a_message_can_be_served_in_the_slot_it_arrives(self):
+        # The per-slot order is arrive -> serve -> age_and_expire. Serving
+        # before the arrivals land delays every message by one slot, which
+        # shifts the effective deadline and depresses eta without breaking a
+        # single conservation identity.
+        env = HybridEnv(HybridParams(horizon=300, seed=12))
+        env.reset()
+        for _ in range(150):        # warm the buffer up past any shortage
+            env.step(PM)
+        self.assertEqual(env.queue_length, 0)
+        for _ in range(100):
+            _, r, _, info = env.step(PM)
+            self.assertEqual(r, info["arrivals"])
+
+
+def _run_fixed(env, action):
+    """Run a whole episode with one fixed action; return messages served."""
+    env.reset()
+    done, total = False, 0
+    while not done:
+        _, r, done, _ = env.step(action)
+        total += r
+    return total
 
 
 if __name__ == "__main__":
