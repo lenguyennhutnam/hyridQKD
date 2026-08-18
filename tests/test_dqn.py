@@ -53,6 +53,84 @@ class _BanditEnv:
         return self._paid / self.horizon
 
 
+class _ChainEnv:
+    """A three-state chain whose payoff is one step away from the decision.
+
+    `_BanditEnv` above is deliberately degenerate -- constant observation,
+    `gamma = 0` -- which makes it a clean probe of the *update* but blind to
+    most of `train`'s wiring: with one observation and no discounting, `obs`
+    and `next_obs` are interchangeable and gamma multiplies nothing. Three
+    corruptions of the loop survive it (measured, see the report): storing the
+    transition backwards, hardwiring gamma to 0, and regressing on `next_obs`
+    instead of `obs`.
+
+    So this fixture is built to make each of those matter:
+
+        A --good--> PAY --any--> PAY   reward 1 per slot, forever
+        A --bad --> DEAD --any--> DEAD  reward 0, forever
+
+    * The observation genuinely varies over time: a one-hot of the state plus
+      a normalised slot clock, so `obs` and `next_obs` are never equal.
+    * The reward at A is 0 for BOTH actions. The right action is identifiable
+      only by what it leads to, so the signal has to travel through the
+      bootstrap -- at gamma = 0 both actions at A are worth exactly 0 and the
+      chain becomes unlearnable. `test_the_fixture_really_needs_a_bootstrap`
+      pins that, so the fixture cannot quietly lose its teeth.
+    * A is reachable only by reset(), never as a `next_obs`. That is what
+      makes the backwards-storage corruptions bite deterministically rather
+      than by luck: they leave Q(A, .) with no training signal at all.
+
+    `good` runs the chain both ways round, so an agent that always answers the
+    same action fails one of the two.
+    """
+
+    A, PAY, DEAD = 0, 1, 2
+
+    def __init__(self, good, horizon=12):
+        self.good = int(good)
+        self.horizon = int(horizon)
+        self.seeds = []
+        self._state = self.A
+        self._t = 0
+        self._paid = 0.0
+
+    def _obs(self):
+        v = np.zeros(OBS_DIM)
+        v[self._state] = 1.0
+        v[3] = self._t / self.horizon
+        return v
+
+    def reset(self, seed=None):
+        self.seeds.append(seed)
+        self._state = self.A
+        self._t = 0
+        self._paid = 0.0
+        return self._obs()
+
+    def step(self, action):
+        if self._state == self.A:
+            self._state = self.PAY if int(action) == self.good else self.DEAD
+            reward = 0.0
+        else:
+            reward = 1.0 if self._state == self.PAY else 0.0
+        self._paid += reward
+        self._t += 1
+        return self._obs(), reward, self._t >= self.horizon, {}
+
+    @property
+    def eta(self):
+        return self._paid / self.horizon
+
+
+def _chain_cfg(good_seed=0, **kw):
+    """Budget that learns the chain in ~50 ms. Verified over 6 config seeds."""
+    base = dict(episodes=40, hidden=16, lr=0.05, gamma=0.9, batch_size=32,
+                capacity=1000, warmup=64, target_sync=50, eps_start=1.0,
+                eps_end=0.1, eps_decay_episodes=20, seed=good_seed)
+    base.update(kw)
+    return DQNConfig(**base)
+
+
 def _tiny_cfg(**kw):
     """A config small enough that a whole training run is milliseconds."""
     base = dict(episodes=4, hidden=8, batch_size=8, capacity=200, warmup=8,
@@ -605,6 +683,178 @@ class TestTrainingLoop(unittest.TestCase):
         env = _BanditEnv(good=1, horizon=2)
         cfg = _tiny_cfg(episodes=1)
         self.assertIsInstance(train(env, cfg), DQNPolicy)
+
+
+class TestTrainingLoopWiring(unittest.TestCase):
+    """The loop itself, on a fixture that can tell its parts apart.
+
+    Everything in TestTrainingLoop above runs against `_BanditEnv`, where a
+    constant observation and gamma = 0 mean most of `train`'s plumbing cannot
+    matter. These run against `_ChainEnv`, where it does.
+    """
+
+    def _learn(self, good, **kw):
+        env = _ChainEnv(good=good)
+        policy = train(env, _chain_cfg(**kw))
+        q = policy.net.forward(_ChainEnv(good).reset())[0]
+        return int(np.argmax(q)), float(q[good] - q[1 - good])
+
+    def test_it_learns_an_action_whose_payoff_is_one_step_away(self):
+        # The reward at A is 0 whichever action is taken, so this can only be
+        # solved by carrying value back from PAY through the bootstrap. It
+        # fails if the transition is stored backwards, if the regression is
+        # run on next_obs, or if gamma is not applied -- none of which the
+        # bandit fixture can see.
+        for good in (0, 1):
+            picked, gap = self._learn(good)
+            self.assertEqual(picked, good, "chain good=%d" % good)
+            # A margin, not a coin flip: the observed gap is 3.6-5.0 over six
+            # config seeds, while a loop that learns nothing about A sits at
+            # |gap| < 0.02. Anything in between is not "learned".
+            self.assertGreater(gap, 1.0, "chain good=%d gap=%.3f"
+                               % (good, gap))
+
+    def test_the_fixture_really_needs_a_bootstrap(self):
+        # Guards the guard. If a future edit made the chain solvable from the
+        # immediate reward alone, the test above would keep passing while
+        # silently losing its power over gamma. At gamma = 0 both actions at A
+        # are worth exactly 0, so no margin can exist.
+        for good in (0, 1):
+            _, gap = self._learn(good, gamma=0.0)
+            self.assertLess(abs(gap), 0.5, "gamma=0 gap=%.3f" % gap)
+
+    def test_the_observation_really_changes_from_slot_to_slot(self):
+        # If obs == next_obs the swap corruptions are no-ops by construction,
+        # so the fixture's premise is asserted rather than assumed.
+        env = _ChainEnv(good=1)
+        obs = env.reset(0)
+        nxt, _, _, _ = env.step(1)
+        self.assertFalse(np.array_equal(obs, nxt))
+        later, _, _, _ = env.step(1)
+        self.assertFalse(np.array_equal(nxt, later))   # the clock keeps moving
+
+    def test_the_decision_state_is_never_a_successor(self):
+        # The property that makes the backwards-storage corruptions bite
+        # deterministically: nothing transitions INTO A, so storing (s', a, r,
+        # s) leaves Q(A, .) with no training signal at all.
+        env = _ChainEnv(good=1)
+        start = env.reset(0)
+        done = False
+        while not done:
+            nxt, _, done, _ = env.step(1)
+            self.assertFalse(np.array_equal(nxt, start))
+
+
+def _training_trace(cfg, env):
+    """Snapshot (online.w1, target.w1) at the start of every gradient step.
+
+    `train` looks `bellman_target` up in the module globals at call time, so
+    patching it here yields a per-gradient-step window onto both networks
+    without `train` exposing anything for testing. The snapshot is taken
+    BEFORE this step's train_step and AFTER the previous step's sync, so
+    trace[i][0] is exactly the online net as it stood when a sync at the end
+    of step i-1 would have copied it.
+    """
+    trace = []
+    real = dqn.bellman_target
+
+    def spy(online, target, *args, **kwargs):
+        trace.append((online.w1.copy(), target.w1.copy()))
+        return real(online, target, *args, **kwargs)
+
+    dqn.bellman_target = spy
+    try:
+        policy = train(env, cfg)
+    finally:
+        dqn.bellman_target = real
+    return trace, policy
+
+
+class TestTargetNetworkWeights(unittest.TestCase):
+    """The target network, asserted on WEIGHTS rather than call counts.
+
+    Counting copy_from calls pins the schedule but says nothing about what was
+    copied where. Two corruptions slip through a count: copying in the wrong
+    direction (which clobbers the ONLINE net every sync and destroys learning
+    outright), and a target built from an independent initialisation.
+    """
+
+    # 2 episodes x 20 slots = 40 env steps; learning starts once the buffer
+    # holds warmup=5, so there are 40 - 5 + 1 = 36 gradient steps and syncs
+    # land at the end of steps 10, 20 and 30 -- i.e. trace indices 10, 20, 30
+    # are the snapshots taken immediately after a sync.
+    CFG = dict(episodes=2, hidden=8, batch_size=8, capacity=200, warmup=5,
+               target_sync=10, lr=0.05, gamma=0.9, eps_decay_episodes=1,
+               seed=0)
+    SYNC_AT = (10, 20, 30)
+
+    def setUp(self):
+        cfg = DQNConfig(**self.CFG)
+        self.cfg = cfg
+        self.trace, self.policy = _training_trace(cfg,
+                                                  _ChainEnv(good=1,
+                                                            horizon=20))
+        self.assertEqual(len(self.trace), 36)     # the arithmetic above holds
+
+    def test_the_target_starts_out_equal_to_the_online_net(self):
+        # A target built from its own seed regresses the first target_sync
+        # steps toward noise. Only a weight comparison sees it: the call count
+        # is unchanged and training still "works".
+        online, target = self.trace[0]
+        np.testing.assert_allclose(target, online)
+
+    def test_the_target_is_frozen_between_syncs(self):
+        # Syncing every step would make the target move with the online net
+        # here, which is the whole difference between DQN and the divergent
+        # version of it.
+        first_target = self.trace[1][1]
+        for i in range(1, self.SYNC_AT[0]):
+            np.testing.assert_allclose(self.trace[i][1], first_target,
+                                       err_msg="target moved at step %d" % i)
+        # ... while the online net is moving the whole time.
+        self.assertFalse(np.allclose(self.trace[self.SYNC_AT[0] - 1][0],
+                                     self.trace[1][0]))
+
+    def test_a_sync_copies_the_online_weights_into_the_target(self):
+        for i in self.SYNC_AT:
+            online, target = self.trace[i]
+            np.testing.assert_allclose(target, online,
+                                       err_msg="no sync visible at step %d" % i)
+            # and it really is a change, not a target that was already equal
+            self.assertFalse(np.allclose(target, self.trace[i - 1][1]),
+                             "target did not move at step %d" % i)
+
+    def test_a_sync_never_overwrites_the_online_net(self):
+        # `online.copy_from(target)` -- the arguments the wrong way round --
+        # resets the online net to the target's stale weights at every sync.
+        # The call count is identical and every component test still passes,
+        # but learning is destroyed. Here the online net would snap back to
+        # its initial weights at each sync, so pin that it never does.
+        init = QNetwork(OBS_DIM, self.cfg.hidden, 2, seed=self.cfg.seed).w1
+        for i in self.SYNC_AT:
+            self.assertFalse(np.allclose(self.trace[i][0], init),
+                             "online net was reset to its init at step %d" % i)
+
+    def test_the_online_net_moves_monotonically_away_from_its_init(self):
+        # A second angle on the same corruption, independent of where the
+        # syncs fall: training must leave the returned net somewhere the
+        # initialisation is not.
+        init = QNetwork(OBS_DIM, self.cfg.hidden, 2, seed=self.cfg.seed).w1
+        self.assertFalse(np.allclose(self.policy.net.w1, init))
+        early = np.linalg.norm(self.trace[1][0] - init)
+        late = np.linalg.norm(self.trace[-1][0] - init)
+        self.assertGreater(late, early)
+
+    def test_the_returned_policy_holds_the_online_net_not_the_target(self):
+        # Returning DQNPolicy(target) would hand back a net that is up to
+        # target_sync gradient steps stale. Training ends on step 36, which is
+        # not a sync point, so the two nets are genuinely apart here.
+        self.assertFalse(np.allclose(self.policy.net.w1, self.trace[-1][1]))
+        # The returned net is one gradient step past the last online snapshot,
+        # so it must sit far closer to that than to the target.
+        to_online = np.linalg.norm(self.policy.net.w1 - self.trace[-1][0])
+        to_target = np.linalg.norm(self.policy.net.w1 - self.trace[-1][1])
+        self.assertLess(to_online, to_target)
 
 
 if __name__ == "__main__":
