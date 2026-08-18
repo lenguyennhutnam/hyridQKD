@@ -13,7 +13,8 @@ import unittest
 from dqn import DQNConfig, training_seed_range
 from evemarkov import EveParams
 from hybridenv import HybridEnv, HybridParams
-from policies import (AlwaysENT, AlwaysPM, GreedyThreshold, run_episode)
+from policies import (AlwaysENT, AlwaysPM, BufferAwareThreshold,
+                      GreedyThreshold, run_episode)
 
 # lam = 2.5 with B_max = 1e6. At the spec section 4 defaults AlwaysPM scores
 # eta = 1.0000 and every threshold ties, so a sweep returning its WORST point
@@ -115,6 +116,43 @@ class TestThresholdSweep(unittest.TestCase):
         with self.assertRaises(ValueError):
             sweep_threshold(nondegenerate_factory(horizon=60),
                             (0.02, 0.02), seeds=(1,))
+
+
+class TestTheGridReachesThePlateau(unittest.TestCase):
+    """A sweep whose argmax sits on its own edge has not been shown to contain
+    the optimum -- "best threshold" then only means "largest one tried"."""
+
+    def test_the_swept_optimum_is_not_the_largest_candidate(self):
+        # Kills a truncated THRESHOLDS, which is what this module shipped
+        # with: the grid stopped at 0.050 and reported it as the best greedy
+        # point, while every larger threshold never fires at all (the highest
+        # QBER PM can display under this Eve is E_PM(0.08) = 4.94%) and scores
+        # strictly higher by being exactly AlwaysPM.
+        from eval_hybrid import THRESHOLDS, sweep_threshold
+
+        best, table = sweep_threshold(nondegenerate_factory(horizon=200),
+                                      THRESHOLDS, seeds=(11, 12))
+        self.assertEqual(table[best], max(table.values()))
+        self.assertNotEqual(best, max(THRESHOLDS))
+
+    def test_the_top_of_the_grid_is_the_never_switch_plateau(self):
+        # The companion assertion: the argmax is interior because the grid
+        # reaches a region where switching has stopped, not because a tie
+        # happened to break leftwards. Pins the plateau by CONTENT -- the
+        # largest candidate must score exactly AlwaysPM.
+        from eval_hybrid import THRESHOLDS, sweep_threshold
+
+        seeds = (11, 12)
+        factory = nondegenerate_factory(horizon=200)
+        best, table = sweep_threshold(factory, THRESHOLDS, seeds=seeds)
+        env = factory(seeds[0])
+        always_pm = statistics.mean(
+            run_episode(env, AlwaysPM(), seed=s)["eta"] for s in seeds)
+        self.assertAlmostEqual(table[max(THRESHOLDS)], always_pm)
+        self.assertAlmostEqual(table[best], always_pm)
+        # ...and the grid still contains points that DO switch, so it has not
+        # degenerated into a sweep over four copies of AlwaysPM.
+        self.assertLess(min(table.values()), always_pm)
 
 
 class TestBufferAwareSweep(unittest.TestCase):
@@ -246,6 +284,44 @@ class TestCompare(unittest.TestCase):
         buffer_rows = [r for k, r in rows.items() if k.startswith("buffer-")]
         self.assertEqual(len(buffer_rows), 1)
         self.assertAlmostEqual(buffer_rows[0]["eta"], max(table.values()))
+
+    def test_the_buffer_aware_row_beats_a_coordinate_descent(self):
+        # Kills a compare() that searches "best greedy threshold, then best
+        # reserve at that threshold" instead of the full grid -- the mutant
+        # the previous review found alive, because compare() had its own copy
+        # of the search and the 2x2 fixture above happened to make the two
+        # answers agree.
+        #
+        # This fixture is chosen so they DISAGREE: the greedy sweep prefers
+        # 0.045 while the buffer-aware grid's optimum sits at 0.050, so a
+        # coordinate descent is locked out of the winning column.
+        from eval_hybrid import (compare, label_rows, sweep_buffer_aware,
+                                 sweep_threshold)
+
+        seeds = (21, 22)
+        thresholds, reserves = (0.045, 0.05), (0.1, 0.25)
+        factory = nondegenerate_factory(horizon=300)
+        best_th, _ = sweep_threshold(factory, thresholds, seeds=seeds)
+        best_pair, table = sweep_buffer_aware(factory, thresholds, reserves,
+                                              seeds=seeds)
+        coord = max((k for k in table if k[0] == best_th), key=table.get)
+        # The trap has to be real, or this test proves nothing: assert the
+        # coordinate descent is STRICTLY worse before demanding compare avoid
+        # it. If the fixture ever degenerates, this line fails loudly rather
+        # than letting the test pass vacuously.
+        self.assertNotEqual(coord, best_pair)
+        self.assertLess(table[coord], table[best_pair])
+
+        rows = label_rows(compare(seeds=seeds,
+                                  params=nondegenerate_params(horizon=300),
+                                  eve_params=EveParams(**MIXED_EVE),
+                                  dqn_config={}, thresholds=thresholds,
+                                  reserves=reserves))
+        buffer_rows = [r for k, r in rows.items() if k.startswith("buffer-")]
+        self.assertEqual(len(buffer_rows), 1)
+        self.assertEqual(buffer_rows[0]["policy"],
+                         BufferAwareThreshold(*best_pair).name)
+        self.assertAlmostEqual(buffer_rows[0]["eta"], table[best_pair])
 
     def test_two_dqn_configs_produce_two_distinct_rows(self):
         # DQNPolicy.name is a class constant; keying the table on it would

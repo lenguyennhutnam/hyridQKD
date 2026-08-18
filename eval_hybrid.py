@@ -23,11 +23,16 @@ written to be hard to flatter. Four properties carry that weight:
    constant and GreedyThreshold renders its threshold at three decimals, so
    two comparands really can collide on a label. `label_rows` raises instead.
 
-The default spec parameters are DEGENERATE -- AlwaysPM serves every message
-(eta = 1.0000) because B_max holds ~1200 slots of demand while the longest
-jamming episode is ~40 slots -- so `compare()` takes the HybridParams and
-EveParams to run at, and the CLI exposes the two knobs (--lam, --b-max) that
-remove the degeneracy.
+The default spec parameters are DEGENERATE -- AlwaysPM serves essentially
+every message (eta = 0.9957 over the eight evaluation seeds: exactly 1.0000
+on seven of them) because B_max holds ~1200 slots of demand and PM refills it
+between jamming episodes. It is NOT the length of a single episode that breaks
+this: HEAVY runs measured over those seeds average ~40 slots and reach 101-314,
+and the one seed that drops below 1.0 has the SHORTEST maximum run of the
+eight. It takes a dense enough cluster of them to outrun the buffer, which is
+rare at these transition probabilities. So `compare()` takes the HybridParams
+and EveParams to run at, and the CLI exposes the two knobs (--lam, --b-max)
+that remove the degeneracy.
 
 Spec: docs/superpowers/specs/2026-08-17-hybrid-policy-design.md
 """
@@ -46,11 +51,24 @@ __all__ = ["THRESHOLDS", "RESERVES", "EVAL_SEED_BASE", "evaluation_seeds",
            "assert_seeds_disjoint", "label_rows", "sweep_threshold",
            "sweep_buffer_aware", "compare", "format_rows", "main"]
 
-# Candidate switch points. PM's death QBER at the design channel sits near
-# 4.8% and ENT's near 11.6%, so the interesting range is the approach to PM's
-# death: switching after it is already too late, switching far before it
-# throws away PM's much higher rate.
-THRESHOLDS = (0.015, 0.02, 0.025, 0.03, 0.035, 0.04, 0.045, 0.05)
+# Candidate switch points, in measured QBER. At the configured operating point
+# (n_X = 1e5, 55 km) PM dies at QBER 3.3535% and ENT at 8.6194%
+# (channel.death_qber / death_qber_ent; spec section 4 quotes the same 3.35% /
+# 8.62%), so the interesting range is the approach to PM's death: switching
+# after it is already too late, switching far before it throws away PM's much
+# higher rate.
+#
+# The grid must also REACH PAST the point where switching stops, or its argmax
+# lands on its own edge and "best threshold" only means "largest tried". Under
+# the default Eve (f_max = 0.08) the highest QBER PM can display is
+# E_PM(0.08) = 4.94%, so a policy that starts on PM never fires above that and
+# is bit-for-bit AlwaysPM; the grid runs on to 0.08, past ENT's own ceiling
+# E_ENT(0.08) = 6.93%, so that plateau is a property of the jamming rather than
+# of the starting mode. The honest consequence is that the swept greedy
+# optimum COINCIDES with AlwaysPM -- see the report; it is the finding, not a
+# defect in the sweep.
+THRESHOLDS = (0.015, 0.02, 0.025, 0.03, 0.035, 0.04, 0.045, 0.05, 0.055,
+              0.06, 0.07, 0.08)
 # reserve = 0 makes BufferAwareThreshold exactly GreedyThreshold, so the grid
 # always contains the plain policy: the buffer-aware row can never score
 # below the greedy row because of the sweep.
@@ -130,6 +148,26 @@ def _envs_for(env_factory, seeds):
     return {s: env_factory(s) for s in seeds}
 
 
+def _resolve_envs(env_factory, envs, seeds):
+    """The envs a sweep runs on: built here, or handed in by a caller.
+
+    compare() already holds one env per seed and shares it across both sweeps
+    and every reported row. Letting a sweep rebuild them would pay the
+    channel.derive()/derive_ent() cost a second and third time -- and, worse,
+    would mean the sweep that picks the operating point and the row that
+    reports it ran on different objects. Exactly one of the two arguments
+    must be given, so neither can silently win over the other.
+    """
+    if (env_factory is None) == (envs is None):
+        raise ValueError("pass exactly one of env_factory= or envs=")
+    if envs is None:
+        return _envs_for(env_factory, seeds)
+    missing = [s for s in seeds if s not in envs]
+    if missing:
+        raise ValueError("no env supplied for seeds %s" % (missing,))
+    return envs
+
+
 def _score(envs, policy, seeds):
     """Run `policy` once per seed. The seed is ALWAYS explicit: run_episode
     with seed=None replays a single trajectory, which would collapse an
@@ -159,29 +197,34 @@ def _sweep(envs, seeds, candidates):
     return max(table, key=table.get), table
 
 
-def sweep_threshold(env_factory, thresholds=THRESHOLDS, seeds=(1, 2, 3)):
+def sweep_threshold(env_factory=None, thresholds=THRESHOLDS, seeds=(1, 2, 3),
+                    envs=None):
     """Return (best threshold, {threshold: mean eta}) for GreedyThreshold.
 
     `env_factory(seed) -> HybridEnv` is called once per seed; every threshold
-    is then scored on that same set of envs and seeds.
+    is then scored on that same set of envs and seeds. `envs={seed: env}` is
+    the alternative for a caller that already built them -- compare() uses it
+    so the study runs THIS function rather than a copy of it.
     """
     seeds = tuple(seeds)
-    envs = _envs_for(env_factory, seeds)
+    envs = _resolve_envs(env_factory, envs, seeds)
     return _sweep(envs, seeds,
                   _keyed((float(t), GreedyThreshold(t)) for t in thresholds))
 
 
-def sweep_buffer_aware(env_factory, thresholds=THRESHOLDS, reserves=RESERVES,
-                       seeds=(1, 2, 3)):
+def sweep_buffer_aware(env_factory=None, thresholds=THRESHOLDS,
+                       reserves=RESERVES, seeds=(1, 2, 3), envs=None):
     """Return (best (threshold, reserve), {pair: mean eta}).
 
     The FULL grid, not "best threshold from the greedy sweep, then best
     reserve": the greedy optimum need not be the first coordinate of the
     buffer-aware optimum, and a coordinate descent that misses it would hand
     the learned policy a weakened baseline to beat.
+
+    `envs` as in sweep_threshold.
     """
     seeds = tuple(seeds)
-    envs = _envs_for(env_factory, seeds)
+    envs = _resolve_envs(env_factory, envs, seeds)
     return _sweep(envs, seeds,
                   _keyed(((float(t), float(r)), BufferAwareThreshold(t, r))
                          for t in thresholds for r in reserves))
@@ -236,12 +279,14 @@ def compare(seeds, params=None, eve_params=None, dqn_config=None,
 
     envs = _envs_for(factory, seeds)
 
-    best_th, th_table = _sweep(
-        envs, seeds, _keyed((float(t), GreedyThreshold(t))
-                            for t in thresholds))
-    best_pair, ba_table = _sweep(
-        envs, seeds, _keyed(((float(t), float(r)), BufferAwareThreshold(t, r))
-                            for t in thresholds for r in reserves))
+    # The public sweeps, not private copies of them: a second implementation
+    # here is what would let the study run a cheaper search than the one the
+    # tests pin (a coordinate descent, say) with every test still green.
+    best_th, th_table = sweep_threshold(thresholds=thresholds, seeds=seeds,
+                                        envs=envs)
+    best_pair, ba_table = sweep_buffer_aware(thresholds=thresholds,
+                                             reserves=reserves, seeds=seeds,
+                                             envs=envs)
     if sweeps is not None:
         sweeps["threshold"] = th_table
         sweeps["buffer_aware"] = ba_table
@@ -265,9 +310,18 @@ def compare(seeds, params=None, eve_params=None, dqn_config=None,
 
 
 def format_rows(rows):
-    """The comparison table as text."""
+    """The comparison table as text.
+
+    "distilled" is GROSS distilled key, not delivered key: hybridenv counts a
+    finished block before KeyBuffer clamps the pool at B_max, so bits thrown
+    away by a full buffer are still in this column. Measured for AlwaysPM over
+    one 3600-slot episode: at the spec defaults 21.0% of the column never
+    reaches the buffer (4.988e7 distilled, 3.939e7 banked or spent), while at
+    --lam 2.5 --b-max 1e6 none of it is lost. Two parameter settings printing
+    the same figure therefore do NOT mean the same key economy.
+    """
     head = ("%-26s %8s %9s %9s %12s %9s %9s"
-            % ("policy", "eta", "switches", "expired", "secret bits",
+            % ("policy", "eta", "switches", "expired", "distilled",
                "ENT frac", "starved"))
     lines = [head, "-" * len(head)]
     for r in rows:
@@ -286,7 +340,8 @@ def main(argv=None):
                     help="DQN training episodes")
     ap.add_argument("--lam", type=float, default=None,
                     help="mean arrivals per slot; the spec default of 1.0 is "
-                         "degenerate (AlwaysPM scores eta = 1)")
+                         "degenerate (AlwaysPM scores eta = 0.9957, and "
+                         "exactly 1.0 on 7 of the 8 evaluation seeds)")
     ap.add_argument("--b-max", type=float, default=None,
                     help="key buffer capacity in bits, e.g. 1e6")
     ap.add_argument("--t0", type=int, default=None, help="deadline in slots")
