@@ -92,8 +92,11 @@ class BufferAwareThreshold(Policy):
     def effective_threshold(self, fullness):
         """The QBER at which this policy switches, given B_t / B_max.
 
-        Non-increasing in `fullness`, which is the entire claim of the
+        Non-DECREASING in `fullness`, which is the entire claim of the
         policy: a thinner buffer must never switch later than a fatter one.
+        (It rises from half the nominal threshold at an empty buffer to the
+        full threshold at `reserve`; reading it the other way round invites
+        exactly the wrong edit.)
         """
         if self.reserve <= 0.0 or fullness >= self.reserve:
             return self.threshold
