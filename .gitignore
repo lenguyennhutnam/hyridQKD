@@ -5,3 +5,4 @@ bin/
 build/
 *.csv
 panel_default.json
+figs/
