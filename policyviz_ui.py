@@ -178,6 +178,33 @@ class PolicyVizApp(tk.Tk):
         self.status.grid(row=row, column=0, columnspan=2, sticky="ew", pady=4)
         row += 1
 
+        # QBER PANEL VISIBILITY -- deliberately far from the "policies" group
+        # at the top of this column and under its own heading. That group
+        # picks which policies RUN; this one only picks which already-running
+        # policy's trace is drawn on panel 2. The two look alike (a stack of
+        # checkboxes with policy-shaped labels) and a reader who conflates
+        # them would think unticking one here drops a policy from the study.
+        ttk.Separator(left, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+        ttk.Label(left, text="QBER panel traces",
+                  font=("TkDefaultFont", 9, "bold")
+                  ).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        ttk.Label(left, text="(view only -- does not change which policies "
+                             "run, see \"policies\" above)",
+                  font=("TkDefaultFont", 7), foreground="#666666",
+                  wraplength=200, justify="left"
+                  ).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        # Populated by _rebuild_qber_checks, never here: at this point there
+        # is no session yet (_apply() runs after _build()), and the set of
+        # policies it will need checkboxes for is not known until then.
+        self.qber_check_frame = ttk.Frame(left)
+        self.qber_check_frame.grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        self.qber_checks = {}   # display name -> tk.BooleanVar
+
         self.board = tk.Text(left, height=12, width=52, font=("TkFixedFont", 8),
                              state="disabled", wrap="none")
         self.board.grid(row=row, column=0, columnspan=2, sticky="nsew")
@@ -343,6 +370,76 @@ class PolicyVizApp(tk.Tk):
         if name is None:
             return
         self.session.toggle_qber(name)
+        # The checkbox group is the OTHER control over this same bit of
+        # state (see the group's heading). Without this line a legend click
+        # would leave that policy's checkbox showing the visibility it had
+        # a moment ago -- ticked while the trace is actually hidden -- and
+        # the checkbox would be lying about what is on screen.
+        self._sync_qber_checks()
+        self._redraw(force=True)
+
+    def _rebuild_qber_checks(self):
+        """One checkbox per policy in the CURRENT session, keyed by its
+        display name -- the same string draw_panels labels its legend and
+        y-ticks with, and the same string `hidden_qber` stores.
+
+        Called every time a session is (re)built, i.e. on every Apply,
+        because the policy set can change: a policy just ticked off in the
+        "policies" group needs a new checkbox here, and one just ticked on
+        needs its checkbox to disappear. Rebuilding from scratch rather than
+        diffing the old group against the new is what guarantees a stale
+        checkbox for a dropped policy can never linger.
+
+        `hidden_qber` is the only source of truth for visibility -- this
+        method reads it once to seed each fresh BooleanVar and never keeps
+        a second copy that could drift out of agreement with it.
+        """
+        for child in self.qber_check_frame.winfo_children():
+            child.destroy()
+        self.qber_checks = {}
+        if self.session is None:
+            return
+        for run in self.session.runs:
+            name = run.display_name
+            var = tk.BooleanVar(value=self.session.qber_visible(name))
+            ttk.Checkbutton(
+                self.qber_check_frame, text=name, variable=var,
+                command=lambda n=name: self._on_qber_check(n)
+                ).pack(anchor="w")
+            self.qber_checks[name] = var
+
+    def _sync_qber_checks(self):
+        """Make every checkbox var agree with `hidden_qber`.
+
+        This is a ONE-WAY read: `hidden_qber` is never inferred from a
+        checkbox's value, only written to it. That is what keeps the legend
+        and the checkbox group from being two copies of the state that
+        happen to agree most of the time -- whichever control was used last,
+        this is the step that reconciles the other one.
+        """
+        if self.session is None:
+            return
+        for name, var in self.qber_checks.items():
+            var.set(self.session.qber_visible(name))
+
+    def _on_qber_check(self, name):
+        """A checkbox was clicked: flip the shared state and redraw.
+
+        This always TOGGLES `hidden_qber` rather than reading the
+        checkbox's own post-click value and writing that in. A Tk
+        Checkbutton flips its variable before invoking `command`, so the two
+        are equivalent when the checkbox and `hidden_qber` already agree --
+        but toggling is also exactly what `_on_pick` does, and having both
+        entry points agree on "flip the shared bit" rather than "impose
+        whatever this widget now shows" is what keeps them from disagreeing
+        about which one wins if they were ever out of step to begin with.
+        `_sync_qber_checks` right after is what actually reconciles the
+        widget with `hidden_qber`, not this method's belief about the click.
+        """
+        if self.session is None:
+            return
+        self.session.toggle_qber(name)
+        self._sync_qber_checks()
         self._redraw(force=True)
 
     def _build_session(self, config, dqn_policy):
@@ -364,10 +461,16 @@ class PolicyVizApp(tk.Tk):
                 dqn_episodes=config.dqn_episodes)
         except Exception as exc:
             self.session = None
+            self._rebuild_qber_checks()
             self._set_status("cannot build session: %s" % exc, "error")
             messagebox.showerror("policy visualiser", str(exc))
             return
         self.session.hidden_qber.update(carried)
+        # Rebuilt AFTER the carried toggles land in hidden_qber, and not
+        # before: a policy that survived Apply must show the visibility it
+        # already had, which _rebuild_qber_checks can only read correctly
+        # once hidden_qber reflects it.
+        self._rebuild_qber_checks()
         self._set_status("ready — seed %d, %d slots"
                          % (self.session.seed, config.horizon), "idle")
         self._redraw()

@@ -1342,5 +1342,211 @@ class TestTheWindowConstructsAndRenders(unittest.TestCase):
                          self.ui.STATUS_COLORS["error"])
 
 
+class TestTheQberVisibilityCheckboxGroup(unittest.TestCase):
+    """Checkboxes are a SECOND control over `hidden_qber`, alongside the
+    legend click tested above. Two controls over one piece of state is the
+    trap: if either one can change the state without the other finding out,
+    they desync and whichever widget is stale starts lying about what is on
+    screen. Every test below is written against one specific way that could
+    happen, mirroring TestHidingAQberTrace's own structure for the legend.
+    """
+
+    def setUp(self):
+        try:
+            import policyviz_ui
+        except Exception as exc:                  # pragma: no cover
+            self.skipTest("tkinter/matplotlib unavailable: %s" % exc)
+        self.ui = policyviz_ui
+        self.dialogs = []
+        self._real_messagebox = policyviz_ui.messagebox
+        policyviz_ui.messagebox = _RecordingMessagebox(self.dialogs)
+        try:
+            self.app = policyviz_ui.PolicyVizApp(small_config())
+        except Exception as exc:                  # pragma: no cover
+            policyviz_ui.messagebox = self._real_messagebox
+            self.skipTest("cannot create Tk window: %s" % exc)
+        self.app.withdraw()
+
+    def tearDown(self):
+        if getattr(self, "_real_messagebox", None) is not None:
+            self.ui.messagebox = self._real_messagebox
+        app = getattr(self, "app", None)
+        if app is not None:
+            app._running = False
+            app.update_idletasks()
+            app.destroy()
+
+    def _legend_entry(self, name):
+        legend = self.app.figure.axes[1].get_legend()
+        for text in legend.get_texts():
+            if text.get_text() == name:
+                return text
+        raise AssertionError("no legend entry for %r" % (name,))
+
+    def _trace(self, name):
+        for line in self.app.figure.axes[1].get_lines():
+            if line.get_label() == name:
+                return line
+        raise AssertionError("no QBER trace for %r" % (name,))
+
+    def _click(self, artist):
+        event = type("_Pick", (), {})()
+        event.name = "pick_event"
+        event.artist = artist
+        event.canvas = self.app.canvas
+        self.app.canvas.callbacks.process("pick_event", event)
+
+    def _qber_widget(self, name):
+        for child in self.app.qber_check_frame.winfo_children():
+            if isinstance(child, self.ui.ttk.Checkbutton) \
+                    and child.cget("text") == name:
+                return child
+        raise AssertionError("no QBER checkbox for %r" % (name,))
+
+    # -- the group matches the session -----------------------------------
+
+    def test_there_is_a_checkbox_for_every_policy_in_the_session(self):
+        self.assertEqual(set(self.app.qber_checks),
+                         {r.display_name for r in self.app.session.runs})
+
+    def test_the_death_thresholds_get_no_checkbox(self):
+        # Only session.runs feed the group; the two reference lines never
+        # appear as a policy name, so this also covers "the group has
+        # exactly as many entries as there are runs, no more".
+        self.assertEqual(len(self.app.qber_checks),
+                         len(self.app.session.runs))
+        self.assertFalse(any("dies" in name for name in self.app.qber_checks))
+
+    def test_checkboxes_start_checked_when_nothing_is_hidden(self):
+        for var in self.app.qber_checks.values():
+            self.assertTrue(var.get())
+
+    # -- unticking actually hides the trace -------------------------------
+
+    def test_unticking_a_checkbox_hides_its_trace(self):
+        name = self.app.session.runs[0].display_name
+        self.app._redraw(force=True)
+        self._qber_widget(name).invoke()
+        self.assertFalse(self.app.session.qber_visible(name))
+        self.assertFalse(self._trace(name).get_visible())
+
+    def test_unticking_leaves_a_different_policys_trace_alone(self):
+        name = self.app.session.runs[0].display_name
+        other = self.app.session.runs[1].display_name
+        self.app._redraw(force=True)
+        self._qber_widget(name).invoke()
+        self.assertTrue(self._trace(other).get_visible())
+
+    def test_ticking_it_back_on_restores_the_trace(self):
+        name = self.app.session.runs[0].display_name
+        widget = self._qber_widget(name)
+        widget.invoke()
+        widget.invoke()
+        self.assertTrue(self.app.session.qber_visible(name))
+        self.assertTrue(self._trace(name).get_visible())
+
+    def test_unticking_greys_out_the_legend_entry_too(self):
+        name = self.app.session.runs[0].display_name
+        self._qber_widget(name).invoke()
+        text = self._legend_entry(name)
+        self.assertEqual(text.get_color(), policyviz.HIDDEN_LEGEND_COLOR)
+
+    # -- both directions of the sync ---------------------------------------
+
+    def test_clicking_a_legend_entry_updates_the_matching_checkbox(self):
+        # THE desync this whole feature exists to prevent: a legend click
+        # must not leave the checkbox showing the old visibility.
+        name = self.app.session.runs[0].display_name
+        self._click(self._legend_entry(name))
+        self.assertFalse(self.app.session.qber_visible(name))
+        self.assertFalse(self.app.qber_checks[name].get(),
+                         "checkbox still says visible after a legend click "
+                         "hid the trace -- the two controls have desynced")
+
+    def test_clicking_a_legend_entry_twice_leaves_the_checkbox_checked(self):
+        name = self.app.session.runs[0].display_name
+        entry = self._legend_entry(name)
+        self._click(entry)
+        self._click(self._legend_entry(name))
+        self.assertTrue(self.app.session.qber_visible(name))
+        self.assertTrue(self.app.qber_checks[name].get())
+
+    def test_unticking_a_checkbox_leaves_the_legend_entry_in_step(self):
+        # The reverse direction: a checkbox click updates the legend's own
+        # greyed-out state via the ordinary redraw, so a stale legend cannot
+        # show a trace as visible while the checkbox says otherwise.
+        name = self.app.session.runs[0].display_name
+        self._qber_widget(name).invoke()
+        self.assertFalse(self._trace(name).get_visible())
+        self.assertFalse(self.app.qber_checks[name].get())
+
+    # -- the group is rebuilt on Apply, not left stale ---------------------
+
+    def test_apply_adds_a_checkbox_for_a_newly_selected_policy(self):
+        self.assertNotIn("buffer-aware-0.045-0.25", self.app.qber_checks)
+        self.app.checks["buffer-aware"].set(True)
+        self.app._apply()
+        self.assertEqual(self.dialogs, [])
+        self.assertIn("buffer-aware-0.045-0.25", self.app.qber_checks)
+
+    def test_apply_drops_the_checkbox_for_a_deselected_policy(self):
+        self.assertIn("always-ent", self.app.qber_checks)
+        self.app.checks["always-ent"].set(False)
+        self.app._apply()
+        self.assertEqual(self.dialogs, [])
+        self.assertNotIn("always-ent", self.app.qber_checks)
+
+    def test_apply_keeps_the_visibility_a_surviving_policy_had(self):
+        self._qber_widget("always-pm").invoke()
+        self.app.entries["lam"].set("2.0")
+        self.app._apply()
+        self.assertEqual(self.dialogs, [])
+        self.assertIn("always-pm", self.app.qber_checks)
+        self.assertFalse(self.app.qber_checks["always-pm"].get())
+        self.assertFalse(self.app.session.qber_visible("always-pm"))
+
+    def test_apply_does_not_resurrect_a_hidden_trace_as_a_stray_checkbox(self):
+        # A toggle for a policy no longer selected is carried in hidden_qber
+        # (see _build_session), but it must not grow a checkbox: there is no
+        # run to draw a trace for it, and a checkbox with nothing behind it
+        # would be a control that does nothing when clicked.
+        self._qber_widget("always-ent").invoke()
+        self.app.checks["always-ent"].set(False)
+        self.app._apply()
+        self.assertEqual(self.dialogs, [])
+        self.assertNotIn("always-ent", self.app.qber_checks)
+
+    # -- unticking touches ONLY the QBER panel ------------------------------
+
+    def test_unticking_a_checkbox_leaves_the_mode_lanes_alone(self):
+        name = self.app.session.runs[0].display_name
+        self._qber_widget(name).invoke()
+        labels = [t.get_text() for t in self.app.figure.axes[0]
+                  .get_yticklabels()]
+        self.assertEqual(labels,
+                         [r.display_name for r in self.app.session.runs])
+
+    def test_unticking_a_checkbox_leaves_the_buffer_panel_alone(self):
+        name = self.app.session.runs[0].display_name
+        before = len(self.app.figure.axes[2].get_lines())
+        self._qber_widget(name).invoke()
+        after = len(self.app.figure.axes[2].get_lines())
+        self.assertEqual(before, after)
+
+    def test_unticking_a_checkbox_leaves_the_eta_panel_alone(self):
+        name = self.app.session.runs[0].display_name
+        before = len(self.app.figure.axes[3].get_lines())
+        self._qber_widget(name).invoke()
+        after = len(self.app.figure.axes[3].get_lines())
+        self.assertEqual(before, after)
+
+    def test_unticking_a_checkbox_leaves_the_scoreboard_alone(self):
+        name = self.app.session.runs[0].display_name
+        self._qber_widget(name).invoke()
+        board_text = self.app.board.get("1.0", "end")
+        self.assertIn(name, board_text)
+
+
+
 if __name__ == "__main__":
     unittest.main()
