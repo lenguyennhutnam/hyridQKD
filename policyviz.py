@@ -561,12 +561,16 @@ def draw_panels(fig, session, title=None):
     ax_mode.set_ylim(-0.6, len(runs) - 0.4)
     plots.style_axis(ax_mode, title="mode per policy  (light blue = PM, "
                                     "light green = ENT)")
-    # A bound's lane must not read as a schedule anyone could run.
+    # A bound's lane must not read as a schedule anyone could run. The tag
+    # goes at the LEFT edge: pinned to the right it sits exactly where the
+    # last slot is drawn and reads as a terminus -- a real reader took it to
+    # mean the run had stopped there, when the episode had simply reached
+    # its horizon.
     for i, run in enumerate(runs):
         if run.is_bound:
-            ax_mode.annotate("bound", (0.995, i), xycoords=("axes fraction",
+            ax_mode.annotate("bound", (0.005, i), xycoords=("axes fraction",
                                                             "data"),
-                             ha="right", va="center", fontsize=6,
+                             ha="left", va="center", fontsize=6,
                              color=plots.RED, style="italic")
 
     # --- panel 2: observed QBER, against both death thresholds -----------
