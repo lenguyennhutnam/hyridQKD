@@ -682,6 +682,343 @@ class TestTheFigure(unittest.TestCase):
         self.assertEqual(len(fig.axes), 4)
 
 
+
+class TestHidingAQberTrace(unittest.TestCase):
+    """Panel 2's legend is a CONTROL, not a caption.
+
+    With five or six tracks on, the step traces sit on top of one another --
+    always-ent, greedy and oracle spend most of the episode in the same mode
+    and therefore draw the same line -- and the panel reads as one solid
+    block of colour. The reader has to be able to switch tracks off.
+
+    That control has four ways to be quietly broken, and there is a test
+    below for each: the state can be kept on an artist that the next frame
+    throws away; the toggle can leak out of panel 2 and erase a policy the
+    reader must still be able to see is running; the legend can go on
+    claiming a trace is on; and the axis can rescale under the curves that
+    are left, which is the comparison the reader was trying to make.
+    """
+
+    def setUp(self):
+        self.session = VizSession(small_config())
+        self.session.step(SLOTS)
+        self.fig = Figure(figsize=(9, 8))
+        FigureCanvasAgg(self.fig)
+        # The track with the highest QBER, so the axis test below has real
+        # headroom to lose if hidden traces stopped counting.
+        self.name = max(self.session.runs,
+                        key=lambda r: max(r.qber)).display_name
+        self.other = [r.display_name for r in self.session.runs
+                      if r.display_name != self.name][0]
+
+    def _draw(self):
+        draw_panels(self.fig, self.session)
+        self.fig.canvas.draw()          # a real render, not just a build
+        return self.fig
+
+    def _traces(self):
+        """{policy name: Line2D} for panel 2's traces; thresholds excluded."""
+        names = {r.display_name for r in self.session.runs}
+        return {ln.get_label(): ln for ln in self.fig.axes[1].get_lines()
+                if ln.get_label() in names}
+
+    def _entry(self, name):
+        """(handle, text) of `name`'s legend entry."""
+        legend = self.fig.axes[1].get_legend()
+        for handle, text in zip(legend.get_lines(), legend.get_texts()):
+            if text.get_text() == name:
+                return handle, text
+        raise AssertionError("no legend entry for %r" % (name,))
+
+    # -- the toggle actually hides something ---------------------------
+
+    def test_a_trace_is_drawn_when_it_is_not_hidden(self):
+        # The control for every "it is hidden" assertion below: without this
+        # they would all pass on a panel that drew nothing at all.
+        self._draw()
+        self.assertTrue(self._traces()[self.name].get_visible())
+
+    def test_hiding_a_policy_takes_its_trace_off_the_qber_panel(self):
+        self.session.hidden_qber.add(self.name)
+        self._draw()
+        self.assertFalse(self._traces()[self.name].get_visible(),
+                         "%s is hidden but its QBER trace is still drawn"
+                         % (self.name,))
+
+    def test_hiding_one_policy_leaves_the_others_drawn(self):
+        self.session.hidden_qber.add(self.name)
+        self._draw()
+        self.assertTrue(self._traces()[self.other].get_visible())
+
+    def test_toggling_twice_brings_the_trace_back(self):
+        self.session.toggle_qber(self.name)
+        self.session.toggle_qber(self.name)
+        self._draw()
+        self.assertTrue(self._traces()[self.name].get_visible())
+
+    def test_toggle_reports_the_visibility_it_leaves_behind(self):
+        self.assertFalse(self.session.toggle_qber(self.name))
+        self.assertFalse(self.session.qber_visible(self.name))
+        self.assertTrue(self.session.toggle_qber(self.name))
+        self.assertTrue(self.session.qber_visible(self.name))
+
+    # -- the state cannot live on the artist ---------------------------
+
+    def test_the_hidden_state_survives_the_next_draw(self):
+        # THE one that matters. The window redraws on a timer, and
+        # draw_panels clears the figure and builds new lines every time, so a
+        # visibility flag left on a Line2D would be gone within a fraction of
+        # a second and the user's click would silently undo itself while the
+        # episode ran.
+        self._draw()
+        self.session.toggle_qber(self.name)
+        self._draw()
+        self._draw()
+        self.assertFalse(self._traces()[self.name].get_visible(),
+                         "the toggle did not survive a redraw: visibility "
+                         "is being kept on the artist, not in the session")
+
+    def test_the_line_really_is_a_new_object_on_the_second_draw(self):
+        # Without this, the test above could pass on an implementation that
+        # reuses one Line2D and keeps the flag on it -- which would then
+        # break the moment draw_panels was called on a fresh figure.
+        self._draw()
+        first = self._traces()[self.name]
+        self._draw()
+        self.assertIsNot(self._traces()[self.name], first)
+
+    def test_the_state_is_not_read_back_off_the_figure(self):
+        # A fresh figure, never drawn to, must render the same hiding.
+        self.session.toggle_qber(self.name)
+        self._draw()
+        other = Figure(figsize=(9, 8))
+        FigureCanvasAgg(other)
+        draw_panels(other, self.session)
+        drawn = {ln.get_label(): ln for ln in other.axes[1].get_lines()}
+        self.assertFalse(drawn[self.name].get_visible())
+
+    def test_reset_keeps_the_toggles(self):
+        # Reset rewinds the EPISODE. Which traces the reader switched off is
+        # not part of the trajectory.
+        self.session.toggle_qber(self.name)
+        self.session.reset()
+        self.assertFalse(self.session.qber_visible(self.name))
+
+    # -- it must not leak out of panel 2 -------------------------------
+
+    def test_hiding_a_trace_leaves_the_mode_lanes_alone(self):
+        # A reader who could hide a policy from the QBER panel and thereby
+        # lose its lane would conclude it was never selected.
+        self.session.hidden_qber.add(self.name)
+        self._draw()
+        labels = [t.get_text() for t in self.fig.axes[0].get_yticklabels()]
+        self.assertEqual(labels,
+                         [r.display_name for r in self.session.runs])
+
+    def test_hiding_a_trace_leaves_the_mode_bands_drawn(self):
+        self.session.hidden_qber.add(self.name)
+        self._draw()
+        hidden_lane = [i for i, r in enumerate(self.session.runs)
+                       if r.display_name == self.name][0]
+        drawn = list(self.fig.axes[0].collections)
+        self.assertTrue(drawn)
+        # The hidden policy's lane still carries its bands.
+        lows = set()
+        for coll in drawn:
+            for path in coll.get_paths():
+                lows.add(round(path.get_extents().y0, 2))
+        self.assertIn(round(hidden_lane - 0.38, 2), lows)
+
+    def test_hiding_a_trace_leaves_the_buffer_panel_alone(self):
+        self.session.hidden_qber.add(self.name)
+        self._draw()
+        drawn = [ln for ln in self.fig.axes[2].get_lines()
+                 if ln.get_visible()]
+        self.assertEqual(len(drawn), len(self.session.runs))
+
+    def test_hiding_a_trace_leaves_the_eta_panel_alone(self):
+        self.session.hidden_qber.add(self.name)
+        self._draw()
+        drawn = [ln for ln in self.fig.axes[3].get_lines()
+                 if ln.get_visible()]
+        self.assertEqual(len(drawn), len(self.session.runs))
+
+    def test_hiding_a_trace_leaves_the_scoreboard_alone(self):
+        self.session.hidden_qber.add(self.name)
+        self._draw()
+        board = format_scoreboard(self.session)
+        for run in self.session.runs:
+            self.assertIn(run.display_name, board)
+
+    # -- the legend has to show its own state --------------------------
+
+    def test_a_hidden_policy_keeps_its_legend_entry(self):
+        # It is the only way back. An entry that vanished with its trace
+        # would make the hiding irreversible.
+        self.session.hidden_qber.add(self.name)
+        self._draw()
+        texts = [t.get_text()
+                 for t in self.fig.axes[1].get_legend().get_texts()]
+        self.assertIn(self.name, texts)
+
+    def test_a_hidden_legend_entry_is_greyed_out(self):
+        self.session.hidden_qber.add(self.name)
+        self._draw()
+        handle, text = self._entry(self.name)
+        self.assertEqual(text.get_color(), policyviz.HIDDEN_LEGEND_COLOR)
+        self.assertEqual(handle.get_color(), policyviz.HIDDEN_LEGEND_COLOR)
+        # Alpha as well as colour: the seventh track is drawn in plots.GREY
+        # to begin with, so colour alone could not distinguish it.
+        self.assertIsNotNone(text.get_alpha())
+        self.assertLess(text.get_alpha(), 1.0)
+        self.assertLess(handle.get_alpha(), 1.0)
+
+    def test_a_visible_legend_entry_is_not_greyed_out(self):
+        self.session.hidden_qber.add(self.name)
+        self._draw()
+        handle, text = self._entry(self.other)
+        self.assertNotEqual(text.get_color(), policyviz.HIDDEN_LEGEND_COLOR)
+        self.assertIn(text.get_alpha(), (None, 1.0))
+        self.assertIn(handle.get_alpha(), (None, 1.0))
+
+    def test_the_greying_is_undone_when_the_trace_comes_back(self):
+        self.session.toggle_qber(self.name)
+        self._draw()
+        self.session.toggle_qber(self.name)
+        self._draw()
+        handle, text = self._entry(self.name)
+        self.assertNotEqual(text.get_color(), policyviz.HIDDEN_LEGEND_COLOR)
+        self.assertIn(text.get_alpha(), (None, 1.0))
+
+    # -- the axis must not move under the remaining curves -------------
+
+    def _session_with_one_tall_trace(self):
+        """A session in which exactly one trace holds the y-axis up.
+
+        Nothing reachable does that on its own, which is worth knowing: in a
+        300-slot episode the tallest QBER any policy reaches (8.45 %) is
+        still BELOW the ENT death threshold (8.62 %), and the three ENT-mode
+        tracks peak at the identical value because they see the identical
+        jamming. So on real data the limit is set by a threshold line and
+        hiding a trace could not move it whatever the rule was -- a test
+        written on the default session would pass on both rules and prove
+        nothing. One trace is therefore lifted explicitly, to build the
+        condition the rule actually governs.
+        """
+        session = VizSession(small_config(specs=("always-pm", "always-ent")))
+        session.step(SLOTS)
+        tall = session.runs[-1]
+        tall.qber = [q + 0.20 for q in tall.qber]
+        others = max([q for r in session.runs[:-1] for q in r.qber]
+                     + [session.death_pm, session.death_ent])
+        # The two rules genuinely disagree here, so the assertion below is
+        # about the rule and not about a coincidence.
+        self.assertGreater(max(tall.qber), 1.5 * others)
+        return session, tall.display_name
+
+    def test_hiding_the_tallest_trace_does_not_move_the_axis(self):
+        # Rescaling to what is left would change the shape and apparent
+        # slope of every remaining curve on each click, and the reader hid a
+        # trace precisely in order to compare the rest.
+        session, tall = self._session_with_one_tall_trace()
+        fig = Figure(figsize=(9, 8))
+        FigureCanvasAgg(fig)
+        draw_panels(fig, session)
+        before = fig.axes[1].get_ylim()
+        session.hidden_qber.add(tall)
+        draw_panels(fig, session)
+        self.assertEqual(fig.axes[1].get_ylim(), before)
+
+    def test_the_limit_is_the_one_the_hidden_trace_asks_for(self):
+        # Pins the value, not just its stability: an axis frozen at some
+        # other number would also "not move".
+        session, tall = self._session_with_one_tall_trace()
+        session.hidden_qber.add(tall)
+        fig = Figure(figsize=(9, 8))
+        FigureCanvasAgg(fig)
+        draw_panels(fig, session)
+        peak = max([100.0 * q for r in session.runs for q in r.qber]
+                   + [100.0 * session.death_pm, 100.0 * session.death_ent])
+        self.assertAlmostEqual(fig.axes[1].get_ylim()[1], peak * 1.45,
+                               places=6)
+
+    def test_hiding_every_trace_still_renders(self):
+        for run in self.session.runs:
+            self.session.hidden_qber.add(run.display_name)
+        self._draw()
+        self.assertEqual(len(self.fig.axes), 4)
+        self.assertTrue(all(not ln.get_visible()
+                            for ln in self._traces().values()))
+
+    # -- the reference lines are not controls --------------------------
+
+    def test_the_death_thresholds_are_not_clickable(self):
+        # They are what the traces are read AGAINST: a panel that let you
+        # hide the line a curve is dying above invites exactly the
+        # misreading it exists to prevent.
+        self._draw()
+        captions = [t for t in self.fig.axes[1].get_legend().get_texts()
+                    if "dies" in t.get_text()]
+        self.assertEqual(len(captions), 2)
+        for text in captions:
+            self.assertNotIn(text, self.session.legend_picks)
+
+    def test_the_death_thresholds_survive_every_policy_being_hidden(self):
+        for run in self.session.runs:
+            self.session.hidden_qber.add(run.display_name)
+        self._draw()
+        levels = {round(ln.get_ydata()[0], 4)
+                  for ln in self.fig.axes[1].get_lines()
+                  if ln.get_visible() and len(set(ln.get_ydata())) == 1}
+        self.assertIn(round(100.0 * self.session.death_pm, 4), levels)
+        self.assertIn(round(100.0 * self.session.death_ent, 4), levels)
+
+    # -- the pick map --------------------------------------------------
+
+    def test_every_policy_entry_is_a_pick_target(self):
+        self._draw()
+        self.assertEqual(set(self.session.legend_picks.values()),
+                         {r.display_name for r in self.session.runs})
+
+    def test_both_halves_of_an_entry_answer_to_a_click(self):
+        # Aiming at a 6 pt line sample is fiddly; a reader who clicks the
+        # words and gets nothing concludes the control is broken.
+        self._draw()
+        handle, text = self._entry(self.name)
+        self.assertEqual(self.session.legend_picks.get(handle), self.name)
+        self.assertEqual(self.session.legend_picks.get(text), self.name)
+
+    def test_the_pick_map_is_rebuilt_with_the_legend(self):
+        # It maps ARTISTS, and every artist is replaced on each draw. A map
+        # left over from the previous frame would resolve nothing and the
+        # legend would stop responding after the first redraw.
+        self._draw()
+        stale = dict(self.session.legend_picks)
+        self._draw()
+        legend = self.fig.axes[1].get_legend()
+        current = set(legend.get_lines()) | set(legend.get_texts())
+        self.assertTrue(set(self.session.legend_picks) <= current)
+        self.assertFalse(set(stale) & set(self.session.legend_picks))
+
+    def test_the_entries_are_pickable_at_all(self):
+        self._draw()
+        handle, text = self._entry(self.name)
+        self.assertIsNotNone(handle.get_picker())
+        self.assertIsNotNone(text.get_picker())
+
+    # -- stale names ---------------------------------------------------
+
+    def test_a_name_no_longer_selected_does_not_break_the_draw(self):
+        # Apply carries the hidden set across a change of policy selection,
+        # so names for policies that are gone are normal, not exceptional.
+        self.session.hidden_qber.add("a policy that is not selected")
+        self._draw()
+        self.assertEqual(len(self.fig.axes), 4)
+        self.assertTrue(all(ln.get_visible()
+                            for ln in self._traces().values()))
+
+
+
 class TestModeSpans(unittest.TestCase):
     """Panel 1's bands. An off-by-one here silently mis-times every switch."""
 
@@ -855,6 +1192,144 @@ class TestTheWindowConstructsAndRenders(unittest.TestCase):
         finally:
             policyviz.draw_panels = real
         self.assertEqual(len(calls), 2)
+
+
+    # ------------------------------------------------------------------
+    # clicking a legend entry
+    # ------------------------------------------------------------------
+
+    def _click(self, artist):
+        """Dispatch a pick on `artist` the way the canvas would.
+
+        Deliberately routed through the canvas's callback registry rather
+        than by calling _on_pick directly: how MANY handlers are registered
+        is the thing being tested, and a direct call would see exactly one
+        however many were connected.
+        """
+        event = type("_Pick", (), {})()
+        event.name = "pick_event"
+        event.artist = artist
+        event.canvas = self.app.canvas
+        self.app.canvas.callbacks.process("pick_event", event)
+
+    def _legend_entry(self, name):
+        legend = self.app.figure.axes[1].get_legend()
+        for text in legend.get_texts():
+            if text.get_text() == name:
+                return text
+        raise AssertionError("no legend entry for %r" % (name,))
+
+    def _trace(self, name):
+        for line in self.app.figure.axes[1].get_lines():
+            if line.get_label() == name:
+                return line
+        raise AssertionError("no QBER trace for %r" % (name,))
+
+    def test_the_pick_handler_is_connected_exactly_once(self):
+        # draw_panels rebuilds the legend on every frame. Connecting there
+        # would leave one handler per frame, and after a minute of running a
+        # single click would toggle a trace hundreds of times.
+        for _ in range(4):
+            self.app._redraw(force=True)
+        registry = self.app.canvas.callbacks.callbacks.get("pick_event", {})
+        self.assertEqual(len(registry), 1,
+                         "%d pick handlers connected, expected 1"
+                         % len(registry))
+
+    def test_a_click_hides_the_trace_it_was_aimed_at(self):
+        name = self.app.session.runs[0].display_name
+        self.app._redraw(force=True)
+        self._click(self._legend_entry(name))
+        self.assertFalse(self.app.session.qber_visible(name))
+        self.assertFalse(self._trace(name).get_visible())
+
+    def test_one_click_after_several_redraws_makes_exactly_one_toggle(self):
+        # The behavioural half of the test above.
+        #
+        # _redraw is frozen for the duration of the click ON PURPOSE. The
+        # handler forces a redraw, which rebuilds the legend and with it
+        # session.legend_picks, so a SECOND handler holding the same event
+        # would find its artist gone from the map and quietly do nothing --
+        # duplicate connections would be masked by the very redraw that
+        # makes them wrong, and the count assertion above would be the only
+        # thing left standing. Freezing the map is what lets a duplicated
+        # handler show itself as the duplicated TOGGLE it is.
+        name = self.app.session.runs[0].display_name
+        for _ in range(3):
+            self.app._redraw(force=True)
+        entry = self._legend_entry(name)
+        toggles = []
+        real = self.app.session.toggle_qber
+        self.app.session.toggle_qber = lambda n: toggles.append(n)
+        self.app._redraw = lambda *a, **k: None
+        try:
+            self._click(entry)
+        finally:
+            self.app.session.toggle_qber = real
+            del self.app._redraw
+        self.assertEqual(toggles, [name])
+
+    def test_clicking_the_entry_again_brings_the_trace_back(self):
+        name = self.app.session.runs[0].display_name
+        self._click(self._legend_entry(name))
+        self._click(self._legend_entry(name))
+        self.assertTrue(self.app.session.qber_visible(name))
+        self.assertTrue(self._trace(name).get_visible())
+
+    def test_clicking_a_death_threshold_caption_changes_nothing(self):
+        before = set(self.app.session.hidden_qber)
+        caption = [t for t in self.app.figure.axes[1].get_legend().get_texts()
+                   if "dies" in t.get_text()][0]
+        self._click(caption)
+        self.assertEqual(self.app.session.hidden_qber, before)
+
+    def test_a_click_on_something_else_entirely_is_ignored(self):
+        # pick_event fires for any pickable artist on the canvas.
+        self._click(self.app.figure.axes[0])
+        self.assertEqual(self.app.session.hidden_qber, set())
+
+    def test_a_hidden_trace_stays_hidden_across_step(self):
+        name = self.app.session.runs[0].display_name
+        self._click(self._legend_entry(name))
+        self.app._step_once()
+        self.assertFalse(self.app.session.qber_visible(name))
+        self.assertFalse(self._trace(name).get_visible())
+
+    def test_a_hidden_trace_stays_hidden_across_start_pause_and_a_tick(self):
+        name = self.app.session.runs[0].display_name
+        self._click(self._legend_entry(name))
+        self.app._toggle_run()
+        self.app.session.step(5)
+        self.app._redraw(force=True)
+        self.app._toggle_run()
+        self.assertFalse(self.app.session.qber_visible(name))
+        self.assertFalse(self._trace(name).get_visible())
+
+    def test_a_hidden_trace_stays_hidden_across_reset(self):
+        name = self.app.session.runs[0].display_name
+        self._click(self._legend_entry(name))
+        self.app._reset()
+        self.assertFalse(self.app.session.qber_visible(name))
+
+    def test_apply_carries_the_toggles_over(self):
+        # Apply rebuilds the session, but which traces are switched off is a
+        # view choice, not part of the episode: nudging lambda must not
+        # un-hide everything the reader had just cleared away.
+        name = self.app.session.runs[0].display_name
+        self._click(self._legend_entry(name))
+        self.app.entries["lam"].set("2.0")
+        self.app._apply()
+        self.assertEqual(self.dialogs, [])
+        self.assertFalse(self.app.session.qber_visible(name))
+
+    def test_a_toggle_for_a_policy_that_is_dropped_does_not_break_apply(self):
+        # A stale name in the carried set is normal, not exceptional.
+        self._click(self._legend_entry("always-ent"))
+        self.app.checks["always-ent"].set(False)
+        self.app._apply()
+        self.assertEqual(self.dialogs, [])
+        self.assertIn("always-ent", self.app.session.hidden_qber)
+        self.assertEqual(len(self.app.figure.axes), 4)
 
     def test_apply_reports_a_bad_form_instead_of_crashing(self):
         # Apply is a button callback: an exception there vanishes into Tk's

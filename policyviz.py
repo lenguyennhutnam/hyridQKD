@@ -77,9 +77,11 @@ from policies import (AlwaysENT, AlwaysPM, BufferAwareThreshold,
                       RelaxedAlwaysPM)
 
 __all__ = ["BANNER", "SPEC_CHOICES", "TRACK_COLORS",
-           "REFERENCE_LINE_SHOW_FRAC", "VizConfig", "PolicyRun",
-           "VizSession", "parse_spec", "death_thresholds", "train_dqn",
-           "dqn_label", "draw_panels", "format_scoreboard", "main"]
+           "REFERENCE_LINE_SHOW_FRAC", "HIDDEN_LEGEND_COLOR",
+           "HIDDEN_LEGEND_ALPHA", "LEGEND_PICK_RADIUS", "VizConfig",
+           "PolicyRun", "VizSession", "parse_spec", "death_thresholds",
+           "train_dqn", "dqn_label", "draw_panels", "format_scoreboard",
+           "main"]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DQN_CACHE_DIR = os.path.join(HERE, "logs", "dqn_cache")
@@ -106,6 +108,16 @@ TRACK_COLORS = (plots.NAVY, plots.GREEN, plots.AMBER, plots.TEAL, plots.RED,
 # for the death-QBER line: a reference far above the trace forces the axis and
 # flattens the trace to a straight line at zero.
 REFERENCE_LINE_SHOW_FRAC = 0.25
+
+# How a switched-off QBER trace shows in the legend. A toggle whose only
+# effect is somewhere else on the figure is a trap: the reader sees a legend
+# entry, looks for its curve, and concludes the policy produced no data. The
+# entry therefore goes grey AND translucent -- grey alone would be ambiguous
+# for the seventh track, which is drawn in plots.GREY to begin with.
+HIDDEN_LEGEND_COLOR = plots.GREY
+HIDDEN_LEGEND_ALPHA = 0.35
+# Pixels of slack around a legend line for a click to count as hitting it.
+LEGEND_PICK_RADIUS = 5
 
 
 # --------------------------------------------------------------------------
@@ -381,6 +393,25 @@ class VizSession:
                 label=label, color=TRACK_COLORS[i % len(TRACK_COLORS)]))
         self._assert_shared_weather()
         self.death_pm, self.death_ent = death_thresholds(self.config)
+        # WHICH QBER TRACES ARE SWITCHED OFF, by display name.
+        #
+        # It lives here and not on the Line2D objects because the window
+        # redraws the whole figure several times a second: `draw_panels`
+        # calls `fig.clear()` and builds brand-new lines and a brand-new
+        # legend every frame, so a visibility flag set on an artist would be
+        # thrown away on the next tick and the user's click would silently
+        # undo itself mid-episode. `draw_panels` READS this set on every draw
+        # instead.
+        #
+        # It lives on the session and not on `VizConfig` because VizConfig is
+        # a value object describing the EPISODE: it is compared, replaced and
+        # hashed into the DQN cache key, and two configurations that differ
+        # only in which curve is on screen are not two different experiments.
+        # The session is also the only object `draw_panels` is handed.
+        self.hidden_qber = set()
+        # {artist: policy name} for this frame's clickable legend entries.
+        # Refreshed by every `draw_panels`; it is a lookup table, not state.
+        self.legend_picks = {}
 
     def _assert_shared_weather(self):
         """Refuse a session whose runs would face different jamming.
@@ -421,7 +452,29 @@ class VizSession:
     def slot(self):
         return max((r.slot for r in self.runs), default=0)
 
+    def qber_visible(self, name):
+        """Is this policy's QBER trace switched on?"""
+        return name not in self.hidden_qber
+
+    def toggle_qber(self, name):
+        """Flip one policy's QBER trace. Returns its new visibility.
+
+        Only panel 2 consults this. The mode lanes, the buffer panel, the
+        cumulative-eta panel and the scoreboard all ignore it, deliberately:
+        a policy the reader has cleared off the QBER panel is still running,
+        and a figure that let a click erase it everywhere would let someone
+        conclude a policy was never selected.
+        """
+        if name in self.hidden_qber:
+            self.hidden_qber.discard(name)
+            return True
+        self.hidden_qber.add(name)
+        return False
+
     def reset(self):
+        # Rewinding the EPISODE, not the view: which traces the reader has
+        # switched off is not part of the trajectory and survives a Reset,
+        # exactly as it survives Start, Pause and Step.
         for run in self.runs:
             run.reset()
 
@@ -531,12 +584,57 @@ def _mode_spans(run):
     return spans
 
 
+def _wire_qber_legend(legend, session, names):
+    """Make panel 2's policy entries clickable, and show which are off.
+
+    `names` runs parallel to the legend's entries, carrying None where an
+    entry is a reference line rather than a policy.
+
+    THE DEATH THRESHOLDS ARE DELIBERATELY NOT TOGGLEABLE. They are what the
+    traces are read AGAINST -- the whole question the panel answers is
+    "which policy is above the line" -- so a control that could take the line
+    away would let a reader look at a dead trace and see nothing wrong. They
+    are also two thin dotted lines, not the six overlapping step traces the
+    toggle exists to thin out. Their entries keep full colour, so it is
+    visible that they are captions and not controls.
+
+    Returns {artist: policy name} for the window's pick handler. The map is
+    rebuilt here on every draw because the legend itself is; the window
+    connects its handler ONCE, at construction, and looks names up through
+    this map rather than through the artists it happens to be holding.
+    """
+    picks = {}
+    for handle, text, name in zip(legend.get_lines(), legend.get_texts(),
+                                  names):
+        if name is None:
+            continue
+        # Both halves of the entry answer to a click: aiming at a 6 pt line
+        # sample is fiddly, and a reader who clicks the words and gets
+        # nothing concludes the control is broken.
+        handle.set_picker(LEGEND_PICK_RADIUS)
+        text.set_picker(True)
+        picks[handle] = name
+        picks[text] = name
+        if not session.qber_visible(name):
+            handle.set_color(HIDDEN_LEGEND_COLOR)
+            handle.set_alpha(HIDDEN_LEGEND_ALPHA)
+            text.set_color(HIDDEN_LEGEND_COLOR)
+            text.set_alpha(HIDDEN_LEGEND_ALPHA)
+    return picks
+
+
 def draw_panels(fig, session, title=None):
     """Render the four panels of `session` into `fig`.
 
     Takes a bare `matplotlib.figure.Figure`, so the window and a headless
     Agg render go through exactly one drawing implementation -- a separate
     "export" path is how a live panel and its published figure drift apart.
+
+    Every artist here is thrown away and rebuilt on each call (`fig.clear()`
+    below), which is why panel 2 reads `session.hidden_qber` rather than
+    trusting any flag left on a line. As a side effect the call refreshes
+    `session.legend_picks`, the map the window's pick handler resolves a
+    clicked legend entry through.
     """
     fig.clear()
     axes = fig.subplots(4, 1, sharex=True,
@@ -574,24 +672,47 @@ def draw_panels(fig, session, title=None):
                              color=plots.RED, style="italic")
 
     # --- panel 2: observed QBER, against both death thresholds -----------
+    # Handles are collected and passed to legend() explicitly, so the entries
+    # keep the order of `runs` and `_wire_qber_legend` can line each one up
+    # with the policy it belongs to. `None` marks an entry that is a
+    # reference line rather than a policy.
+    handles, labels, names = [], [], []
     for run in runs:
-        ax_qber.plot([t for t in run.t], [100.0 * q for q in run.qber],
-                     color=run.color, lw=1.0, ls=run.linestyle,
-                     label=run.display_name)
-    ax_qber.axhline(100.0 * session.death_pm, color=plots.MODE_LINE["pm"],
-                    lw=1.0, ls=":",
-                    label="PM dies %.2f%%" % (100.0 * session.death_pm))
-    ax_qber.axhline(100.0 * session.death_ent, color=plots.MODE_LINE["ent"],
-                    lw=1.0, ls=":",
-                    label="ENT dies %.2f%%" % (100.0 * session.death_ent))
-    plots.style_axis(ax_qber, title="observed QBER (windowed)",
+        line, = ax_qber.plot([t for t in run.t], [100.0 * q for q in run.qber],
+                             color=run.color, lw=1.0, ls=run.linestyle,
+                             label=run.display_name)
+        # READ from the session, every frame. See VizSession.hidden_qber for
+        # why the flag cannot be left on this line.
+        line.set_visible(session.qber_visible(run.display_name))
+        handles.append(line)
+        labels.append(run.display_name)
+        names.append(run.display_name)
+    for mode, death in (("pm", session.death_pm), ("ent", session.death_ent)):
+        label = "%s dies %.2f%%" % (mode.upper(), 100.0 * death)
+        handles.append(ax_qber.axhline(100.0 * death,
+                                       color=plots.MODE_LINE[mode], lw=1.0,
+                                       ls=":", label=label))
+        labels.append(label)
+        names.append(None)
+    plots.style_axis(ax_qber,
+                     title="observed QBER (windowed)  —  click a policy in "
+                           "the legend to hide/show its trace",
                      ylabel="QBER [%]")
     # Headroom for the legend, which would otherwise sit on top of the first
     # few hundred slots -- the stretch where the policies first diverge.
+    #
+    # HIDDEN TRACES STILL SET THE LIMIT. Rescaling to whatever is left on
+    # screen would change the shape and apparent slope of the remaining
+    # curves on every click, so two screenshots of the same episode would
+    # carry two different vertical scales -- and the reader was hiding a
+    # trace in order to COMPARE the rest, which a moving axis defeats. The
+    # complaint this control answers is overlap, not scale.
     peak = max([100.0 * q for run in runs for q in run.qber]
                + [100.0 * session.death_pm, 100.0 * session.death_ent])
     ax_qber.set_ylim(0.0, peak * 1.45)
-    ax_qber.legend(fontsize=6, ncol=3, loc="upper left", framealpha=0.9)
+    legend = ax_qber.legend(handles, labels, fontsize=6, ncol=3,
+                            loc="upper left", framealpha=0.9)
+    session.legend_picks = _wire_qber_legend(legend, session, names)
 
     # --- panel 3: the key buffer ----------------------------------------
     for run in runs:

@@ -186,6 +186,17 @@ class PolicyVizApp(tk.Tk):
         self.figure = Figure(figsize=(9.2, 8.4), dpi=100)
         self.canvas = FigureCanvasTkAgg(self.figure, master=right)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        # ONE connection, for the life of the window.
+        #
+        # The obvious place to bind this is next to the legend it listens
+        # for, inside draw_panels -- and that is the trap. draw_panels runs
+        # on the redraw timer, so binding there would add a handler per
+        # frame: after a minute of running, one click would toggle a trace
+        # hundreds of times and appear to do nothing at all (or something,
+        # depending on the parity of the frame count). The handler is bound
+        # here instead and resolves the clicked artist through
+        # `session.legend_picks`, which draw_panels refreshes each frame.
+        self._pick_cid = self.canvas.mpl_connect("pick_event", self._on_pick)
 
     # ------------------------------------------------------------------
     # form <-> config
@@ -318,7 +329,35 @@ class PolicyVizApp(tk.Tk):
             return
         self._build_session(config, state["policy"])
 
+    def _on_pick(self, event):
+        """Click a QBER legend entry: hide or show that policy's trace.
+
+        Anything that is not a policy entry -- the two death-threshold
+        captions, or a click that lands on some other artist -- resolves to
+        None and is ignored. The redraw is forced: throttling it would leave
+        the click apparently unanswered for up to REDRAW_MS.
+        """
+        if self.session is None:
+            return
+        name = self.session.legend_picks.get(event.artist)
+        if name is None:
+            return
+        self.session.toggle_qber(name)
+        self._redraw(force=True)
+
     def _build_session(self, config, dqn_policy):
+        # Which QBER traces are switched off is a VIEW choice, not part of
+        # the episode, so it rides across an Apply: otherwise nudging lambda
+        # would silently un-hide everything the reader had just cleared away,
+        # and Apply is the button they press most.
+        #
+        # Names of policies that are no longer selected are carried too, and
+        # simply never match -- draw_panels only ever asks "is THIS run
+        # hidden", so a stale name cannot reach the draw. Keeping them means
+        # re-ticking a policy restores the visibility it had rather than
+        # springing back on top of the traces the reader was comparing.
+        carried = (set(self.session.hidden_qber)
+                   if self.session is not None else set())
         try:
             self.session = policyviz.VizSession(
                 config, dqn_policy=dqn_policy,
@@ -328,6 +367,7 @@ class PolicyVizApp(tk.Tk):
             self._set_status("cannot build session: %s" % exc, "error")
             messagebox.showerror("policy visualiser", str(exc))
             return
+        self.session.hidden_qber.update(carried)
         self._set_status("ready — seed %d, %d slots"
                          % (self.session.seed, config.horizon), "idle")
         self._redraw()
