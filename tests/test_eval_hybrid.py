@@ -352,5 +352,45 @@ class TestCompare(unittest.TestCase):
         self.assertEqual(rows["always-pm"]["eta"], 0.0)
 
 
+class TestPresetFlagsReachTheEnvironment(unittest.TestCase):
+    """The hardware assumption decides whether switching has any value at all,
+    so a preset flag that parses but never reaches HybridParams is the worst
+    kind of bug: every table would be labelled with a scenario it did not run
+    at, and nothing would look wrong."""
+
+    def _capture(self, argv):
+        import eval_hybrid
+        seen = {}
+
+        def fake_compare(seeds=None, params=None, **kw):
+            seen["params"] = params
+            return [{"policy": "always-pm", "episodes": 1, "eta": 0.0,
+                     "switches": 0.0, "expired": 0.0, "secret_bits": 0.0,
+                     "ent_fraction": 0.0, "starved": 0.0}]
+
+        real = eval_hybrid.compare
+        eval_hybrid.compare = fake_compare
+        try:
+            eval_hybrid.main(argv)
+        finally:
+            eval_hybrid.compare = real
+        return seen["params"]
+
+    def test_the_preset_flags_are_not_silently_dropped(self):
+        params = self._capture(["--no-dqn", "--seeds", "1",
+                                "--ent-preset", "ent_advanced",
+                                "--pm-preset", "rusca"])
+        self.assertEqual(params.ent_preset, "ent_advanced")
+        self.assertEqual(params.pm_preset, "rusca")
+
+    def test_omitting_the_flags_keeps_the_documented_defaults(self):
+        # Kills an override that writes None into HybridParams when the flag is
+        # absent, which would break every existing run rather than leaving it
+        # alone.
+        params = self._capture(["--no-dqn", "--seeds", "1"])
+        self.assertEqual(params.ent_preset, HybridParams().ent_preset)
+        self.assertEqual(params.pm_preset, HybridParams().pm_preset)
+
+
 if __name__ == "__main__":
     unittest.main()

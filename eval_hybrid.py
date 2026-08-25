@@ -345,6 +345,13 @@ def main(argv=None):
     ap.add_argument("--b-max", type=float, default=None,
                     help="key buffer capacity in bits, e.g. 1e6")
     ap.add_argument("--t0", type=int, default=None, help="deadline in slots")
+    ap.add_argument("--ent-preset", default=None,
+                    help="ENT operating point, e.g. ent_advanced. The hardware "
+                         "assumption is the single biggest lever on whether "
+                         "switching has any value at all, so it belongs on the "
+                         "command line rather than buried in a default.")
+    ap.add_argument("--pm-preset", default=None,
+                    help="PM operating point (default aurea)")
     ap.add_argument("--no-dqn", action="store_true",
                     help="baselines only; skips training entirely")
     ap.add_argument("--show-sweep", action="store_true",
@@ -358,6 +365,10 @@ def main(argv=None):
         overrides["b_max"] = int(args.b_max)
     if args.t0 is not None:
         overrides["t0_deadline"] = args.t0
+    if args.ent_preset is not None:
+        overrides["ent_preset"] = args.ent_preset
+    if args.pm_preset is not None:
+        overrides["pm_preset"] = args.pm_preset
     params = HybridParams(**overrides)
 
     cfg = DQNConfig(episodes=args.episodes)
@@ -371,6 +382,7 @@ def main(argv=None):
     print("params: lam=%.3f b_max=%.3g horizon=%d T0=%d n_x=%d d_km=%.1f"
           % (params.lam, params.b_max, params.horizon, params.t0_deadline,
              params.n_x, params.d_km))
+    print("presets: pm=%s ent=%s" % (params.pm_preset, params.ent_preset))
     print("evaluation seeds: %d..%d (training range %d..%d)"
           % (seeds[0], seeds[-1], training_seed_range(cfg).start,
              training_seed_range(cfg).stop - 1))
