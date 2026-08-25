@@ -1,0 +1,8 @@
+{
+    "protocol": "ent",
+    "d_km": 0.0, "alpha": 0.2, "odr_losses": 0.0,
+    "eta_a": 0.80, "eta_bob": 0.90,
+    "xi_a": 1e-06, "xi_b": 1e-06,
+    "e_intr": 0.0136, "mu": 0.050,
+    "f_rep": 80000000.0, "qber_sigma": 0.001
+}
