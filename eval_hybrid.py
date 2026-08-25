@@ -22,6 +22,12 @@ written to be hard to flatter. Four properties carry that weight:
 4. **No row is ever overwritten in silence.** `DQNPolicy.name` is a class
    constant and GreedyThreshold renders its threshold at three decimals, so
    two comparands really can collide on a label. `label_rows` raises instead.
+5. **The table carries its own upper bound.** `oracle` and
+   `always-pm-relaxed` are not policies: they run in the relaxed environment
+   of `HybridEnv.step_relaxed` (clairvoyant, free switching, continuous key
+   delivery). Their difference is the ENTIRE value switching could ever have
+   had -- see `switching_value()`. Without it "no policy we tried beat
+   AlwaysPM" is a statement about the policies we happened to try.
 
 The default spec parameters are DEGENERATE -- AlwaysPM serves essentially
 every message (eta = 0.9957 over the eight evaluation seeds: exactly 1.0000
@@ -45,11 +51,13 @@ from dqn import DQNConfig, train, training_seed_range
 from evemarkov import EveParams
 from hybridenv import HybridEnv, HybridParams
 from policies import (AlwaysENT, AlwaysPM, BufferAwareThreshold,
-                      GreedyThreshold, run_episode)
+                      GreedyThreshold, Oracle, RelaxedAlwaysPM, run_episode,
+                      run_relaxed_episode)
 
-__all__ = ["THRESHOLDS", "RESERVES", "EVAL_SEED_BASE", "evaluation_seeds",
-           "assert_seeds_disjoint", "label_rows", "sweep_threshold",
-           "sweep_buffer_aware", "compare", "format_rows", "main"]
+__all__ = ["THRESHOLDS", "RESERVES", "EVAL_SEED_BASE", "BOUNDS",
+           "evaluation_seeds", "assert_seeds_disjoint", "label_rows",
+           "sweep_threshold", "sweep_buffer_aware", "compare",
+           "switching_value", "format_rows", "main"]
 
 # Candidate switch points, in measured QBER. At the configured operating point
 # (n_X = 1e5, 55 km) PM dies at QBER 3.3535% and ENT at 8.6194%
@@ -168,11 +176,26 @@ def _resolve_envs(env_factory, envs, seeds):
     return envs
 
 
+# The two reference bounds, in the order they are reported: the control
+# first, then the Oracle, because the pair is only meaningful read as a
+# difference. RelaxedAlwaysPM is NOT optional -- dropping it leaves
+# Oracle - AlwaysPM, which measures the relaxation and the switching
+# together and reads as several times more headroom than switching has.
+BOUNDS = (RelaxedAlwaysPM, Oracle)
+
+
 def _score(envs, policy, seeds):
     """Run `policy` once per seed. The seed is ALWAYS explicit: run_episode
     with seed=None replays a single trajectory, which would collapse an
     n-seed average into one episode repeated n times."""
     return [run_episode(envs[s], policy, seed=s) for s in seeds]
+
+
+def _score_bound(envs, bound, seeds):
+    """As _score, but through the relaxed dynamics. Same envs, same seeds:
+    the bound faces the identical jamming and arrivals as every policy row,
+    which is what makes the subtraction below mean anything."""
+    return [run_relaxed_episode(envs[s], bound, seed=s) for s in seeds]
 
 
 def _keyed(pairs):
@@ -305,8 +328,37 @@ def compare(seeds, params=None, eve_params=None, dqn_config=None,
         trained = train(factory(training_seed_range(cfg).start), cfg)
         rows.append(_mean_row(label, _score(envs, trained, seeds)))
 
+    # The bounds go last: they are not policies, and reading them as one
+    # would misreport the study. Each is a FRESH instance, so no two rows can
+    # be the same object -- `rows[-1] is rows[-2]` would make the two numbers
+    # trivially equal and the decomposition trivially zero.
+    rows.extend(_mean_row(b.name, _score_bound(envs, b(), seeds))
+                for b in BOUNDS)
+
     label_rows(rows)        # refuse a silent collision; the dict is a guard
     return rows
+
+
+def switching_value(rows):
+    """Split the Oracle's headroom over AlwaysPM into its two causes.
+
+    `relaxation` is what the relaxed environment alone is worth (clairvoyance
+    is idle for a policy that never switches, so this is free switching plus
+    continuous delivery); `switching` is what CHOOSING between the modes is
+    worth on top, which is the quantity the whole study is about. Reporting
+    only `total` overstates switching's value several-fold.
+
+    Returns None when the rows carry no bounds -- a caller that ran only
+    baselines gets a missing number rather than a made-up one.
+    """
+    by = label_rows(rows)
+    needed = (AlwaysPM.name, RelaxedAlwaysPM.name, Oracle.name)
+    if any(k not in by for k in needed):
+        return None
+    pm, relaxed_pm, oracle = (by[k]["eta"] for k in needed)
+    return {"always_pm": pm, "always_pm_relaxed": relaxed_pm,
+            "oracle": oracle, "relaxation": relaxed_pm - pm,
+            "switching": oracle - relaxed_pm, "total": oracle - pm}
 
 
 def format_rows(rows):
@@ -396,6 +448,18 @@ def main(argv=None):
                   % (key[0], key[1], sweeps["buffer_aware"][key]))
     print()
     print(format_rows(rows))
+
+    split = switching_value(rows)
+    if split is not None:
+        print()
+        print("upper bound (sees f_t, switches free, key delivered "
+              "continuously):")
+        print("  relaxation alone  %+.6f eta   (always-pm-relaxed - "
+              "always-pm)" % split["relaxation"])
+        print("  switching itself  %+.6f eta   (oracle - "
+              "always-pm-relaxed)" % split["switching"])
+        print("  total headroom    %+.6f eta   (oracle - always-pm)"
+              % split["total"])
 
 
 if __name__ == "__main__":

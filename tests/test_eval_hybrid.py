@@ -394,3 +394,116 @@ class TestPresetFlagsReachTheEnvironment(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheOracleRowsInTheTable(unittest.TestCase):
+    """The bound is worthless if it never reaches the table, and worse than
+    worthless if it reaches it as a duplicate of the row it is compared
+    against."""
+
+    def _rows(self, **over):
+        from eval_hybrid import compare
+        return compare(seeds=(11, 12),
+                       params=nondegenerate_params(horizon=200),
+                       eve_params=EveParams(**MIXED_EVE), dqn_config={},
+                       thresholds=(0.04,), reserves=(0.0,), **over)
+
+    def test_the_table_carries_the_oracle_and_its_relaxed_control(self):
+        from eval_hybrid import label_rows
+
+        rows = label_rows(self._rows())
+        self.assertIn("oracle", rows)
+        self.assertIn("always-pm-relaxed", rows)
+
+    def test_the_control_row_is_not_the_oracle_row(self):
+        # The failure this kills: scoring one bound and reporting it twice.
+        # Both rows then agree exactly, the switching value collapses to 0
+        # and the study understates its own headroom -- with nothing visibly
+        # wrong in the table.
+        rows = self._rows()
+        oracle = [r for r in rows if r["policy"] == "oracle"][0]
+        control = [r for r in rows if r["policy"] == "always-pm-relaxed"][0]
+        self.assertIsNot(oracle, control)
+        self.assertEqual(control["ent_fraction"], 0.0)
+        self.assertGreater(oracle["ent_fraction"], 0.0)
+        self.assertGreater(oracle["switches"], 0.0)
+        self.assertEqual(control["switches"], 0.0)
+
+    def test_the_bounds_are_scored_on_the_same_seeds_as_the_policies(self):
+        # Rebuilt by hand from the same seeds: a bound run on a different
+        # seed set is not comparable with the rows it is subtracted from.
+        from eval_hybrid import label_rows
+        from policies import Oracle, run_relaxed_episode
+
+        seeds = (11, 12)
+        params = nondegenerate_params(horizon=200)
+        rows = label_rows(self._rows())
+        want = []
+        for s in seeds:
+            env = HybridEnv(dataclasses.replace(params, seed=s),
+                            EveParams(seed=s, **MIXED_EVE))
+            want.append(run_relaxed_episode(env, Oracle(), seed=s))
+        self.assertAlmostEqual(rows["oracle"]["eta"],
+                               statistics.mean(r["eta"] for r in want))
+
+    def test_the_oracle_row_is_at_least_as_good_as_every_other_row(self):
+        # Spec section 9 again, at the level of the published table.
+        from eval_hybrid import label_rows
+
+        rows = label_rows(self._rows())
+        for label, row in rows.items():
+            if label == "oracle":
+                continue
+            self.assertGreaterEqual(rows["oracle"]["eta"], row["eta"], label)
+
+
+class TestTheSwitchingValueDecomposition(unittest.TestCase):
+    """Oracle - AlwaysPM measures the relaxation AND the switching together.
+    Only Oracle - RelaxedAlwaysPM isolates switching, and at the measured
+    operating points most of the headroom turns out to be the relaxation --
+    so a driver that reported only the total would overstate the thing the
+    study is about."""
+
+    def test_it_splits_the_headroom_at_the_relaxed_control(self):
+        from eval_hybrid import switching_value
+
+        rows = [{"policy": "always-pm", "eta": 0.50},
+                {"policy": "always-pm-relaxed", "eta": 0.60},
+                {"policy": "oracle", "eta": 0.65}]
+        split = switching_value(rows)
+        self.assertAlmostEqual(split["relaxation"], 0.10)
+        self.assertAlmostEqual(split["switching"], 0.05)
+        self.assertAlmostEqual(split["total"], 0.15)
+
+    def test_it_reports_nothing_rather_than_guessing_without_the_bounds(self):
+        from eval_hybrid import switching_value
+
+        self.assertIsNone(switching_value([{"policy": "always-pm",
+                                            "eta": 0.5}]))
+
+    def test_the_cli_prints_both_halves_of_the_split(self):
+        # A decomposition computed and never printed is a decomposition the
+        # reader does not have.
+        import contextlib
+        import io as _io
+
+        import eval_hybrid
+
+        rows = [{"policy": p, "episodes": 1, "eta": e, "switches": 0.0,
+                 "expired": 0.0, "secret_bits": 0.0, "ent_fraction": 0.0,
+                 "starved": 0.0}
+                for p, e in (("always-pm", 0.50), ("always-pm-relaxed", 0.60),
+                             ("oracle", 0.65))]
+        real = eval_hybrid.compare
+        eval_hybrid.compare = lambda **kw: rows
+        try:
+            out = _io.StringIO()
+            with contextlib.redirect_stdout(out):
+                eval_hybrid.main(["--seeds", "1", "--horizon", "10",
+                                  "--no-dqn"])
+        finally:
+            eval_hybrid.compare = real
+        text = out.getvalue()
+        self.assertIn("relaxation alone  +0.100000", text)
+        self.assertIn("switching itself  +0.050000", text)
+        self.assertIn("total headroom    +0.150000", text)

@@ -240,6 +240,10 @@ class HybridEnv:
         self._sifted = (int(d_pm.clicks_per_s * 0.25 * p.delta_t),
                         int(d_ent.clicks_per_s * 0.5 * p.delta_t))
         self._e_floor = (d_pm.e_avg, d_ent.q2)
+        # kappa() memo: f takes one of three values, so the finite-key
+        # routine runs a handful of times per episode instead of 3,600.
+        # Keyed on params, not on the episode, so reset() must NOT clear it.
+        self._kappa_cache = {}
 
     def reset(self, seed=None):
         """Start a fresh episode; return the first observation.
@@ -312,6 +316,28 @@ class HybridEnv:
             return keyrate_ent.secret_key_length_ent(n, qber) or 0
         return keyrate.secret_key_length(n, qber, self._key_params) or 0
 
+    def _classical_slot(self):
+        """eq (2)-(4) for one slot: arrivals, service, expiry.
+
+        Shared by step() and step_relaxed(). The Oracle relaxation touches
+        the QUANTUM side only, so the two must run the same classical code on
+        the same arrival stream -- a second copy here is how a bound quietly
+        stops bounding the thing it is compared against.
+
+        The order is mandatory: arrive -> serve -> age_and_expire. Any other
+        shifts the effective deadline by a slot.
+        """
+        p = self.params
+        arrivals = int(self._arrivals_rng.poisson(p.lam))
+        self._queue.arrive(arrivals)
+        capacity = self._buffer.level // p.l0
+        served = self._queue.serve(min(self._queue.length, capacity))
+        self._buffer.withdraw(served * p.l0)
+        expired = self._queue.age_and_expire()
+        self._served_total += served
+        self._arrived_total += arrivals
+        return arrivals, served, expired
+
     def step(self, action):
         """Advance one slot under `action` (PM or ENT).
 
@@ -341,17 +367,8 @@ class HybridEnv:
             self._buffer.deposit(bits)
 
         # --- classical side: arrivals, service, expiry (eq 2-4) ---
-        # This order is mandatory: arrive -> serve -> age_and_expire. Any
-        # other shifts the effective deadline by a slot.
-        arrivals = int(self._arrivals_rng.poisson(p.lam))
-        self._queue.arrive(arrivals)
-        capacity = self._buffer.level // p.l0
-        served = self._queue.serve(min(self._queue.length, capacity))
-        self._buffer.withdraw(served * p.l0)
-        expired = self._queue.age_and_expire()
+        arrivals, served, expired = self._classical_slot()
 
-        self._served_total += served
-        self._arrived_total += arrivals
         self._last_mode = mode
         self._slot += 1
         done = self._slot >= p.horizon
@@ -360,6 +377,97 @@ class HybridEnv:
                 "buffer": self._buffer.level, "deposited": deposited,
                 "blocks": len(blocks), "mode": mode,
                 "qber": self._qber_hist[-1]}
+        return self._observe(), float(served), done, info
+
+    # ---------------- the Oracle relaxation (spec section 7) ----------------
+    #
+    # A negative result -- "switching does not pay" -- is only publishable
+    # with a bound on how much it could ever have paid. These two methods are
+    # the mechanics of that bound; policies.py supplies the decision rule.
+    # Three constraints are dropped, EVERY one of them in the switcher's
+    # favour, so no realisable switching policy can exceed what they produce:
+    #
+    #   1. the mode is chosen from the true f_t, not from the noisy windowed
+    #      QBER a real controller sees (eq 16's causality constraint lifted);
+    #   2. switching is free -- eq (5) does not destroy the partial block;
+    #   3. key arrives continuously at kappa_m(f_t) instead of in n_x-sized
+    #      blocks, which can only make key available earlier, never later.
+    #
+    # The classical side is NOT relaxed: same _classical_slot(), same arrival
+    # stream, same B_max clamp.
+
+    def kappa(self, mode, f):
+        """eq (12): mean secret bits per slot for `mode` at jamming `f`.
+
+        ns_m * l_m(E_m(f)) / n_x -- one block's key spread over the slots
+        that fill the block.
+
+        The error count handed to the finite-key routine is ROUNDED to an
+        integer, because that is what it receives at every other call site: a
+        finished block carries a whole number of errors. Feeding it the
+        fractional expectation instead moves eta in the fourth decimal, which
+        would leave the bound on a slightly different footing from the blocks
+        it is meant to bound.
+
+        The one thing the relaxation cannot wave away: this is an
+        EXPECTATION, while a real block's key length comes from its realised
+        binomial error count, and l(q) is convex -- so a lucky block can
+        out-earn kappa. Measured over 4,000 (PM) and 20,000 (ENT) slot runs
+        at f = 0.00 and 0.03, the block rate lands 0.001-0.05% BELOW kappa
+        (the uncounted final partial block dominates), so the bound holds
+        comfortably in practice. It is not an almost-sure inequality, and a
+        report that needs one should say so.
+        """
+        key = (int(mode), float(f))
+        if key not in self._kappa_cache:
+            n = self.params.n_x
+            e_eff = self._e_floor[mode] * (1.0 - f) + 0.5 * f
+            errors = int(round(min(e_eff, 1.0) * n))
+            bits = self._key_length(mode, n, errors)
+            self._kappa_cache[key] = self._sifted[mode] * bits / n
+        return self._kappa_cache[key]
+
+    def step_relaxed(self, chooser):
+        """One slot under the relaxation above; same (obs, reward, done, info).
+
+        `chooser(f, rates, obs) -> mode` decides the slot AFTER f_t is drawn.
+        That signature is what makes clairvoyance structural rather than a
+        promise in a comment: relaxation 1 is the `f` argument, and a chooser
+        that ignores it and reads `obs` instead is exactly the realisable
+        policy this bound is supposed to sit above. `rates` is
+        (kappa_PM, kappa_ENT) at this slot's f.
+
+        The QBER window is still filled from a real binomial draw, so `obs`
+        is the observation an unrelaxed agent would have had at this slot and
+        such a chooser is a fair comparand. `obs[I_BLOCK]` is always 0:
+        under relaxation 3 there is no partial block to lose.
+        """
+        p = self.params
+        obs = self._observe()
+        f = self.eve.step()
+        rates = (self.kappa(PM, f), self.kappa(ENT, f))
+        mode = ENT if int(chooser(f, rates, obs)) == ENT else PM
+
+        sifted = self._sifted[mode]
+        e_eff = self._e_floor[mode] * (1.0 - f) + 0.5 * f
+        errors = int(self._rng.binomial(sifted, min(e_eff, 1.0)))
+        self._qber_hist.append(errors / sifted if sifted else 0.0)
+
+        # Relaxations 2 and 3 together: no BlockAccumulator at all, so a
+        # switch costs nothing and this slot's key is banked in this slot.
+        deposited = rates[mode]
+        self._buffer.deposit(deposited)
+
+        arrivals, served, expired = self._classical_slot()
+
+        self._last_mode = mode
+        self._slot += 1
+        done = self._slot >= p.horizon
+        info = {"f": f, "eve_state": self.eve.state, "arrivals": arrivals,
+                "served": served, "expired": expired,
+                "buffer": self._buffer.level, "deposited": deposited,
+                "blocks": 0, "mode": mode, "qber": self._qber_hist[-1],
+                "rates": rates}
         return self._observe(), float(served), done, info
 
     @property

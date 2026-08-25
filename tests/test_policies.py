@@ -14,7 +14,8 @@ import hybridenv
 from evemarkov import EveParams
 from hybridenv import (ENT, I_BUFFER, I_QBER, PM, HybridEnv, HybridParams)
 from policies import (AlwaysENT, AlwaysPM, BufferAwareThreshold,
-                      GreedyThreshold, Policy, run_episode)
+                      GreedyThreshold, Oracle, Policy, RelaxationBound,
+                      RelaxedAlwaysPM, run_episode, run_relaxed_episode)
 
 
 def obs_with(qber=0.0, mode=PM, block=0.0, buffer=0.0, queue=0.0, age=0.0):
@@ -389,3 +390,137 @@ class TestRunEpisode(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RelaxedAlwaysENT(RelaxationBound):
+    """AlwaysENT under the relaxation. Not shipped -- the study reports the
+    PM control only -- but the Oracle has to beat BOTH constant modes to be
+    a per-slot argmax rather than the better of the two."""
+
+    name = "always-ent-relaxed"
+
+    def choose(self, f, rates, obs):
+        return ENT
+
+
+# The regime the whole study lives in: QUIET most of the time, with HEAVY
+# episodes above PM's death QBER and below ENT's.
+MIXED_EVE = {"f_levels": (0.0, 0.03, 0.08)}
+HEAVY_EVE = {"f_levels": (0.08, 0.08, 0.08)}
+
+
+def mixed_env(horizon=400, seed=1, **over):
+    params = HybridParams(horizon=horizon, seed=seed, lam=2.5,
+                          b_max=1_000_000, **over)
+    return HybridEnv(params, EveParams(seed=seed, **MIXED_EVE))
+
+
+class TestTheOracleBound(unittest.TestCase):
+    """Spec section 7's mandatory upper bound.
+
+    The study's headline is NEGATIVE -- no switching policy beats AlwaysPM --
+    and a negative result is only publishable with a bound on how much value
+    switching could ever have had. These tests exist because a bound that is
+    silently not a bound (not clairvoyant, paying a switch cost, delivering
+    in blocks, or simply AlwaysPM renamed) still prints a plausible number
+    and would understate exactly the quantity the paper turns on.
+    """
+
+    def test_the_oracle_takes_the_better_mode_slot_by_slot(self):
+        oracle = Oracle()
+        obs = obs_with()
+        self.assertEqual(oracle.choose(0.0, (23332.0, 1137.0), obs), PM)
+        self.assertEqual(oracle.choose(0.08, (0.0, 271.2), obs), ENT)
+        # Both modes dead: switching buys nothing, so do not report a switch.
+        self.assertEqual(oracle.choose(0.5, (0.0, 0.0), obs), PM)
+
+    def test_the_relaxed_control_never_leaves_pm(self):
+        control = RelaxedAlwaysPM()
+        self.assertEqual(control.choose(0.08, (0.0, 271.2), obs_with()), PM)
+
+    def test_the_oracle_switches_with_the_jamming(self):
+        # Kills an "Oracle" that is really max(AlwaysPM, AlwaysENT): that one
+        # reports zero switches and an ENT fraction of exactly 0 or 1.
+        result = run_relaxed_episode(mixed_env(), Oracle(), seed=1)
+        self.assertGreater(result["switches"], 0)
+        self.assertGreater(result["ent_fraction"], 0.0)
+        self.assertLess(result["ent_fraction"], 1.0)
+
+    def test_the_oracle_out_distils_both_constant_modes_under_the_relaxation(self):
+        # The same point, on the quantity the choice actually controls: a
+        # per-slot argmax banks STRICTLY more key than either constant mode,
+        # while "the better of the two" ties with one of them.
+        env = mixed_env()
+        oracle = run_relaxed_episode(env, Oracle(), seed=1)["secret_bits"]
+        pm = run_relaxed_episode(env, RelaxedAlwaysPM(), seed=1)["secret_bits"]
+        ent = run_relaxed_episode(env, RelaxedAlwaysENT(), seed=1)["secret_bits"]
+        self.assertGreater(oracle, pm)
+        self.assertGreater(oracle, ent)
+
+    def test_the_oracle_acts_on_the_true_f_and_not_on_the_observed_qber(self):
+        # Clairvoyance, made testable. In the first slot the QBER window is
+        # EMPTY, so the observation reads q = 0 and any policy inferring the
+        # channel from it starts on PM. Under permanent heavy jamming PM
+        # distils nothing, and the Oracle must be on ENT from slot one.
+        env = HybridEnv(HybridParams(horizon=5, seed=1, lam=0.0),
+                        EveParams(seed=1, **HEAVY_EVE))
+        env.reset()
+        oracle = Oracle()
+        done, slots = False, 0
+        while not done:
+            _, _, done, info = env.step_relaxed(oracle.choose)
+            slots += 1
+            self.assertEqual(info["mode"], ENT,
+                             "slot %d fell back to PM" % slots)
+            self.assertGreater(info["deposited"], 0.0)
+        self.assertEqual(slots, 5)
+
+    def test_a_bound_is_not_a_policy_and_cannot_be_run_as_one(self):
+        # run_episode() would score it under the UNRELAXED dynamics and
+        # produce a number that is neither the bound nor a policy.
+        with self.assertRaises(AttributeError):
+            run_episode(mixed_env(horizon=5), Oracle(), seed=1)
+
+    def test_the_two_bounds_are_distinct_rows(self):
+        self.assertNotEqual(Oracle.name, RelaxedAlwaysPM.name)
+        env = mixed_env()
+        oracle = run_relaxed_episode(env, Oracle(), seed=1)
+        control = run_relaxed_episode(env, RelaxedAlwaysPM(), seed=1)
+        self.assertNotEqual(oracle["ent_fraction"], control["ent_fraction"])
+        self.assertNotEqual(oracle["secret_bits"], control["secret_bits"])
+
+    def test_the_oracle_is_at_least_as_good_as_every_policy_on_every_seed(self):
+        # Spec section 9's mandated property. If it ever fails, either the
+        # environment leaks the future to a policy or the "bound" is not one.
+        #
+        # Two operating points, and the second is what gives this test teeth:
+        # under permanent heavy jamming AlwaysPM scores 0 while AlwaysENT
+        # does not, so an "Oracle" that is AlwaysPM under another name FAILS
+        # here. Checked per seed, never on the mean -- a bound that lost on
+        # one seed and won on another would still average out.
+        policies = [AlwaysPM(), AlwaysENT(), GreedyThreshold(0.02),
+                    GreedyThreshold(0.045), BufferAwareThreshold(0.045, 0.25)]
+        for eve_kwargs in (MIXED_EVE, HEAVY_EVE):
+            for seed in (11, 12, 13):
+                params = HybridParams(horizon=200, seed=seed, lam=2.5,
+                                      b_max=1_000_000)
+                env = HybridEnv(params, EveParams(seed=seed, **eve_kwargs))
+                bound = run_relaxed_episode(env, Oracle(), seed=seed)["eta"]
+                for policy in policies:
+                    got = run_episode(env, policy, seed=seed)["eta"]
+                    self.assertGreaterEqual(
+                        bound, got,
+                        "%s scored %.6f above the oracle's %.6f (eve %s, "
+                        "seed %d)" % (policy.name, got, bound,
+                                      eve_kwargs["f_levels"], seed))
+
+    def test_that_property_test_can_actually_fail(self):
+        # The guard on the guard. Under permanent heavy jamming AlwaysENT
+        # really does beat AlwaysPM, which is what makes the test above
+        # capable of rejecting an Oracle that never leaves PM.
+        params = HybridParams(horizon=200, seed=11, lam=2.5, b_max=1_000_000)
+        env = HybridEnv(params, EveParams(seed=11, **HEAVY_EVE))
+        pm = run_episode(env, AlwaysPM(), seed=11)["eta"]
+        ent = run_episode(env, AlwaysENT(), seed=11)["eta"]
+        self.assertEqual(pm, 0.0)
+        self.assertGreater(ent, 0.0)

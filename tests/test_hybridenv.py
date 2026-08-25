@@ -6,6 +6,8 @@ from hybridenv import (ENT, I_AGE, I_BLOCK, I_BUFFER, I_MODE, I_QBER, I_QUEUE,
                        OBS_DIM, PM, BlockAccumulator, HybridEnv, HybridParams,
                        KeyBuffer, MessageQueue)
 
+QUIET_EVE = EveParams(f_levels=(0.0, 0.0, 0.0), seed=1)
+
 
 class TestMessageQueue(unittest.TestCase):
     """FIFO with a common deadline T0 (eq 3-4). All messages expire at the
@@ -698,3 +700,155 @@ def _run_fixed(env, action):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheRelaxedDynamics(unittest.TestCase):
+    """HybridEnv.kappa / step_relaxed -- the mechanics of the Oracle bound.
+
+    Everything here exists to stop the bound quietly becoming something else.
+    A bound that is not actually relaxed is not an upper bound, and nothing
+    about it looks wrong from the outside: it prints a smaller number and
+    makes switching look more valuable than it really is.
+    """
+
+    def test_kappa_reproduces_the_measured_table(self):
+        # Spec section 5's kappa table, which every conclusion of the study
+        # rests on. 2%, the tolerance the block-rate test above already uses.
+        env = HybridEnv(HybridParams(horizon=10, seed=1), QUIET_EVE)
+        for f, k_pm, k_ent in ((0.00, 23332.0, 1137.0),
+                               (0.03, 7642.0, 776.2)):
+            self.assertAlmostEqual(
+                env.kappa(PM, f) / k_pm, 1.0, delta=0.02,
+                msg="kappa_PM(%.2f) = %.1f" % (f, env.kappa(PM, f)))
+            self.assertAlmostEqual(
+                env.kappa(ENT, f) / k_ent, 1.0, delta=0.02,
+                msg="kappa_ENT(%.2f) = %.1f" % (f, env.kappa(ENT, f)))
+        # PM is dead at f = 0.08 and ENT is not: that gap is the entire
+        # reason a switching policy could have had any value at all.
+        self.assertEqual(env.kappa(PM, 0.08), 0.0)
+        self.assertAlmostEqual(env.kappa(ENT, 0.08) / 271.2, 1.0, delta=0.02)
+
+    def test_kappa_is_the_rate_the_unrelaxed_environment_really_delivers(self):
+        # The bound only bounds if its continuous rate matches the block
+        # dynamics it replaces. A kappa scaled by, say, a basis factor would
+        # inflate the Oracle without failing a single table lookup.
+        for action, horizon in ((PM, 1200), (ENT, 4000)):
+            env = HybridEnv(HybridParams(horizon=horizon, seed=1), QUIET_EVE)
+            env.reset()
+            done, deposited = False, 0
+            while not done:
+                _, _, done, info = env.step(action)
+                deposited += info["deposited"]
+            self.assertAlmostEqual(
+                (deposited / horizon) / env.kappa(action, 0.0), 1.0,
+                delta=0.02,
+                msg="mode %d: blocks gave %.1f bit/slot, kappa says %.1f"
+                    % (action, deposited / horizon, env.kappa(action, 0.0)))
+
+    def test_the_relaxed_slot_banks_key_at_once_not_in_blocks(self):
+        # Relaxation 3. ENT needs ~29 slots to fill a block at this channel,
+        # so after ONE slot the unrelaxed environment has banked nothing
+        # while the relaxed one has banked a slot's worth.
+        params = HybridParams(horizon=5, seed=1, lam=0.0)
+        real = HybridEnv(params, QUIET_EVE)
+        real.reset()
+        real.step(ENT)
+        self.assertEqual(real.buffer_level, 0)
+
+        relaxed = HybridEnv(params, QUIET_EVE)
+        relaxed.reset()
+        _, _, _, info = relaxed.step_relaxed(lambda f, rates, obs: ENT)
+        self.assertAlmostEqual(info["deposited"], relaxed.kappa(ENT, 0.0))
+        self.assertEqual(relaxed.buffer_level, int(relaxed.kappa(ENT, 0.0)))
+
+    def test_the_relaxed_run_pays_nothing_for_a_switch(self):
+        # Relaxation 2. Alternating mode every slot destroys every partial
+        # block under eq (5); under the relaxation each slot must still bank
+        # exactly kappa of the mode it ran, with no deduction anywhere.
+        env = HybridEnv(HybridParams(horizon=40, seed=1, lam=0.0), QUIET_EVE)
+        env.reset()
+        slot = [0]
+
+        def alternate(f, rates, obs):
+            slot[0] += 1
+            return ENT if slot[0] % 2 else PM
+
+        # The buffer is tracked as well as the reported deposit: a switch
+        # cost charged as a separate withdrawal would leave `deposited`
+        # looking innocent. lam = 0, so nothing is ever spent.
+        done, banked, switches, last, level = False, 0.0, 0, None, 0
+        while not done:
+            _, _, done, info = env.step_relaxed(alternate)
+            self.assertAlmostEqual(info["deposited"],
+                                   env.kappa(info["mode"], info["f"]))
+            banked += info["deposited"]
+            level += int(info["deposited"])
+            self.assertEqual(env.buffer_level, level)
+            switches += 1 if last is not None and info["mode"] != last else 0
+            last = info["mode"]
+        self.assertEqual(switches, 39)          # it really did thrash
+        self.assertAlmostEqual(banked,
+                               20 * (env.kappa(PM, 0.0) + env.kappa(ENT, 0.0)))
+
+    def test_the_chooser_is_handed_the_true_jamming_of_this_slot(self):
+        # Relaxation 1, structurally: whatever the chooser reads as `f` must
+        # be the f the slot actually ran at, not a lagged or estimated one,
+        # and `rates` must agree with kappa at that f for both modes.
+        # 300 slots against a mean dwell of 40: long enough that the chain
+        # really does leave QUIET, which the last assertion checks rather
+        # than assumes.
+        env = HybridEnv(HybridParams(horizon=300, seed=3, lam=0.0),
+                        EveParams(f_levels=(0.0, 0.03, 0.08), seed=3))
+        env.reset()
+        seen = []
+
+        def watch(f, rates, obs):
+            seen.append((f, tuple(rates)))
+            return PM
+
+        done = False
+        while not done:
+            _, _, done, info = env.step_relaxed(watch)
+            f_seen, rates_seen = seen[-1]
+            self.assertEqual(f_seen, info["f"])
+            self.assertEqual(rates_seen, (env.kappa(PM, info["f"]),
+                                          env.kappa(ENT, info["f"])))
+        self.assertGreater(len({f for f, _ in seen}), 1)   # f really moved
+
+    def test_the_relaxed_observation_is_the_one_a_real_agent_would_have_had(self):
+        # The bound must sit above a REALISABLE policy, so the observation
+        # handed to the chooser has to be the noisy, lagged one that policy
+        # would have seen. Otherwise "the Oracle reads f instead of obs" is a
+        # distinction without a difference and no test of clairvoyance can
+        # bite. obs[I_BLOCK] is the exception: relaxation 3 leaves no partial
+        # block, so it is always 0.
+        env = HybridEnv(HybridParams(horizon=12, seed=5, lam=0.0), QUIET_EVE)
+        env.reset()
+        obs_seen = []
+
+        def record(f, rates, obs):
+            obs_seen.append(obs)
+            return PM
+
+        done = False
+        while not done:
+            _, _, done, _ = env.step_relaxed(record)
+        self.assertEqual(obs_seen[0][I_QBER], 0.0)     # empty window
+        # By the end the window holds PM's floor -- measured, not assumed.
+        self.assertAlmostEqual(obs_seen[-1][I_QBER], env.error_floor[PM],
+                               delta=0.002)
+        self.assertTrue(all(o[I_BLOCK] == 0.0 for o in obs_seen))
+
+    def test_the_relaxed_run_faces_the_same_weather_as_the_real_one(self):
+        # The bound is subtracted from policy rows, so it must run on the
+        # identical jamming and arrival trajectories. Separate RNG streams
+        # make that true; sharing one would silently break it.
+        params = HybridParams(horizon=200, seed=7, lam=2.5)
+        eve = EveParams(f_levels=(0.0, 0.03, 0.08), seed=7)
+        real, relaxed = HybridEnv(params, eve), HybridEnv(params, eve)
+        real.reset(7)
+        relaxed.reset(7)
+        for _ in range(200):
+            _, _, _, a = real.step(PM)
+            _, _, _, b = relaxed.step_relaxed(lambda f, rates, obs: PM)
+            self.assertEqual((a["f"], a["arrivals"]), (b["f"], b["arrivals"]))
