@@ -30,6 +30,40 @@ any seed a study would train with. `episodes > SEED_STRIDE` is refused rather
 than allowed to wrap, because wrapping would make two different config seeds
 share trajectories and quietly break that disjointness promise.
 
+Input scaling
+-------------
+`HybridEnv`'s observation is deliberately in RAW physical units: obs[I_QBER]
+is a QBER, obs[I_BUFFER] is a fraction of B_max, and GreedyThreshold /
+BufferAwareThreshold read them as such. Those units are not commensurable.
+Measured over one 3,600-slot rollout at lam=2.5, b_max=1e6,
+ent_preset=ent_advanced, the per-feature standard deviations span two orders
+of magnitude (mode 0.4999, block 0.2335, queue 0.1517, age 0.0695, QBER
+0.0155, buffer 0.0024), while the decision the agent exists to make is a QBER
+threshold separating E_PM(f=0.03)=0.02488 from E_PM(f=0.08)=0.04937 -- a gap
+of 0.0245, about a twentieth of the dominant feature's spread. With He
+initialisation the first layer is then dominated by `mode` and `block`, a
+sawtooth nearly irrelevant to the mode choice, and the argmax flips on noise.
+
+The fix is `ObsNormalizer`, and it belongs HERE rather than in hybridenv: the
+environment's observation contract is consumed by the threshold baselines and
+pinned by tests, so rescaling it there would silently move GreedyThreshold's
+threshold out of QBER units.
+
+Why running mean/variance rather than fixed per-feature ranges: five of the
+six features already have known ranges ([0,1] or [0,2]) and are NOT the
+problem -- the problem feature is QBER, whose useful range is set by
+`e_floor[mode]` and Eve's f_max, i.e. by the preset and the jamming model,
+both of which this study sweeps. A fixed divisor would have to be re-derived
+for every operating point, and the one honest constant (QBER in [0, 0.5])
+buys a factor of two where a factor of thirty is needed. Welford statistics
+gathered from the observations the agent actually sees adapt to the operating
+point without anyone choosing a number.
+
+The fitted normaliser is FROZEN INTO the returned DQNPolicy (see
+`ObsNormalizer.snapshot`), and `DQNPolicy` requires one: a normaliser present
+during training and absent at evaluation is the classic form of this bug and
+produces a mediocre-but-plausible result rather than a crash.
+
 Spec: docs/superpowers/specs/2026-08-17-hybrid-policy-design.md
 """
 
@@ -47,8 +81,8 @@ SEED_STRIDE = 100_000
 N_ACTIONS = 2       # PM and ENT; hybridenv defines nothing else.
 
 __all__ = ["SEED_STRIDE", "N_ACTIONS", "DQNConfig", "QNetwork", "ReplayBuffer",
-           "DQNPolicy", "bellman_target", "epsilon_at", "episode_seed",
-           "training_seed_range", "validate_config", "train"]
+           "ObsNormalizer", "DQNPolicy", "bellman_target", "epsilon_at",
+           "episode_seed", "training_seed_range", "validate_config", "train"]
 
 
 @dataclass
@@ -183,16 +217,108 @@ class ReplayBuffer:
         return self._n
 
 
+class ObsNormalizer:
+    """Per-feature standardisation with statistics gathered by Welford.
+
+    `update` accumulates; `transform` is PURE. That split is deliberate: the
+    only caller that may move the statistics is the training loop, so an
+    agent cannot keep adapting its own input scaling while it is being
+    scored, and two evaluation runs of the same policy cannot differ because
+    of the order they were run in.
+
+    Unfitted (count < 2) it is the identity: mean 0, variance 1. That makes
+    `ObsNormalizer(OBS_DIM)` a usable "no statistics yet" object without a
+    separate identity class that could be passed to DQNPolicy by accident.
+
+    `eps` is added to the VARIANCE before the square root, so a feature that
+    never varied (a constant queue at lam=0, or block progress under the
+    Oracle relaxation, where it is identically 0) standardises to exactly 0
+    instead of 0/0 = nan. It must stay far below the smallest variance that
+    carries signal: `buffer` measures 0.0024 in std, i.e. 5.8e-6 in variance,
+    so 1e-8 leaves it scaled to within 0.1% of unit variance while still
+    catching a true zero.
+
+    `clip` bounds the standardised value. Under full jamming the QBER feature
+    reaches 0.5, some 30 standard deviations above its mean, and a single
+    such slot would otherwise dominate a gradient step; +-5 keeps the whole
+    decision region (the PM threshold sits about 1.4 sigma from the mean)
+    untouched while bounding the tail.
+    """
+
+    def __init__(self, dim=OBS_DIM, clip=5.0, eps=1e-8):
+        self.dim = int(dim)
+        self.clip = float(clip)
+        self.eps = float(eps)
+        self.count = 0
+        self.mean = np.zeros(self.dim)
+        self._m2 = np.zeros(self.dim)     # sum of squared deviations
+
+    def update(self, obs):
+        """Fold one observation into the running statistics (Welford)."""
+        x = np.asarray(obs, dtype=float).reshape(self.dim)
+        self.count += 1
+        delta = x - self.mean
+        self.mean += delta / self.count
+        self._m2 += delta * (x - self.mean)
+
+    @property
+    def var(self):
+        """Population variance, or ones while there is nothing to estimate."""
+        if self.count < 2:
+            return np.ones(self.dim)
+        return self._m2 / self.count
+
+    @property
+    def std(self):
+        return np.sqrt(self.var + self.eps)
+
+    def transform(self, x):
+        """Standardise a single observation or a batch. Never mutates state."""
+        x = np.asarray(x, dtype=float)
+        z = (x - self.mean) / self.std
+        return np.clip(z, -self.clip, self.clip)
+
+    def snapshot(self):
+        """A frozen copy: later training cannot move an issued policy's scaling."""
+        out = ObsNormalizer(self.dim, clip=self.clip, eps=self.eps)
+        out.count = self.count
+        out.mean = self.mean.copy()
+        out._m2 = self._m2.copy()
+        return out
+
+    @property
+    def fitted(self):
+        """True once the statistics are estimated from data rather than assumed."""
+        return self.count >= 2
+
+
 class DQNPolicy(Policy):
-    """Greedy w.r.t. a trained Q-network."""
+    """Greedy w.r.t. a trained Q-network, on the inputs it was trained on.
+
+    `norm` is REQUIRED and has no default. The failure this guards against --
+    a normaliser fitted during training and quietly missing at evaluation --
+    does not raise, it just scores a network on inputs from a distribution it
+    never saw, which looks like a mediocre policy rather than a bug.
+    """
 
     name = "dqn"
 
-    def __init__(self, net):
+    def __init__(self, net, norm):
         self.net = net
+        self.norm = norm
+
+    def q_values(self, obs):
+        """Q(a) for a RAW environment observation.
+
+        The single place normalisation happens at inference. Tests and
+        analysis read Q values through here rather than calling
+        `policy.net.forward(obs)`, which would feed the network raw units and
+        report an argmax the policy would never take.
+        """
+        return self.net.forward(self.norm.transform(obs))[0]
 
     def act(self, obs):
-        return int(np.argmax(self.net.forward(obs)[0]))
+        return int(np.argmax(self.q_values(obs)))
 
 
 def bellman_target(online, target, obs, act, rew, next_obs, done, gamma):
@@ -259,7 +385,17 @@ def train(env, config=None, progress=None):
     trajectory `episodes` times.
 
     Rewards are already in served-messages units (one served message = 1), so
-    no reward normalisation is needed.
+    no reward normalisation is needed. Observations are NOT -- see the module
+    docstring -- so an ObsNormalizer is fitted here and frozen into the
+    returned policy.
+
+    The replay buffer stores RAW observations and normalisation happens at
+    sampling time. Storing pre-normalised rows would freeze each transition
+    at whatever the statistics happened to be when it was collected, so a
+    single batch would mix rows standardised under different scalings; this
+    way every row in a batch is standardised by the same current statistics.
+    Both `obs` and `next_obs` go through the SAME transform, which is what
+    keeps Q(s) and the bootstrap max_a' Q(s') on one input scale.
     """
     cfg = config or DQNConfig()
     validate_config(cfg)
@@ -268,27 +404,37 @@ def train(env, config=None, progress=None):
     target = QNetwork(OBS_DIM, cfg.hidden, N_ACTIONS, seed=cfg.seed)
     target.copy_from(online)
     buf = ReplayBuffer(cfg.capacity, OBS_DIM, seed=cfg.seed)
+    norm = ObsNormalizer(OBS_DIM)
     steps = 0
     for episode in range(cfg.episodes):
         eps = epsilon_at(episode, cfg)
         obs = env.reset(episode_seed(cfg, episode))
+        norm.update(obs)
         done = False
         while not done:
             if rng.rand() < eps:
                 action = int(rng.randint(N_ACTIONS))
             else:
-                action = int(np.argmax(online.forward(obs)[0]))
+                # The greedy branch must see the same scaling the gradient
+                # steps below use, or the behaviour policy and the learned
+                # policy are two different functions of the state.
+                action = int(np.argmax(online.forward(norm.transform(obs))[0]))
             next_obs, reward, done, _ = env.step(action)
+            norm.update(next_obs)
             buf.add(obs, action, reward, next_obs, done)
             obs = next_obs
             if len(buf) >= cfg.warmup:
                 batch = buf.sample(cfg.batch_size)
-                y = bellman_target(online, target, batch[0], batch[1],
-                                   batch[2], batch[3], batch[4], cfg.gamma)
-                online.train_step(batch[0], y, cfg.lr)
+                obs_n = norm.transform(batch[0])
+                next_n = norm.transform(batch[3])
+                y = bellman_target(online, target, obs_n, batch[1],
+                                   batch[2], next_n, batch[4], cfg.gamma)
+                online.train_step(obs_n, y, cfg.lr)
                 steps += 1
                 if steps % cfg.target_sync == 0:
                     target.copy_from(online)
         if progress is not None:
             progress(episode, env.eta, eps)
-    return DQNPolicy(online)
+    # A snapshot, not the live object: nothing that happens to `norm` after
+    # this line may change how an already-issued policy scales its inputs.
+    return DQNPolicy(online, norm.snapshot())

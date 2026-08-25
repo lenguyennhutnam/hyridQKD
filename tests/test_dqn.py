@@ -13,9 +13,9 @@ import unittest
 import numpy as np
 
 import dqn
-from dqn import (SEED_STRIDE, DQNConfig, DQNPolicy, QNetwork, ReplayBuffer,
-                 bellman_target, episode_seed, epsilon_at, train,
-                 training_seed_range)
+from dqn import (SEED_STRIDE, DQNConfig, DQNPolicy, ObsNormalizer, QNetwork,
+                 ReplayBuffer, bellman_target, episode_seed, epsilon_at,
+                 train, training_seed_range)
 from hybridenv import ENT, OBS_DIM, PM, HybridEnv, HybridParams
 from policies import Policy, run_episode
 
@@ -504,34 +504,40 @@ class TestDQNPolicy(unittest.TestCase):
         net = QNetwork(OBS_DIM, 4, 2, seed=0)
         net.w3[:] = 0.0
         net.b3[:] = np.array([1.0, 5.0])
-        self.assertEqual(DQNPolicy(net).act(np.zeros(OBS_DIM)), 1)
+        self.assertEqual(
+            DQNPolicy(net, ObsNormalizer()).act(np.zeros(OBS_DIM)), 1)
 
     def test_it_picks_the_other_action_when_that_one_is_higher(self):
         # `return 1` passes the test above. It does not pass this one.
         net = QNetwork(OBS_DIM, 4, 2, seed=0)
         net.w3[:] = 0.0
         net.b3[:] = np.array([5.0, 1.0])
-        self.assertEqual(DQNPolicy(net).act(np.zeros(OBS_DIM)), 0)
+        self.assertEqual(
+            DQNPolicy(net, ObsNormalizer()).act(np.zeros(OBS_DIM)), 0)
 
     def test_it_returns_a_plain_int_the_environment_accepts(self):
         # np.int64 compares equal to 0/1 but is not what `info["mode"]` and
         # the CSV writers downstream expect.
         net = QNetwork(OBS_DIM, 4, 2, seed=0)
-        self.assertIs(type(DQNPolicy(net).act(np.zeros(OBS_DIM))), int)
+        self.assertIs(
+            type(DQNPolicy(net, ObsNormalizer()).act(np.zeros(OBS_DIM))), int)
 
     def test_it_is_a_policy_the_episode_runner_accepts(self):
-        self.assertIsInstance(DQNPolicy(QNetwork(OBS_DIM, 4, 2, seed=0)),
-                              Policy)
+        self.assertIsInstance(
+            DQNPolicy(QNetwork(OBS_DIM, 4, 2, seed=0), ObsNormalizer()),
+            Policy)
 
     def test_acting_does_not_change_the_network(self):
         net = QNetwork(OBS_DIM, 8, 2, seed=0)
         before = net.w1.copy()
         for _ in range(5):
-            DQNPolicy(net).act(np.random.RandomState(0).randn(OBS_DIM))
+            DQNPolicy(net, ObsNormalizer()).act(
+                np.random.RandomState(0).randn(OBS_DIM))
         np.testing.assert_allclose(net.w1, before)
 
     def test_it_carries_a_label_the_result_tables_can_key_on(self):
-        self.assertTrue(DQNPolicy(QNetwork(OBS_DIM, 4, 2, seed=0)).name)
+        self.assertTrue(
+            DQNPolicy(QNetwork(OBS_DIM, 4, 2, seed=0), ObsNormalizer()).name)
 
 
 class TestTrainingLoop(unittest.TestCase):
@@ -696,7 +702,10 @@ class TestTrainingLoopWiring(unittest.TestCase):
     def _learn(self, good, **kw):
         env = _ChainEnv(good=good)
         policy = train(env, _chain_cfg(**kw))
-        q = policy.net.forward(_ChainEnv(good).reset())[0]
+        # Through q_values, not net.forward: the net is trained on
+        # standardised inputs, so reading it with a raw observation reports
+        # an argmax the policy would never take.
+        q = policy.q_values(_ChainEnv(good).reset())
         return int(np.argmax(q)), float(q[good] - q[1 - good])
 
     def test_it_learns_an_action_whose_payoff_is_one_step_away(self):
@@ -855,6 +864,378 @@ class TestTargetNetworkWeights(unittest.TestCase):
         to_online = np.linalg.norm(self.policy.net.w1 - self.trace[-1][0])
         to_target = np.linalg.norm(self.policy.net.w1 - self.trace[-1][1])
         self.assertLess(to_online, to_target)
+
+
+class _OffScaleEnv:
+    """An environment whose six features live on wildly different scales.
+
+    This is the defect under test, reproduced small enough to assert on. The
+    real HybridEnv's per-feature standard deviations span two orders of
+    magnitude (module docstring of dqn); here they span six by construction,
+    and one feature is CONSTANT so the epsilon guard is exercised by the
+    training loop itself and not only by a unit test on the normaliser.
+
+    Feature 0 is the only one that says anything: it is +SIGNAL when the
+    paying arm is 0 and -SIGNAL when it is 1, and it is deliberately the
+    SMALLEST-amplitude feature in the vector, exactly as QBER is the smallest
+    real feature while being the one the decision turns on.
+    """
+
+    SIGNAL = 0.02          # the informative feature's amplitude
+    LOUD = 500.0           # an irrelevant feature that shouts
+
+    def __init__(self, good, horizon=12, seed=0):
+        self.good = int(good)
+        self.horizon = int(horizon)
+        self.seeds = []
+        self._rng = np.random.RandomState(seed)
+        self._t = 0
+        self._paid = 0.0
+
+    def _obs(self):
+        r = self._rng.randn(OBS_DIM)
+        v = np.zeros(OBS_DIM)
+        v[0] = (self.SIGNAL if self.good == 0 else -self.SIGNAL) + 1e-4 * r[0]
+        v[1] = self.LOUD * r[1]              # loud noise
+        v[2] = 7.0 + self.LOUD * r[2]        # loud noise, offset
+        v[3] = 3.0                           # constant: zero variance
+        v[4] = 1e-6 * r[4]                   # nearly constant
+        v[5] = self._t / self.horizon
+        return v
+
+    def reset(self, seed=None):
+        self.seeds.append(seed)
+        self._rng = np.random.RandomState(0 if seed is None else int(seed))
+        self._t = 0
+        self._paid = 0.0
+        return self._obs()
+
+    def step(self, action):
+        reward = 1.0 if int(action) == self.good else 0.0
+        self._paid += reward
+        self._t += 1
+        return self._obs(), reward, self._t >= self.horizon, {}
+
+    @property
+    def eta(self):
+        return self._paid / self.horizon
+
+
+class _StubNet:
+    """Q = [x0, -x0]: the greedy action is the SIGN of the first feature.
+
+    A real QNetwork cannot be forced to a known decision boundary without
+    solving for its weights, and a boundary that is known exactly is what
+    turns "does inference normalise" from a statistical claim into an
+    equality.
+    """
+
+    def forward(self, x):
+        x = np.atleast_2d(np.asarray(x, dtype=float))
+        return np.column_stack([x[:, 0], -x[:, 0]])
+
+
+class TestObsNormalizer(unittest.TestCase):
+    """The scaling itself. Every test names the mutation it exists to kill."""
+
+    def test_an_unfitted_normaliser_is_the_identity(self):
+        # So ObsNormalizer() is a usable "no statistics yet" object and no
+        # separate identity class exists for DQNPolicy to be handed by
+        # accident.
+        x = np.random.RandomState(0).randn(4, OBS_DIM)
+        np.testing.assert_allclose(
+            ObsNormalizer(OBS_DIM, clip=1e9).transform(x), x)
+
+    def test_it_centres_and_scales_to_the_sample_statistics(self):
+        # Welford must agree with the two-pass formula it replaces; an
+        # off-by-one in the update leaves a plausible but wrong variance.
+        data = np.random.RandomState(1).randn(500, OBS_DIM) * [
+            1.0, 0.02, 300.0, 5.0, 0.5, 7.0] + 3.0
+        norm = ObsNormalizer(OBS_DIM)
+        for row in data:
+            norm.update(row)
+        np.testing.assert_allclose(norm.mean, data.mean(axis=0), rtol=1e-10)
+        np.testing.assert_allclose(norm.var, data.var(axis=0), rtol=1e-8)
+
+    def test_it_equalises_features_that_differ_by_orders_of_magnitude(self):
+        # The defect in one assertion: raw, the loud feature outweighs the
+        # informative one by a factor of 1e4; standardised, they weigh the same.
+        data = np.random.RandomState(2).randn(2000, OBS_DIM) * [
+            0.02, 300.0, 1.0, 1.0, 1.0, 1.0]
+        norm = ObsNormalizer(OBS_DIM)
+        for row in data:
+            norm.update(row)
+        z = norm.transform(data)
+        self.assertGreater(data.std(axis=0)[1] / data.std(axis=0)[0], 1e4)
+        np.testing.assert_allclose(z.std(axis=0), np.ones(OBS_DIM), rtol=0.05)
+
+    def test_a_zero_variance_feature_survives_instead_of_becoming_nan(self):
+        # MUTATION: divide by sqrt(var) with no epsilon. A constant feature
+        # then yields 0/0 = nan, which poisons every weight in the first layer
+        # on the next gradient step and shows up only as a policy that picks
+        # PM forever.
+        data = np.random.RandomState(3).randn(100, OBS_DIM)
+        data[:, 2] = 4.0
+        norm = ObsNormalizer(OBS_DIM)
+        for row in data:
+            norm.update(row)
+        z = norm.transform(data)
+        self.assertTrue(np.isfinite(z).all())
+        np.testing.assert_allclose(z[:, 2], 0.0, atol=1e-12)
+
+    def test_the_epsilon_guard_does_not_squash_a_real_feature(self):
+        # The other half of the same mutation: an epsilon large enough to feel
+        # "safe" (1e-2, say, or a plain +1 on the variance) collapses the QBER
+        # feature -- std 0.0155 in the study -- to nearly a constant, which is
+        # the defect again wearing a guard's clothes.
+        data = np.random.RandomState(4).randn(4000, OBS_DIM) * 0.0155
+        norm = ObsNormalizer(OBS_DIM)
+        for row in data:
+            norm.update(row)
+        z = norm.transform(data)
+        np.testing.assert_allclose(z.std(axis=0), np.ones(OBS_DIM), rtol=0.05)
+
+    def test_it_clips_a_far_outlier_without_touching_the_decision_region(self):
+        # A fully jammed slot puts QBER some 30 sigma out; unclipped, one such
+        # row dominates a batch's gradient.
+        data = np.random.RandomState(5).randn(500, OBS_DIM)
+        norm = ObsNormalizer(OBS_DIM, clip=5.0)
+        for row in data:
+            norm.update(row)
+        far = norm.mean + 40.0 * norm.std
+        np.testing.assert_allclose(norm.transform(far), 5.0)
+        near = norm.mean + 1.4 * norm.std
+        np.testing.assert_allclose(norm.transform(near), 1.4, rtol=1e-6)
+
+    def test_transform_never_moves_the_statistics(self):
+        # MUTATION: a transform() that also updates. The policy would keep
+        # adapting while being scored, and two evaluation runs of the SAME
+        # policy would differ by the order they were run in.
+        norm = ObsNormalizer(OBS_DIM)
+        for row in np.random.RandomState(6).randn(50, OBS_DIM):
+            norm.update(row)
+        before = (norm.count, norm.mean.copy(), norm.var.copy())
+        for _ in range(10):
+            norm.transform(np.random.RandomState(7).randn(OBS_DIM))
+        self.assertEqual(norm.count, before[0])
+        np.testing.assert_allclose(norm.mean, before[1])
+        np.testing.assert_allclose(norm.var, before[2])
+
+    def test_a_snapshot_does_not_move_when_the_original_keeps_learning(self):
+        # MUTATION: return DQNPolicy(online, norm) holding the LIVE object. An
+        # issued policy's scaling would then depend on training that happened
+        # after it was issued.
+        norm = ObsNormalizer(OBS_DIM)
+        for row in np.random.RandomState(8).randn(30, OBS_DIM):
+            norm.update(row)
+        frozen = norm.snapshot()
+        np.testing.assert_allclose(frozen.mean, norm.mean)
+        for row in np.random.RandomState(9).randn(30, OBS_DIM) + 100.0:
+            norm.update(row)
+        self.assertFalse(np.allclose(frozen.mean, norm.mean))
+
+    def test_it_reports_whether_it_was_fitted(self):
+        self.assertFalse(ObsNormalizer(OBS_DIM).fitted)
+        norm = ObsNormalizer(OBS_DIM)
+        norm.update(np.zeros(OBS_DIM))
+        self.assertFalse(norm.fitted)      # one sample estimates no variance
+        norm.update(np.ones(OBS_DIM))
+        self.assertTrue(norm.fitted)
+
+
+class TestInferenceNormalises(unittest.TestCase):
+    """MUTATION: fitted during training, not applied at inference.
+
+    The classic form of this bug. It does not raise; it scores a network on
+    inputs from a distribution it never saw, which reads as a mediocre policy.
+    """
+
+    def _shifted(self, mean0):
+        norm = ObsNormalizer(OBS_DIM)
+        # Two samples straddling mean0 give a fitted normaliser with a known
+        # mean and a nonzero variance, without a loop.
+        norm.update(np.full(OBS_DIM, mean0 - 1.0))
+        norm.update(np.full(OBS_DIM, mean0 + 1.0))
+        return norm
+
+    def test_act_uses_the_normaliser_and_not_the_raw_observation(self):
+        # Q = [x0, -x0], so the action is the sign of feature 0. Raw, the
+        # observation is +0.5 -> action 0. Centred on 1.0 it is negative ->
+        # action 1. A DQNPolicy that skipped the transform answers 0.
+        policy = DQNPolicy(_StubNet(), self._shifted(1.0))
+        self.assertEqual(policy.act(np.full(OBS_DIM, 0.5)), 1)
+
+    def test_the_same_network_answers_the_other_way_on_the_raw_input(self):
+        # Guards the guard: the test above is only evidence if the raw answer
+        # really differs.
+        raw = int(np.argmax(_StubNet().forward(np.full(OBS_DIM, 0.5))[0]))
+        self.assertEqual(raw, 0)
+
+    def test_q_values_are_the_networks_values_at_the_normalised_input(self):
+        norm = self._shifted(1.0)
+        obs = np.full(OBS_DIM, 0.5)
+        np.testing.assert_allclose(
+            DQNPolicy(_StubNet(), norm).q_values(obs),
+            _StubNet().forward(norm.transform(obs))[0])
+
+    def test_a_trained_policy_carries_a_fitted_normaliser(self):
+        # MUTATION: train() returns DQNPolicy(online, ObsNormalizer()) -- an
+        # unfitted normaliser IS the identity, so this is the "absent at
+        # evaluation" bug with a normaliser-shaped object in the slot.
+        policy = train(_OffScaleEnv(good=1), _tiny_cfg(episodes=2))
+        self.assertTrue(policy.norm.fitted)
+        # ... and its statistics are the environment's, not zeros and ones.
+        self.assertGreater(abs(policy.norm.mean[2]), 1.0)   # obs[2] ~ 7 + noise
+        self.assertGreater(policy.norm.std[1], 10.0)        # the loud feature
+
+    def test_the_normaliser_a_policy_carries_changes_what_it_reports(self):
+        # A policy handed a FRESH (identity) normaliser reads the SAME network
+        # at a different point, so the shipped statistics demonstrably reach
+        # the output. Asserted on Q values rather than on the argmax: a tiny
+        # training budget can leave both readings on the same side of the
+        # boundary, which would make an action comparison flaky rather than
+        # sharp.
+        env = _OffScaleEnv(good=0)
+        policy = train(env, _tiny_cfg(episodes=3))
+        probe = np.array([env.reset(1)] + [env.step(0)[0] for _ in range(20)])
+        naive = DQNPolicy(policy.net, ObsNormalizer(OBS_DIM))
+        gaps = [float(np.max(np.abs(policy.q_values(o) - naive.q_values(o))))
+                for o in probe]
+        self.assertGreater(max(gaps), 1e-6)
+
+
+class TestTrainingNormalises(unittest.TestCase):
+    """MUTATION: normalised at inference but raw during training -- and the
+    obs/next_obs half-application.
+
+    Asserted on the arrays that actually reach the network, captured by
+    spying on `bellman_target` and `QNetwork.train_step`, rather than on the
+    outcome: an outcome test would be statistical, and each of these
+    mutations leaves a loop that runs to completion and returns a policy.
+    """
+
+    def _capture(self, env, cfg):
+        seen = {"obs": [], "next": [], "x": []}
+        real_bellman = dqn.bellman_target
+        real_step = QNetwork.train_step
+
+        def spy_bellman(online, target, obs, act, rew, next_obs, done, gamma):
+            seen["obs"].append(np.asarray(obs, dtype=float).copy())
+            seen["next"].append(np.asarray(next_obs, dtype=float).copy())
+            return real_bellman(online, target, obs, act, rew, next_obs,
+                                done, gamma)
+
+        def spy_step(self_net, x, target, lr):
+            seen["x"].append(np.asarray(x, dtype=float).copy())
+            return real_step(self_net, x, target, lr)
+
+        dqn.bellman_target = spy_bellman
+        QNetwork.train_step = spy_step
+        try:
+            policy = train(env, cfg)
+        finally:
+            dqn.bellman_target = real_bellman
+            QNetwork.train_step = real_step
+        return seen, policy
+
+    def setUp(self):
+        self.env = _OffScaleEnv(good=1, horizon=40)
+        cfg = _tiny_cfg(episodes=6, warmup=32, batch_size=16)
+        self.seen, self.policy = self._capture(self.env, cfg)
+        self.assertGreater(len(self.seen["obs"]), 50)
+
+    def _assert_standardised(self, batches, what):
+        # Pooled over every gradient step: each feature must arrive centred
+        # and at unit scale. Raw, feature 1 has std ~500 and feature 2 a mean
+        # of 7, so either half-application is a factor of hundreds out.
+        pooled = np.concatenate(batches, axis=0)
+        self.assertLess(np.abs(pooled.mean(axis=0)).max(), 0.35,
+                        "%s not centred: %s" % (what, pooled.mean(axis=0)))
+        spread = pooled.std(axis=0)
+        for i in (0, 1, 2, 5):      # 3 is constant, 4 is numerical dust
+            self.assertGreater(spread[i], 0.5, "%s feature %d flat: %.4g"
+                               % (what, i, spread[i]))
+            self.assertLess(spread[i], 2.0, "%s feature %d loud: %.4g"
+                            % (what, i, spread[i]))
+
+    def test_the_obs_batch_reaching_the_bellman_target_is_standardised(self):
+        self._assert_standardised(self.seen["obs"], "obs")
+
+    def test_the_next_obs_batch_is_standardised_too(self):
+        # MUTATION: normalise obs but not next_obs. Q(s) and the bootstrap
+        # max Q(s') would then be read off two different input scales, which
+        # is a Bellman equation between two different functions.
+        self._assert_standardised(self.seen["next"], "next_obs")
+
+    def test_the_regression_input_is_the_batch_the_target_was_built_on(self):
+        # MUTATION: normalise for bellman_target but regress on the raw batch,
+        # or the reverse. The target would be Q of one input while the
+        # gradient step moved Q of another.
+        self.assertEqual(len(self.seen["x"]), len(self.seen["obs"]))
+        for i, (x, obs) in enumerate(zip(self.seen["x"], self.seen["obs"])):
+            np.testing.assert_allclose(x, obs, err_msg="step %d" % i)
+
+    def test_the_environment_really_hands_out_off_scale_observations(self):
+        # Guards the guard: if the fixture were already standardised, every
+        # assertion above would pass on an implementation that normalises
+        # nothing at all.
+        env = _OffScaleEnv(good=1, horizon=40)
+        raw = np.array([env.reset(0)] + [env.step(1)[0] for _ in range(200)])
+        self.assertGreater(raw.std(axis=0)[1], 100.0)
+        self.assertGreater(abs(raw.mean(axis=0)[2]), 5.0)
+        self.assertLess(raw.std(axis=0)[0], 0.01)
+
+    def test_the_greedy_branch_of_training_sees_the_same_scaling(self):
+        # MUTATION: normalise the gradient step but act on raw obs while
+        # collecting. The behaviour policy and the learned policy would then
+        # be two different functions of the state, so the buffer would fill
+        # with transitions the agent itself would never generate.
+        calls = []
+        real_forward = QNetwork.forward
+
+        def spy(self_net, x):
+            calls.append(np.asarray(x, dtype=float).copy())
+            return real_forward(self_net, x)
+
+        QNetwork.forward = spy
+        try:
+            train(_OffScaleEnv(good=1, horizon=20),
+                  _tiny_cfg(episodes=3, warmup=10_000, capacity=10_000,
+                            eps_start=0.0, eps_end=0.0))
+        finally:
+            QNetwork.forward = real_forward
+        # warmup is unreachable here, so every forward IS an action choice.
+        single = np.array([c.reshape(-1) for c in calls
+                           if np.asarray(c).reshape(-1).size == OBS_DIM])
+        self.assertGreater(len(single), 20)
+        self.assertLess(np.abs(single[:, 1]).max(), 20.0,
+                        "acting on raw observations: feature 1 reaches %.4g"
+                        % np.abs(single[:, 1]).max())
+
+
+class TestNormalisationMakesTheQuietFeatureUsable(unittest.TestCase):
+    """The end-to-end reason the fix exists.
+
+    _OffScaleEnv's only informative feature has amplitude 0.02 against noise
+    of amplitude 500 -- the study's QBER-against-block situation, exaggerated
+    enough that a millisecond budget can resolve it. An unnormalised agent
+    cannot learn it; a normalised one must.
+    """
+
+    def _learn(self, good):
+        env = _OffScaleEnv(good=good, horizon=25)
+        policy = train(env, _chain_cfg(episodes=60, gamma=0.0))
+        probe = np.array([env.reset(5)]
+                         + [env.step(good)[0] for _ in range(199)])
+        picked = [policy.act(o) for o in probe]
+        return sum(1 for a in picked if a == good) / len(picked)
+
+    def test_it_learns_the_quiet_feature_both_ways_round(self):
+        for good in (0, 1):
+            share = self._learn(good)
+            self.assertGreater(share, 0.9,
+                               "good=%d chose it only %.0f%% of the time"
+                               % (good, 100 * share))
 
 
 if __name__ == "__main__":
