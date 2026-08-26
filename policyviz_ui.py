@@ -16,21 +16,38 @@ Two states this window owes the viewer an explanation for:
   hardware and there is nothing to animate.)
 * **bound** -- the Oracle row is dashed and labelled, in the figure and in the
   scoreboard both. See policyviz's module docstring.
+
+THE PARAMETER DIALOGS
+---------------------
+`ParamsDialog` edits one mode's operating point. It owns no physics: every
+number it produces goes through `policyviz.parse_params`, every name through
+`policyviz.validate_preset_name`, and the fibre it shows is read-only because
+`HybridEnv._setup_modes` overrides it on both modes anyway (see
+`policyviz.SHARED_CHANNEL_FIELDS`).
+
+It is written so that NOTHING in it has to be opened modally to be tested:
+`show()` is the only blocking call, and the window reaches it through the one
+seam `_params_dialog_result`. Every modal in this file -- showerror, showinfo,
+askyesno, askstring -- is reached through the module-level `messagebox` and
+`simpledialog` names so a test can record them instead of waiting for a click
+that will never come. CLAUDE.md records an unattended run hanging eight
+minutes on exactly that.
 """
 
+import dataclasses
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 
+import presets as preset_store  # noqa: E402
 import policyviz  # noqa: E402
 from policies import BufferAwareThreshold, GreedyThreshold  # noqa: E402
-from presets import load_ent_presets, load_presets  # noqa: E402
 
 TICK_MS = 80            # timer period; `speed` sets slots advanced per tick
 TRAIN_POLL_MS = 200
@@ -53,12 +70,199 @@ FIELDS = [("lam", "λ arrivals/slot", 8), ("b_max", "B_max [bits]", 10),
           ("dqn_episodes", "DQN episodes", 8)]
 
 
+class ParamsDialog(tk.Toplevel):
+    """Edit ONE mode's operating point: choose a preset, or type the numbers.
+
+    `result` is (preset name, params dataclass) after OK and None after
+    Cancel -- so a caller that forgets to check it gets None, not a
+    half-applied configuration.
+
+    The three fibre parameters are shown but DISABLED. Both modes ride the
+    same fibre and `HybridEnv._setup_modes` overrides them from the main
+    window on both envs; an editable copy here would let the reader believe
+    they had set a per-mode link that the environment then ignored. They are
+    still written into a saved preset (the dataclass has no hole in it), so a
+    preset saved from this dialog still round-trips through presets.load_*.
+    """
+
+    def __init__(self, master, protocol, preset_name, env, shared):
+        super().__init__(master)
+        self.protocol_name = str(protocol)
+        self.shared = {k: float(v) for k, v in dict(shared).items()}
+        self.table = policyviz.preset_table(self.protocol_name)
+        self.result = None
+        self.title("%s operating point" % self.protocol_name.upper())
+        self.transient(master)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.resizable(False, False)
+
+        frame = ttk.Frame(self, padding=10)
+        frame.pack(fill="both", expand=True)
+        row = 0
+        ttk.Label(frame, text="preset").grid(row=row, column=0, sticky="w")
+        self.preset_var = tk.StringVar(value=str(preset_name))
+        self.preset_box = ttk.Combobox(
+            frame, textvariable=self.preset_var, width=20, state="readonly",
+            values=sorted(self.table))
+        self.preset_box.grid(row=row, column=1, sticky="w")
+        self.preset_box.bind("<<ComboboxSelected>>", self._on_preset)
+        row += 1
+        ttk.Label(frame, text="(choosing a preset refills the fields below; "
+                              "edit them freely afterwards)",
+                  font=("TkDefaultFont", 7), foreground="#666666",
+                  wraplength=300, justify="left"
+                  ).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        self.entries = {}          # editable field -> StringVar
+        self.shared_vars = {}      # read-only fibre field -> StringVar
+        for name, label, is_shared in policyviz.param_fields(
+                self.protocol_name):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w")
+            var = tk.StringVar()
+            entry = ttk.Entry(frame, textvariable=var, width=14)
+            entry.grid(row=row, column=1, sticky="w")
+            if is_shared:
+                entry.state(["disabled"])
+                self.shared_vars[name] = var
+            else:
+                self.entries[name] = var
+            row += 1
+        ttk.Label(frame, text="fibre length, attenuation and optics losses "
+                              "are SHARED by both modes and are set in the "
+                              "main window",
+                  font=("TkDefaultFont", 7), foreground="#8A6D3B",
+                  wraplength=300, justify="left"
+                  ).grid(row=row, column=0, columnspan=2, sticky="w",
+                         pady=(4, 0))
+        row += 1
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(buttons, text="Save as preset…", command=self._save
+                   ).pack(side="left")
+        ttk.Button(buttons, text="Cancel", command=self._cancel
+                   ).pack(side="right")
+        ttk.Button(buttons, text="OK", command=self._ok
+                   ).pack(side="right", padx=4)
+
+        self.fill(env)
+
+    # ------------------------------------------------------------------
+
+    def fill(self, env):
+        """Write `env` into the fields. The fibre always comes from `shared`.
+
+        Filling the fibre from `env` instead would be the quiet way to
+        reintroduce a per-mode channel: a preset carrying odr_losses = 13 dB
+        would display 13 while the environment ran the main window's 0.
+        """
+        data = dataclasses.asdict(env)
+        for name, var in self.entries.items():
+            var.set(policyviz.format_param(data[name]))
+        for name, var in self.shared_vars.items():
+            var.set(policyviz.format_param(self.shared[name]))
+
+    def read_env(self):
+        """The params dataclass the fields currently describe.
+
+        Raises ValueError with a field-named message. Used by BOTH OK and
+        Save as preset, so what gets saved is what the dialog is showing and
+        what OK applies -- never the preset the dialog was opened on.
+        """
+        return policyviz.parse_params(
+            self.protocol_name,
+            {name: var.get() for name, var in self.entries.items()},
+            self.shared)
+
+    def _on_preset(self, *_event):
+        env = self.table.get(self.preset_var.get())
+        if env is not None:
+            self.fill(env)
+
+    def _ok(self):
+        try:
+            env = self.read_env()
+        except ValueError as exc:
+            # The dialog STAYS OPEN: closing it on a bad number would throw
+            # away every other edit the user had made.
+            messagebox.showerror("%s operating point"
+                                 % self.protocol_name.upper(), str(exc))
+            return
+        self.result = (self.preset_var.get(), env)
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+    def _save(self):
+        """Write the CURRENT FIELDS to presets/<name>.json.
+
+        Validated first, so a preset file can never hold numbers the dialog
+        would refuse to apply.
+        """
+        title = "%s operating point" % self.protocol_name.upper()
+        try:
+            env = self.read_env()
+        except ValueError as exc:
+            messagebox.showerror(title, str(exc))
+            return
+        raw = simpledialog.askstring(title, "Save these parameters as preset:",
+                                     parent=self)
+        if raw is None:
+            return                      # the name prompt was cancelled
+        try:
+            name = policyviz.validate_preset_name(raw)
+        except ValueError as exc:
+            messagebox.showerror(title, str(exc))
+            return
+        if name in policyviz.preset_table(self.protocol_name):
+            if not messagebox.askyesno(
+                    title, "Preset %r already exists. Overwrite it?" % name):
+                return
+        try:
+            path = preset_store.save_preset(name, env)
+        except Exception as exc:        # disk full, read-only tree, ...
+            messagebox.showerror(title, "could not save preset: %s" % exc)
+            return
+        # Reload from disk rather than inserting into the copy in hand: that
+        # is the only version that proves the file we just wrote can be read
+        # back, and it is what the chooser must offer without a restart.
+        self.table = policyviz.preset_table(self.protocol_name)
+        self.preset_box.configure(values=sorted(self.table))
+        self.preset_var.set(name)
+        messagebox.showinfo(title, "saved %s" % path)
+
+    def show(self):
+        """Open modally and return `result`. The ONLY blocking call here."""
+        self.grab_set()
+        self.wait_window(self)
+        return self.result
+
+
 class PolicyVizApp(tk.Tk):
     def __init__(self, config=None):
         super().__init__()
         self.title("Hybrid policy visualiser — NUMERIC MODEL (not the stack)")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.config_obj = config or policyviz.VizConfig()
+        # THE EDITED OPERATING POINTS LIVE HERE, one per mode, and nowhere
+        # else. None means "run the named preset as it ships"; a dataclass
+        # means the dialog produced numbers that differ from it. `_read_config`
+        # copies them into the VizConfig it builds, `VizConfig.hybrid_params`
+        # copies them into HybridParams, and `HybridEnv._setup_modes` runs
+        # them -- so a value typed into the dialog reaches the physics by one
+        # path with no branch in it.
+        #
+        # They are normalised back to None by `_set_operating_point` whenever
+        # they match the preset, so `is None` is a reliable "vanilla preset"
+        # test everywhere downstream.
+        self.mode_env = {"pm": self.config_obj.pm_env,
+                         "ent": self.config_obj.ent_env}
         self.session = None
         self._running = False
         self._trainer = None
@@ -124,19 +328,33 @@ class PolicyVizApp(tk.Tk):
             row=row, column=0, columnspan=2, sticky="ew", pady=6)
         row += 1
 
-        ttk.Label(left, text="ENT preset").grid(row=row, column=0, sticky="w")
-        self.ent_preset = tk.StringVar(value=self.config_obj.ent_preset)
-        ent_box = ttk.Combobox(left, textvariable=self.ent_preset, width=16,
-                               state="readonly",
-                               values=sorted(load_ent_presets()))
-        ent_box.grid(row=row, column=1, sticky="w")
+        # OPERATING POINTS. One button per mode, and the button IS the
+        # readout: it carries the preset name and, when the numbers have been
+        # edited away from it, the word "(modified)". A control that only said
+        # "PM parameters…" would leave a reader unable to tell which physics
+        # produced the curve on screen -- which is the whole reason the preset
+        # name used to be visible in a dropdown here.
+        ttk.Label(left, text="operating points",
+                  font=("TkDefaultFont", 9, "bold")
+                  ).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
-        ttk.Label(left, text="PM preset").grid(row=row, column=0, sticky="w")
-        self.pm_preset = tk.StringVar(value=self.config_obj.pm_preset)
-        ttk.Combobox(left, textvariable=self.pm_preset, width=16,
-                     state="readonly", values=sorted(load_presets())
-                     ).grid(row=row, column=1, sticky="w")
+        ttk.Label(left, text="(click to choose a preset or type the "
+                             "parameters; takes effect on Apply)",
+                  font=("TkDefaultFont", 7), foreground="#666666",
+                  wraplength=200, justify="left"
+                  ).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
+        self.preset_var = {"pm": tk.StringVar(value=self.config_obj.pm_preset),
+                           "ent": tk.StringVar(
+                               value=self.config_obj.ent_preset)}
+        self.mode_buttons = {}
+        for protocol in ("pm", "ent"):
+            btn = ttk.Button(left, text=protocol.upper(),
+                             command=lambda m=protocol: self._edit_params(m))
+            btn.grid(row=row, column=0, columnspan=2, sticky="ew", pady=1)
+            self.mode_buttons[protocol] = btn
+            row += 1
+        self._refresh_mode_buttons()
 
         self.entries = {}
         for name, label, width in FIELDS:
@@ -259,6 +477,88 @@ class PolicyVizApp(tk.Tk):
                 out.append(spec)
         return out
 
+    # ------------------------------------------------------------------
+    # operating points
+    # ------------------------------------------------------------------
+
+    def _shared_channel(self):
+        """The fibre BOTH modes ride, as the MAIN WINDOW currently has it.
+
+        Only d_km is on the form; alpha and odr_losses ride along on the
+        config object. A half-typed d_km falls back to the applied value
+        rather than raising: this is called to POPULATE a dialog, and refusing
+        to open it because a box is mid-edit would be a worse answer than
+        showing the link that is actually running.
+        """
+        try:
+            d_km = float(self.entries["d_km"].get().strip())
+        except (ValueError, KeyError):
+            d_km = float(self.config_obj.d_km)
+        return {"d_km": d_km, "alpha": float(self.config_obj.alpha),
+                "odr_losses": float(self.config_obj.odr_losses)}
+
+    def _current_env(self, protocol):
+        """What the dialog for `protocol` should open showing."""
+        env = self.mode_env.get(protocol)
+        if env is not None:
+            return env
+        table = policyviz.preset_table(protocol)
+        name = self.preset_var[protocol].get()
+        return table.get(name) or policyviz.PARAM_CLASSES[protocol]()
+
+    def _set_operating_point(self, protocol, name, env):
+        """Adopt what a dialog returned, and normalise it.
+
+        An env equal to its preset is stored as None. Otherwise every OK --
+        including one on a dialog nobody touched -- would freeze a snapshot of
+        the preset file into the configuration, and the button would go on
+        saying "aurea" while later edits to presets/aurea.json were ignored.
+        """
+        table = policyviz.preset_table(protocol)
+        self.preset_var[protocol].set(name)
+        self.mode_env[protocol] = (
+            env if policyviz.is_modified(env, table.get(name)) else None)
+        self._refresh_mode_buttons()
+
+    def _refresh_mode_buttons(self):
+        for protocol, btn in self.mode_buttons.items():
+            btn.config(text=policyviz.operating_point_label(
+                protocol, self.preset_var[protocol].get(),
+                self.mode_env.get(protocol),
+                policyviz.preset_table(protocol)))
+
+    def _params_dialog_result(self, protocol):
+        """Open the editor modally; (preset name, env) on OK, None on Cancel.
+
+        The ONE seam between this window and a blocking dialog. A test drives
+        `_edit_params` by replacing this method, so nothing in the suite ever
+        has to wait for a click.
+        """
+        dialog = ParamsDialog(self, protocol,
+                              self.preset_var[protocol].get(),
+                              self._current_env(protocol),
+                              self._shared_channel())
+        return dialog.show()
+
+    def _edit_params(self, protocol):
+        """The two operating-point buttons.
+
+        Cancel (a None result) changes NOTHING -- not the preset name, not the
+        parameters, not the status line.
+        """
+        result = self._params_dialog_result(protocol)
+        if result is None:
+            return
+        name, env = result
+        self._set_operating_point(protocol, name, env)
+        # The form has changed but the session has not; every other control
+        # here behaves the same way, and silently running the old physics
+        # under a button that reads "(modified)" would be the worse failure.
+        self._set_status("%s changed — press Apply"
+                         % self.mode_buttons[protocol].cget("text"), "paused")
+
+    # ------------------------------------------------------------------
+
     def _read_config(self):
         specs = []
         for stem in policyviz.SPEC_CHOICES:
@@ -287,8 +587,10 @@ class PolicyVizApp(tk.Tk):
             except ValueError:
                 raise ValueError("%s: %r is not a number" % (label, text))
         return policyviz.VizConfig(
-            specs=tuple(specs), pm_preset=self.pm_preset.get(),
-            ent_preset=self.ent_preset.get(), **values)
+            specs=tuple(specs), pm_preset=self.preset_var["pm"].get(),
+            ent_preset=self.preset_var["ent"].get(),
+            pm_env=self.mode_env.get("pm"), ent_env=self.mode_env.get("ent"),
+            **values)
 
     # ------------------------------------------------------------------
     # actions

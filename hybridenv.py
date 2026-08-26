@@ -189,6 +189,19 @@ class HybridParams:
     # does, so eq (14)'s crossover q* would not exist (spec section 2, #2).
     pm_preset: str = "aurea"
     ent_preset: str = "chapman_lowmu"
+    # EDITED OPERATING POINTS, when the caller has some.
+    #
+    # None means "load the named preset", which is what every caller did
+    # before the visualiser let the parameters be edited, and is still what
+    # eval_hybrid and the CLI do. A `channel.EnvParams` /
+    # `channel.EntEnvParams`
+    # here REPLACES the preset lookup -- the preset NAME is kept alongside it
+    # so labels can still say which preset the values started from.
+    #
+    # The shared fibre is overridden either way (see _setup_modes): an env
+    # handed in here does not get to carry its own link.
+    pm_env: object = None
+    ent_env: object = None
 
 
 class HybridEnv:
@@ -221,12 +234,17 @@ class HybridEnv:
         once and retracted.
         """
         p = self.params
-        pm_env = dataclasses.replace(presets.load_presets()[p.pm_preset],
-                                     d_km=p.d_km, alpha=p.alpha,
+        # An explicitly supplied env wins over the preset name; the channel
+        # override below applies to BOTH paths, which is what stops an edited
+        # operating point from smuggling in its own fibre.
+        pm_base = (p.pm_env if p.pm_env is not None
+                   else presets.load_presets()[p.pm_preset])
+        ent_base = (p.ent_env if p.ent_env is not None
+                    else presets.load_ent_presets()[p.ent_preset])
+        pm_env = dataclasses.replace(pm_base, d_km=p.d_km, alpha=p.alpha,
                                      odr_losses=p.odr_losses)
-        ent_env = dataclasses.replace(
-            presets.load_ent_presets()[p.ent_preset],
-            d_km=p.d_km, alpha=p.alpha, odr_losses=p.odr_losses)
+        ent_env = dataclasses.replace(ent_base, d_km=p.d_km, alpha=p.alpha,
+                                      odr_losses=p.odr_losses)
         d_pm = channel.derive(pm_env, p.n_x)
         d_ent = channel.derive_ent(ent_env, p.n_x)
         # pdc is passed explicitly: KeyParams defaults it, and a preset with a

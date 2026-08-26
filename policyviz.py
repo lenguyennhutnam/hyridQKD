@@ -66,6 +66,7 @@ from dataclasses import dataclass
 
 import channel
 import dqn as dqn_module
+import panelstate
 import plots
 import presets
 from dqn import DQNConfig, training_seed_range
@@ -78,10 +79,14 @@ from policies import (AlwaysENT, AlwaysPM, BufferAwareThreshold,
 
 __all__ = ["BANNER", "SPEC_CHOICES", "TRACK_COLORS",
            "REFERENCE_LINE_SHOW_FRAC", "HIDDEN_LEGEND_COLOR",
-           "HIDDEN_LEGEND_ALPHA", "LEGEND_PICK_RADIUS", "VizConfig",
-           "PolicyRun", "VizSession", "parse_spec", "death_thresholds",
-           "train_dqn", "dqn_label", "draw_panels", "format_scoreboard",
-           "main"]
+           "HIDDEN_LEGEND_ALPHA", "LEGEND_PICK_RADIUS",
+           "SHARED_CHANNEL_FIELDS", "PARAM_CLASSES", "PARAM_RULES",
+           "PARAM_LABELS", "param_fields", "format_param", "parse_params",
+           "strip_channel", "is_modified", "operating_point_label",
+           "preset_table", "validate_preset_name", "resolve_envs",
+           "VizConfig", "PolicyRun", "VizSession", "parse_spec",
+           "death_thresholds", "train_dqn", "dqn_label", "draw_panels",
+           "format_scoreboard", "main"]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DQN_CACHE_DIR = os.path.join(HERE, "logs", "dqn_cache")
@@ -121,6 +126,257 @@ LEGEND_PICK_RADIUS = 5
 
 
 # --------------------------------------------------------------------------
+# operating points: the two modes' physics, editable
+# --------------------------------------------------------------------------
+#
+# A preset NAME is not enough to identify an operating point any more. The
+# window can hand `VizConfig` an `EnvParams`/`EntEnvParams` it edited, so two
+# sessions can carry the same preset name and different physics -- which is
+# why `_cache_key` below hashes VALUES and never the name, and why
+# `operating_point_label` exists to say "(modified)" on screen.
+
+# The three parameters BOTH modes share, because both ride the same fibre.
+#
+# `HybridEnv._setup_modes` overrides them on both envs from the main window's
+# values, so a per-mode copy is not merely redundant -- it is a lie: the
+# dialog would show a link the environment is not simulating. CLAUDE.md
+# records a comparison of two presets carrying different channels having been
+# published once and retracted (PM was handicapped ~20x and the conclusion
+# "ENT matches PM" was wrong). They are therefore displayed READ-ONLY in the
+# dialog, and re-imposed by _setup_modes rather than trusted.
+SHARED_CHANNEL_FIELDS = ("d_km", "alpha", "odr_losses")
+
+PARAM_CLASSES = {"pm": channel.EnvParams, "ent": channel.EntEnvParams}
+
+# field -> (minimum, maximum, minimum is exclusive, maximum is exclusive).
+# None for a bound means unbounded on that side. Anything not listed is only
+# required to be a finite number.
+PARAM_RULES = {
+    "d_km":       (0.0, None, False, False),
+    "alpha":      (0.0, None, False, False),
+    "odr_losses": (0.0, None, False, False),
+    "eta_bob":    (0.0, 1.0, True, False),
+    "eta_a":      (0.0, 1.0, True, False),
+    "pdc":        (0.0, 1.0, False, False),
+    "xi_a":       (0.0, 1.0, False, False),
+    "xi_b":       (0.0, 1.0, False, False),
+    # An "error rate" at or above 1/2 is not an error rate; the finite-key
+    # routines return nothing usable there and the message should say why.
+    "e_det":      (0.0, 0.5, False, True),
+    "e_intr":     (0.0, 0.5, False, True),
+    "dead_us":    (0.0, None, False, False),
+    "coeff":      (0.0, None, True, False),
+    "f_rep":      (0.0, None, True, False),
+    "mu1":        (0.0, None, True, False),
+    "mu2":        (0.0, None, True, False),
+    "mu":         (0.0, None, True, False),
+    # p1 = 1 means no decoy pulses at all, which the 1-decoy bound cannot be
+    # evaluated at.
+    "p1":         (0.0, 1.0, True, True),
+    "qber_sigma": (0.0, None, False, False),
+}
+
+# Short captions for the dialog. Field names alone ("coeff", "xi_a") do not
+# tell a reader what they are looking at.
+PARAM_LABELS = {
+    "d_km": "fibre length d [km]",
+    "alpha": "fibre attenuation alpha [dB/km]",
+    "odr_losses": "optics/receiver losses [dB]",
+    "eta_bob": "eta_bob detector efficiency",
+    "eta_a": "eta_A Alice arm efficiency",
+    "pdc": "dark-count prob / gate",
+    "e_det": "e_det intrinsic optical error",
+    "e_intr": "e_intr intrinsic basis error",
+    "xi_a": "xi_A background prob / pulse",
+    "xi_b": "xi_B background prob / pulse",
+    "dead_us": "detector dead time [us]",
+    "coeff": "dead-time correction coeff",
+    "f_rep": "repetition rate f_rep [Hz]",
+    "mu1": "mu1 signal intensity",
+    "mu2": "mu2 decoy intensity",
+    "mu": "mu mean pairs / pump pulse",
+    "p1": "p1 = P(signal)",
+    "qber_sigma": "QBER jitter sigma",
+}
+
+
+def param_fields(protocol):
+    """[(name, label, is_shared)] for one mode's dialog, in dataclass order."""
+    cls = PARAM_CLASSES[str(protocol)]
+    return [(f.name, PARAM_LABELS.get(f.name, f.name),
+             f.name in SHARED_CHANNEL_FIELDS)
+            for f in dataclasses.fields(cls)]
+
+
+def format_param(value):
+    """How a parameter is written INTO the dialog.
+
+    repr() renders 80000000.0 in full and 1.33e-06 in exponent form; %g keeps
+    every one of them short and round-trips through float() unchanged, which
+    matters because "Save as preset" writes back exactly what the field shows.
+    """
+    return "%g" % float(value)
+
+
+def _check_range(name, label, number):
+    rule = PARAM_RULES.get(name)
+    if rule is None:
+        return
+    lo, hi, lo_open, hi_open = rule
+    if lo is not None and (number <= lo if lo_open else number < lo):
+        raise ValueError("%s: must be %s %g (got %g)"
+                         % (label, "greater than" if lo_open else "at least",
+                            lo, number))
+    if hi is not None and (number >= hi if hi_open else number > hi):
+        raise ValueError("%s: must be %s %g (got %g)"
+                         % (label, "less than" if hi_open else "at most",
+                            hi, number))
+
+
+def _check_consistency(protocol, env):
+    """Cross-field rules a per-field range check cannot see."""
+    if protocol == "pm" and env.mu2 >= env.mu1:
+        # The 1-decoy bound estimates the single-photon yield from the
+        # DIFFERENCE between the two intensities; at mu2 >= mu1 it is solving
+        # the wrong inequality and returns a length that bounds nothing.
+        raise ValueError("mu2 decoy intensity (%g) must be below mu1 signal "
+                         "intensity (%g)" % (env.mu2, env.mu1))
+
+
+def parse_params(protocol, values, shared):
+    """Build one mode's params dataclass from the dialog's text fields.
+
+    `values` is {field: text} as typed; `shared` is {field: number} for the
+    three fibre parameters, taken from the MAIN WINDOW rather than from the
+    dialog (they are shown read-only there). Anything absent from `values`
+    keeps the dataclass default.
+
+    Raises ValueError NAMING THE FIELD, so the window has a message it can put
+    in front of the user instead of a traceback. Nothing is applied anywhere
+    until this returns, which is what keeps a rejected edit from leaving a
+    half-written configuration behind.
+    """
+    cls = PARAM_CLASSES[str(protocol)]
+    known = {f.name for f in dataclasses.fields(cls)}
+    unknown = set(values) - known
+    if unknown:
+        raise ValueError("unknown parameter(s): %s" % sorted(unknown))
+    out = {}
+    for name, label, is_shared in param_fields(protocol):
+        if is_shared:
+            out[name] = float(shared[name])
+            continue
+        if name not in values:
+            continue
+        text = str(values[name]).strip()
+        if not text:
+            raise ValueError("%s: no value given" % label)
+        try:
+            number = float(text)
+        except ValueError:
+            raise ValueError("%s: %r is not a number" % (label, text))
+        if number != number or number in (float("inf"), float("-inf")):
+            raise ValueError("%s: %r is not a finite number" % (label, text))
+        _check_range(name, label, number)
+        out[name] = number
+    env = cls(**out)
+    _check_consistency(protocol, env)
+    return env
+
+
+def strip_channel(env):
+    """`env` as a dict with the three shared fibre fields removed.
+
+    Two operating points are "the same" for labelling purposes when they
+    agree on everything the dialog can actually edit. The fibre is excluded
+    because the dialog shows the MAIN WINDOW's link, which routinely differs
+    from the one the preset file happens to carry (aurea ships
+    odr_losses = 13 dB; the visualiser's default link has 0), and comparing it
+    would report every preset as "modified" the moment it was opened.
+    """
+    data = dataclasses.asdict(env)
+    for name in SHARED_CHANNEL_FIELDS:
+        data.pop(name, None)
+    return data
+
+
+def is_modified(env, preset_env):
+    """Has this operating point been edited away from its preset?"""
+    if env is None or preset_env is None:
+        return False
+    return strip_channel(env) != strip_channel(preset_env)
+
+
+def operating_point_label(protocol, preset_name, env, table):
+    """What the main window's button (and the figure header) says.
+
+    "PM: aurea" when the preset is running unchanged, "PM: aurea (modified)"
+    when it is not. A reader must never be unable to tell which physics
+    produced the curve in front of them, and a bare preset name on an edited
+    configuration is exactly that failure.
+    """
+    tag = str(protocol).upper()
+    name = str(preset_name)
+    preset_env = (table or {}).get(name)
+    if env is not None and (preset_env is None
+                            or is_modified(env, preset_env)):
+        return "%s: %s (modified)" % (tag, name)
+    return "%s: %s" % (tag, name)
+
+
+def preset_table(protocol):
+    """{name: params} for one protocol, read fresh from presets/.
+
+    Read fresh on every call, not cached: "Save as preset" writes a new file
+    and the chooser has to offer it without the app being restarted.
+    """
+    return (presets.load_presets() if str(protocol) == "pm"
+            else presets.load_ent_presets())
+
+
+def validate_preset_name(name, existing=()):
+    """Clean and check a name typed into "Save as preset"; returns it.
+
+    `default` is reserved for the saved panel state, and `presets._load`
+    RAISES if a presets/default.json exists -- so accepting it here would not
+    merely produce a bad preset, it would break every later preset load in the
+    process, including the ones this window needs in order to redraw itself.
+
+    `existing` is accepted so a caller can ask whether it would overwrite; the
+    decision to overwrite is the caller's (the window asks first).
+    """
+    cleaned = str(name or "").strip()
+    if not cleaned:
+        raise ValueError("give the preset a name")
+    if cleaned == panelstate.RESERVED_NAME:
+        raise ValueError("%r is reserved for the saved panel state -- choose "
+                         "another name" % (panelstate.RESERVED_NAME,))
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", cleaned):
+        raise ValueError("preset names may use letters, digits, '_', '-' and "
+                         "'.', and must start with a letter or digit (got %r)"
+                         % (cleaned,))
+    return cleaned
+
+
+def resolve_envs(config):
+    """(pm_env, ent_env) ACTUALLY in force for `config`, fibre included.
+
+    One place resolves "edited env, else named preset", and one place imposes
+    the shared fibre, so the death-threshold lines, the DQN cache key and
+    `HybridEnv._setup_modes` cannot end up describing three slightly different
+    experiments.
+    """
+    pm_env = (config.pm_env if config.pm_env is not None
+              else preset_table("pm")[config.pm_preset])
+    ent_env = (config.ent_env if config.ent_env is not None
+               else preset_table("ent")[config.ent_preset])
+    shared = dict(d_km=float(config.d_km), alpha=float(config.alpha),
+                  odr_losses=float(config.odr_losses))
+    return (dataclasses.replace(pm_env, **shared),
+            dataclasses.replace(ent_env, **shared))
+
+
+# --------------------------------------------------------------------------
 # configuration
 # --------------------------------------------------------------------------
 
@@ -148,6 +404,18 @@ class VizConfig:
     t0_deadline: int = 20
     seed_index: int = 0
     dqn_episodes: int = 20
+    # EDITED OPERATING POINTS. None = "run the named preset as it ships".
+    #
+    # The preset NAME is kept even when an env is present: it is what the
+    # button and the figure header are labelled with, and "aurea (modified)"
+    # tells a reader far more than a bare list of numbers would.
+    #
+    # These are `channel.EnvParams` / `channel.EntEnvParams`, i.e. MUTABLE
+    # dataclasses on a value object. Nothing here ever mutates them in place
+    # -- the dialog builds a fresh one on OK -- because a VizConfig is
+    # compared, replaced and hashed into the DQN cache key.
+    pm_env: object = None
+    ent_env: object = None
 
     def dqn_config(self):
         """The DQNConfig a "dqn" track would train with, or None if unused."""
@@ -168,11 +436,23 @@ class VizConfig:
             t0_deadline=int(self.t0_deadline), horizon=int(self.horizon),
             d_km=float(self.d_km), alpha=float(self.alpha),
             odr_losses=float(self.odr_losses), seed=seed,
-            pm_preset=self.pm_preset, ent_preset=self.ent_preset)
+            pm_preset=self.pm_preset, ent_preset=self.ent_preset,
+            pm_env=self.pm_env, ent_env=self.ent_env)
+
+    def operating_points(self):
+        """(pm label, ent label) as the button and the header say them."""
+        return (operating_point_label("pm", self.pm_preset, self.pm_env,
+                                      preset_table("pm")),
+                operating_point_label("ent", self.ent_preset, self.ent_env,
+                                      preset_table("ent")))
 
 
 def death_thresholds(config):
     """(PM, ENT) death QBER for `config`, in the units panel 2 plots.
+
+    Goes through `resolve_envs`, so an EDITED operating point moves the line
+    with it: a threshold drawn from the preset file while the environment runs
+    edited parameters would tell the reader a dead trace is alive.
 
     Both modes ride the same fibre, so the presets' own d_km/alpha/odr_losses
     are overridden exactly as `HybridEnv._setup_modes` overrides them --
@@ -183,12 +463,7 @@ def death_thresholds(config):
     Costs ~25 finite-key evaluations per mode; call it once per session, not
     once per frame.
     """
-    pm_env = dataclasses.replace(presets.load_presets()[config.pm_preset],
-                                 d_km=config.d_km, alpha=config.alpha,
-                                 odr_losses=config.odr_losses)
-    ent_env = dataclasses.replace(
-        presets.load_ent_presets()[config.ent_preset], d_km=config.d_km,
-        alpha=config.alpha, odr_losses=config.odr_losses)
+    pm_env, ent_env = resolve_envs(config)
     return (channel.death_qber(pm_env, int(config.n_x)),
             channel.death_qber_ent(ent_env, int(config.n_x)))
 
@@ -392,6 +667,10 @@ class VizSession:
                 agent, HybridEnv(self.params, self.eve_params), self.seed,
                 label=label, color=TRACK_COLORS[i % len(TRACK_COLORS)]))
         self._assert_shared_weather()
+        # Resolved ONCE, at construction, from the same `resolve_envs` the
+        # environment and the cache key use -- so the label on screen cannot
+        # describe one operating point while the traces come from another.
+        self.pm_label, self.ent_label = self.config.operating_points()
         self.death_pm, self.death_ent = death_thresholds(self.config)
         # WHICH QBER TRACES ARE SWITCHED OFF, by display name.
         #
@@ -502,14 +781,24 @@ def _cache_key(config, cfg):
 
     An agent trained at `chapman_lowmu` is a different agent from one trained
     at `ent_advanced` -- those two presets give the study opposite answers --
-    so the preset has to be in the key or flipping the dropdown would silently
-    reuse the wrong weights.
+    so the operating point has to be in the key or flipping the chooser would
+    silently reuse the wrong weights.
+
+    THE KEY IS BUILT FROM VALUES, NOT FROM PRESET NAMES. Once the parameters
+    are editable a name no longer identifies an operating point: two runs can
+    both say "ent_advanced" and differ in mu, and a cache keyed on the name
+    would hand back an agent trained on the other physics -- with a perfectly
+    plausible-looking curve and nothing on screen to say so. `resolve_envs`
+    returns exactly what `HybridEnv._setup_modes` will build from, shared
+    fibre included, so the key covers every number the environment can see.
     """
+    pm_env, ent_env = resolve_envs(config)
     payload = {
         "episodes": int(cfg.episodes), "seed": int(cfg.seed),
         "hidden": int(cfg.hidden), "lr": float(cfg.lr),
         "gamma": float(cfg.gamma), "batch": int(cfg.batch_size),
-        "pm_preset": config.pm_preset, "ent_preset": config.ent_preset,
+        "pm_env": dataclasses.asdict(pm_env),
+        "ent_env": dataclasses.asdict(ent_env),
         "lam": float(config.lam), "b_max": int(config.b_max),
         "horizon": int(config.horizon), "n_x": int(config.n_x),
         "d_km": float(config.d_km), "alpha": float(config.alpha),
@@ -746,10 +1035,14 @@ def draw_panels(fig, session, title=None):
     ax_eta.set_ylim(0.0, 1.02)
     ax_eta.set_xlim(0, horizon)
 
-    head = title or ("%s   ent=%s  λ=%.2f  B_max=%.3g  n_X=%.0e  seed=%d"
-                     % (BANNER.split("—")[0].strip(), session.config.ent_preset,
-                        session.params.lam, session.params.b_max,
-                        session.params.n_x, session.seed))
+    # The operating-point labels, not the bare preset names: an edited
+    # configuration that printed "ent=ent_advanced" would put a figure in a
+    # thesis under the name of physics it was not run with.
+    head = title or ("%s   %s  %s  λ=%.2f  B_max=%.3g  n_X=%.0e  seed=%d"
+                     % (BANNER.split("—")[0].strip(), session.pm_label,
+                        session.ent_label, session.params.lam,
+                        session.params.b_max, session.params.n_x,
+                        session.seed))
     fig.suptitle(head, fontsize=8, color=plots.NAVY, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.965))
     return fig

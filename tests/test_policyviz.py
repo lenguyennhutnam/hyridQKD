@@ -45,14 +45,36 @@ class _RecordingMessagebox:
     place hangs any unattended run that trips an error path.
     """
 
-    def __init__(self, sink):
+    def __init__(self, sink, answer=True):
         self._sink = sink
+        self.answer = answer          # what askyesno returns
 
     def showerror(self, title, message, **kw):
         self._sink.append(("error", title, message))
 
     def showinfo(self, title, message, **kw):
         self._sink.append(("info", title, message))
+
+    def askyesno(self, title, message, **kw):
+        self._sink.append(("askyesno", title, message))
+        return self.answer
+
+
+class _RecordingSimpledialog:
+    """Stands in for tkinter.simpledialog: answers instead of blocking.
+
+    askstring is modal in exactly the way showerror is, and "Save as preset"
+    reaches it on the happy path -- so an unstubbed one would hang the suite
+    on a passing test rather than a failing one.
+    """
+
+    def __init__(self, sink, answer=None):
+        self._sink = sink
+        self.answer = answer
+
+    def askstring(self, title, prompt, **kw):
+        self._sink.append(("askstring", title, prompt))
+        return self.answer
 
 
 # Short enough to keep the suite quick, long enough that Eve leaves the QUIET
@@ -1550,3 +1572,713 @@ class TestTheQberVisibilityCheckboxGroup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+# ==========================================================================
+# EDITABLE OPERATING POINTS
+#
+# The preset chooser used to be the whole story: a name in a dropdown, and
+# the physics behind it fixed on disk. Now the numbers can be typed, which
+# opens three ways for the window to be quietly wrong -- each has a class
+# below, and each of those has at least one test that goes red when the
+# property is removed (see the mutation table in the task report):
+#
+#   * the edits are COLLECTED but never REACH the environment, so the run
+#     shows the old preset under a button that says "modified";
+#   * the DQN cache is keyed on the preset NAME, so an agent trained on the
+#     old mu is silently reused for the new one and the curve looks fine;
+#   * a per-mode fibre reaches _setup_modes, which is the trap CLAUDE.md
+#     records having been published once and retracted.
+# ==========================================================================
+
+
+def _ent_env(**kw):
+    """ent_advanced with the visualiser's own fibre, plus overrides."""
+    base = dataclasses.replace(presets.load_ent_presets()["ent_advanced"],
+                               d_km=55.0, alpha=0.2, odr_losses=0.0)
+    return dataclasses.replace(base, **kw)
+
+
+def _pm_env(**kw):
+    base = dataclasses.replace(presets.load_presets()["aurea"],
+                               d_km=55.0, alpha=0.2, odr_losses=0.0)
+    return dataclasses.replace(base, **kw)
+
+
+class TestEditedParametersReachTheEnvironment(unittest.TestCase):
+    """Collecting an edit and running it are two different things.
+
+    A window that stores the numbers, labels its button "(modified)" and then
+    builds the environment from the preset file would look completely correct
+    on screen and report the wrong physics.
+    """
+
+    def test_an_edited_ent_parameter_changes_the_ent_physics(self):
+        plain = HybridEnv(small_config().hybrid_params())
+        edited = HybridEnv(small_config(
+            ent_env=_ent_env(mu=0.015)).hybrid_params())
+        self.assertNotEqual(plain.sifted_per_slot[ENT],
+                            edited.sifted_per_slot[ENT])
+        self.assertNotAlmostEqual(plain.error_floor[ENT],
+                                  edited.error_floor[ENT], places=4)
+
+    def test_an_edited_pm_parameter_changes_the_pm_physics(self):
+        plain = HybridEnv(small_config().hybrid_params())
+        edited = HybridEnv(small_config(
+            pm_env=_pm_env(eta_bob=0.05)).hybrid_params())
+        self.assertNotEqual(plain.sifted_per_slot[PM],
+                            edited.sifted_per_slot[PM])
+
+    def test_editing_one_mode_leaves_the_other_alone(self):
+        plain = HybridEnv(small_config().hybrid_params())
+        edited = HybridEnv(small_config(
+            ent_env=_ent_env(mu=0.015)).hybrid_params())
+        self.assertEqual(plain.sifted_per_slot[PM], edited.sifted_per_slot[PM])
+
+    def test_an_env_equal_to_the_preset_reproduces_the_preset_run(self):
+        # The normalisation the window relies on: OK-ing an untouched dialog
+        # must not perturb anything.
+        plain = HybridEnv(small_config().hybrid_params())
+        same = HybridEnv(small_config(ent_env=_ent_env(),
+                                      pm_env=_pm_env()).hybrid_params())
+        self.assertEqual(plain.sifted_per_slot, same.sifted_per_slot)
+        self.assertEqual(plain.error_floor, same.error_floor)
+
+    def test_no_env_still_loads_the_named_preset(self):
+        # Backwards compatibility: every caller that predates this feature
+        # passes preset names only.
+        from hybridenv import HybridParams
+        env = HybridEnv(HybridParams(seed=0))
+        self.assertEqual(env.sifted_per_slot, (69422, 3485))
+
+    def test_the_session_runs_the_edited_operating_point(self):
+        # End to end through VizSession, not just HybridParams: the config
+        # has to carry the env all the way into the runs.
+        session = VizSession(small_config(specs=("always-ent",),
+                                          ent_env=_ent_env(mu=0.015)))
+        self.assertEqual(session.runs[0].env.sifted_per_slot[ENT],
+                         HybridEnv(small_config(ent_env=_ent_env(mu=0.015))
+                                   .hybrid_params()).sifted_per_slot[ENT])
+
+    def test_the_death_threshold_follows_the_edit(self):
+        # Panel 2's line is what a trace is read AGAINST. Drawing it from the
+        # preset file while the run uses edited parameters would show a dead
+        # trace sitting comfortably under a threshold that does not apply.
+        plain = death_thresholds(small_config())[0]
+        edited = death_thresholds(small_config(
+            pm_env=_pm_env(mu1=0.5, mu2=0.1, p1=0.7)))[0]
+        self.assertNotAlmostEqual(plain, edited, places=4)
+
+
+class TestTheSharedFibreIsNeverPerMode(unittest.TestCase):
+    """Both modes ride the SAME fibre.
+
+    CLAUDE.md records a comparison of two presets carrying different channels
+    being published once and retracted: PM was handicapped ~20x and the
+    conclusion "ENT matches PM" was wrong. Making the parameters editable
+    reopens that door, so it is nailed shut in three places -- the dialog
+    disables the fields, resolve_envs re-imposes the main window's link, and
+    _setup_modes overrides whatever it is handed.
+    """
+
+    def test_a_per_mode_fibre_in_an_edited_env_is_overridden(self):
+        honest = HybridEnv(small_config(pm_env=_pm_env()).hybrid_params())
+        smuggled = HybridEnv(small_config(
+            pm_env=_pm_env(d_km=0.0, alpha=0.0,
+                           odr_losses=0.0)).hybrid_params())
+        self.assertEqual(honest.sifted_per_slot, smuggled.sifted_per_slot)
+
+    def test_it_is_the_main_windows_fibre_that_wins(self):
+        near = HybridEnv(small_config(
+            d_km=0.0, pm_env=_pm_env(d_km=200.0)).hybrid_params())
+        far = HybridEnv(small_config(
+            d_km=200.0, pm_env=_pm_env(d_km=0.0)).hybrid_params())
+        self.assertGreater(near.sifted_per_slot[PM], far.sifted_per_slot[PM])
+
+    def test_resolve_envs_stamps_the_configs_link_on_both_modes(self):
+        config = small_config(d_km=17.0, pm_env=_pm_env(d_km=1.0),
+                              ent_env=_ent_env(d_km=2.0))
+        pm_env, ent_env = policyviz.resolve_envs(config)
+        for env in (pm_env, ent_env):
+            self.assertEqual(env.d_km, 17.0)
+            self.assertEqual(env.alpha, config.alpha)
+            self.assertEqual(env.odr_losses, config.odr_losses)
+
+    def test_a_shared_field_typed_into_the_form_is_ignored(self):
+        # parse_params takes the fibre from `shared`, never from the fields,
+        # so even a disabled entry that somehow got edited cannot leak.
+        env = policyviz.parse_params(
+            "pm", {"mu1": "0.29", "d_km": "999"},
+            {"d_km": 4.0, "alpha": 0.2, "odr_losses": 0.0})
+        self.assertEqual(env.d_km, 4.0)
+
+    def test_the_shared_fields_are_named_as_shared(self):
+        for protocol in ("pm", "ent"):
+            shared = {n for n, _, is_shared
+                      in policyviz.param_fields(protocol) if is_shared}
+            self.assertEqual(shared, set(policyviz.SHARED_CHANNEL_FIELDS))
+
+
+class TestTheDqnCacheFollowsTheValues(unittest.TestCase):
+    """Trap (a). A preset name no longer identifies an operating point.
+
+    Two runs can both say "ent_advanced" and differ in mu; a cache keyed on
+    the name hands back an agent trained on the other physics, and the curve
+    it draws looks entirely plausible.
+    """
+
+    def setUp(self):
+        self.cache = tempfile.mkdtemp()
+        self.config = small_config(specs=("dqn",), horizon=60, dqn_episodes=2)
+
+    def tearDown(self):
+        shutil.rmtree(self.cache, ignore_errors=True)
+
+    def test_editing_a_parameter_under_the_same_name_is_a_different_agent(self):
+        policyviz.train_dqn(self.config, cache_dir=self.cache)
+        edited = dataclasses.replace(self.config, ent_env=_ent_env(mu=0.015))
+        self.assertEqual(edited.ent_preset, self.config.ent_preset)
+        _, cached = policyviz.train_dqn(edited, cache_dir=self.cache)
+        self.assertFalse(cached, "an edited operating point reused the agent "
+                                 "trained on the preset's own parameters")
+
+    def test_editing_a_pm_parameter_is_a_different_agent_too(self):
+        policyviz.train_dqn(self.config, cache_dir=self.cache)
+        edited = dataclasses.replace(self.config, pm_env=_pm_env(eta_bob=0.1))
+        _, cached = policyviz.train_dqn(edited, cache_dir=self.cache)
+        self.assertFalse(cached)
+
+    def test_the_same_values_are_the_same_agent_however_they_arrived(self):
+        # The other half of "keyed on values": an env that merely restates
+        # the preset must NOT force a retrain, or every OK on an untouched
+        # dialog would cost the user a training run.
+        policyviz.train_dqn(self.config, cache_dir=self.cache)
+        restated = dataclasses.replace(self.config, pm_env=_pm_env(),
+                                       ent_env=_ent_env())
+        _, cached = policyviz.train_dqn(restated, cache_dir=self.cache)
+        self.assertTrue(cached)
+
+    def test_the_key_covers_every_editable_field(self):
+        # A whitelist of "interesting" fields would rot the moment a field is
+        # added to EnvParams. Every one of them must move the key.
+        cfg = self.config.dqn_config()
+        base = policyviz._cache_key(self.config, cfg)
+        for name, _label, is_shared in policyviz.param_fields("ent"):
+            if is_shared:
+                continue
+            value = getattr(_ent_env(), name)
+            bumped = dataclasses.replace(self.config,
+                                         ent_env=_ent_env(**{name: value * 2}))
+            self.assertNotEqual(policyviz._cache_key(bumped, cfg), base,
+                                "%s does not reach the cache key" % name)
+
+
+class TestParsingTheParameterFields(unittest.TestCase):
+    """Bad input must produce a message, never a traceback and never a
+    half-applied configuration."""
+
+    SHARED = {"d_km": 55.0, "alpha": 0.2, "odr_losses": 0.0}
+
+    def _parse(self, protocol, **values):
+        return policyviz.parse_params(protocol, values, self.SHARED)
+
+    def test_an_empty_field_is_refused_by_name(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._parse("ent", mu="")
+        self.assertIn("mu", str(ctx.exception))
+
+    def test_text_is_refused_by_name(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._parse("ent", mu="quite a lot")
+        self.assertIn("quite a lot", str(ctx.exception))
+
+    def test_a_negative_intensity_is_refused(self):
+        with self.assertRaises(ValueError):
+            self._parse("ent", mu="-0.01")
+
+    def test_an_efficiency_above_one_is_refused(self):
+        with self.assertRaises(ValueError):
+            self._parse("ent", eta_a="1.5")
+
+    def test_a_zero_efficiency_is_refused(self):
+        with self.assertRaises(ValueError):
+            self._parse("ent", eta_bob="0")
+
+    def test_an_error_rate_at_one_half_is_refused(self):
+        # h2(0.5) = 1: there is no key there and no message worth sending.
+        with self.assertRaises(ValueError):
+            self._parse("pm", e_det="0.5")
+
+    def test_infinity_is_refused(self):
+        with self.assertRaises(ValueError):
+            self._parse("ent", f_rep="inf")
+
+    def test_a_decoy_at_or_above_the_signal_is_refused(self):
+        # The 1-decoy bound reads the single-photon yield off the DIFFERENCE
+        # between the intensities; at mu2 >= mu1 it bounds nothing.
+        with self.assertRaises(ValueError) as ctx:
+            self._parse("pm", mu1="0.1", mu2="0.2")
+        self.assertIn("mu2", str(ctx.exception))
+        with self.assertRaises(ValueError):
+            self._parse("pm", mu1="0.1", mu2="0.1")
+
+    def test_an_unknown_field_is_refused(self):
+        with self.assertRaises(ValueError):
+            self._parse("ent", not_a_parameter="1")
+
+    def test_a_good_set_of_values_survives_verbatim(self):
+        env = self._parse("ent", mu="0.0125", eta_a="0.81")
+        self.assertAlmostEqual(env.mu, 0.0125)
+        self.assertAlmostEqual(env.eta_a, 0.81)
+
+    def test_every_preset_round_trips_through_the_dialogs_formatting(self):
+        # "Save as preset" writes what the fields show, so a preset that does
+        # not survive being displayed would be silently rewritten on save.
+        for protocol, table in (("pm", presets.load_presets()),
+                                ("ent", presets.load_ent_presets())):
+            for name, env in table.items():
+                values = {f: policyviz.format_param(getattr(env, f))
+                          for f, _l, sh in policyviz.param_fields(protocol)
+                          if not sh}
+                shared = {f: getattr(env, f)
+                          for f in policyviz.SHARED_CHANNEL_FIELDS}
+                self.assertEqual(
+                    policyviz.parse_params(protocol, values, shared), env,
+                    "%s preset %s did not round-trip" % (protocol, name))
+
+
+class TestPresetNameValidation(unittest.TestCase):
+    def test_the_reserved_name_is_refused(self):
+        # presets._load RAISES if presets/default.json exists, so accepting
+        # this would not make a bad preset -- it would break every later
+        # preset load in the process, this window's own redraws included.
+        with self.assertRaises(ValueError):
+            policyviz.validate_preset_name("default")
+
+    def test_an_empty_name_is_refused(self):
+        for bad in ("", "   ", None):
+            with self.assertRaises(ValueError):
+                policyviz.validate_preset_name(bad)
+
+    def test_a_path_separator_is_refused(self):
+        for bad in ("../aurea", "a/b", "a\\b"):
+            with self.assertRaises(ValueError):
+                policyviz.validate_preset_name(bad)
+
+    def test_surrounding_space_is_trimmed(self):
+        self.assertEqual(policyviz.validate_preset_name("  my_point "),
+                         "my_point")
+
+    def test_ordinary_names_pass(self):
+        for good in ("my_point", "ent-v2", "run.3", "A1"):
+            self.assertEqual(policyviz.validate_preset_name(good), good)
+
+
+class TestTheOperatingPointLabel(unittest.TestCase):
+    """The button, and the figure header, must never hide an edit."""
+
+    def setUp(self):
+        self.table = presets.load_ent_presets()
+
+    def test_an_unedited_preset_shows_its_name(self):
+        self.assertEqual(
+            policyviz.operating_point_label("ent", "ent_advanced", None,
+                                            self.table),
+            "ENT: ent_advanced")
+
+    def test_an_env_equal_to_the_preset_is_not_modified(self):
+        self.assertEqual(
+            policyviz.operating_point_label("ent", "ent_advanced", _ent_env(),
+                                            self.table),
+            "ENT: ent_advanced")
+
+    def test_an_edited_env_is_marked(self):
+        label = policyviz.operating_point_label(
+            "ent", "ent_advanced", _ent_env(mu=0.015), self.table)
+        self.assertIn("ent_advanced", label)
+        self.assertIn("modified", label)
+
+    def test_the_shared_fibre_alone_is_not_an_edit(self):
+        # The dialog shows the MAIN WINDOW's link, which routinely differs
+        # from the one the preset file ships (aurea has 13 dB of optics
+        # losses; the visualiser's default link has none). Counting that as
+        # an edit would mark every preset "modified" on sight.
+        label = policyviz.operating_point_label(
+            "pm", "aurea", _pm_env(d_km=999.0, odr_losses=1.0),
+            presets.load_presets())
+        self.assertNotIn("modified", label)
+
+    def test_a_config_reports_both_of_its_operating_points(self):
+        pm, ent = small_config(ent_env=_ent_env(mu=0.015)).operating_points()
+        self.assertEqual(pm, "PM: aurea")
+        self.assertIn("modified", ent)
+
+    def test_the_figure_header_names_both_operating_points(self):
+        session = VizSession(small_config(specs=("always-pm",),
+                                          ent_env=_ent_env(mu=0.015)))
+        fig = Figure(figsize=(9, 8))
+        FigureCanvasAgg(fig)
+        draw_panels(fig, session)
+        head = fig._suptitle.get_text()
+        self.assertIn("PM: aurea", head)
+        self.assertIn("ENT: ent_advanced (modified)", head)
+
+
+class TestTheParameterDialog(unittest.TestCase):
+    """The editor itself. Nothing here is opened modally: `show()` is the
+    only blocking call and no test calls it."""
+
+    def setUp(self):
+        try:
+            import policyviz_ui
+        except Exception as exc:                  # pragma: no cover
+            self.skipTest("tkinter/matplotlib unavailable: %s" % exc)
+        self.ui = policyviz_ui
+        self.dialogs = []
+        self._real_messagebox = policyviz_ui.messagebox
+        self._real_simpledialog = policyviz_ui.simpledialog
+        policyviz_ui.messagebox = _RecordingMessagebox(self.dialogs)
+        policyviz_ui.simpledialog = _RecordingSimpledialog(self.dialogs)
+        try:
+            self.root = policyviz_ui.tk.Tk()
+        except Exception as exc:                  # pragma: no cover
+            policyviz_ui.messagebox = self._real_messagebox
+            policyviz_ui.simpledialog = self._real_simpledialog
+            self.skipTest("cannot create Tk window: %s" % exc)
+        self.root.withdraw()
+        self.shared = {"d_km": 55.0, "alpha": 0.2, "odr_losses": 0.0}
+
+    def tearDown(self):
+        self.ui.messagebox = self._real_messagebox
+        self.ui.simpledialog = self._real_simpledialog
+        root = getattr(self, "root", None)
+        if root is not None:
+            root.update_idletasks()
+            root.destroy()
+
+    def _dialog(self, protocol="ent", name="ent_advanced", env=None):
+        table = policyviz.preset_table(protocol)
+        dialog = self.ui.ParamsDialog(self.root, protocol, name,
+                                      env if env is not None else table[name],
+                                      self.shared)
+        dialog.withdraw()
+        return dialog
+
+    def test_it_shows_the_presets_actual_parameters(self):
+        dialog = self._dialog()
+        self.assertEqual(float(dialog.entries["mu"].get()),
+                         presets.load_ent_presets()["ent_advanced"].mu)
+
+    def test_choosing_a_preset_refills_the_fields(self):
+        dialog = self._dialog()
+        dialog.preset_var.set("chapman_lowmu")
+        dialog._on_preset()
+        self.assertEqual(float(dialog.entries["mu"].get()),
+                         presets.load_ent_presets()["chapman_lowmu"].mu)
+
+    def test_the_fibre_fields_are_shown_but_not_editable(self):
+        dialog = self._dialog()
+        self.assertEqual(set(dialog.shared_vars),
+                         set(policyviz.SHARED_CHANNEL_FIELDS))
+        for name in policyviz.SHARED_CHANNEL_FIELDS:
+            self.assertNotIn(name, dialog.entries)
+            self.assertEqual(float(dialog.shared_vars[name].get()),
+                             self.shared[name])
+
+    def test_the_fibre_shown_is_the_main_windows_not_the_presets(self):
+        dialog = self._dialog("pm", "aurea")
+        self.assertEqual(presets.load_presets()["aurea"].odr_losses, 13.0)
+        self.assertEqual(float(dialog.shared_vars["odr_losses"].get()), 0.0)
+
+    def test_ok_returns_what_the_fields_currently_show(self):
+        dialog = self._dialog()
+        dialog.entries["mu"].set("0.015")
+        dialog._ok()
+        name, env = dialog.result
+        self.assertEqual(name, "ent_advanced")
+        self.assertAlmostEqual(env.mu, 0.015)
+
+    def test_cancel_returns_nothing_at_all(self):
+        dialog = self._dialog()
+        dialog.entries["mu"].set("0.015")
+        dialog._cancel()
+        self.assertIsNone(dialog.result)
+
+    def test_the_window_manager_close_button_is_wired(self):
+        # Without this the [x] destroys the dialog with `result` never set
+        # and no way to tell a close from an OK.
+        dialog = self._dialog()
+        self.assertTrue(dialog.protocol("WM_DELETE_WINDOW"))
+
+    def test_a_bad_number_reports_and_leaves_the_dialog_open(self):
+        dialog = self._dialog()
+        dialog.entries["mu"].set("banana")
+        dialog._ok()
+        self.assertIsNone(dialog.result)
+        self.assertTrue(dialog.winfo_exists(),
+                        "the dialog closed on a bad number, throwing away "
+                        "every other edit in it")
+        self.assertTrue([d for d in self.dialogs if d[0] == "error"])
+
+    def test_a_bad_number_does_not_half_apply_the_other_fields(self):
+        dialog = self._dialog()
+        dialog.entries["eta_a"].set("0.5")
+        dialog.entries["mu"].set("banana")
+        dialog._ok()
+        self.assertIsNone(dialog.result)
+
+
+class TestSavingAPreset(unittest.TestCase):
+    """"Save as preset" must write WHAT THE FIELDS SHOW.
+
+    Writing the preset the dialog was opened on would produce a file that
+    looks saved, loads cleanly and contains the wrong numbers -- with nothing
+    on screen to say so.
+
+    presets/ is redirected to a COPY for the whole class: a test that wrote
+    into the real directory could overwrite an operating point the study
+    depends on.
+    """
+
+    def setUp(self):
+        try:
+            import policyviz_ui
+        except Exception as exc:                  # pragma: no cover
+            self.skipTest("tkinter/matplotlib unavailable: %s" % exc)
+        self.ui = policyviz_ui
+        self.tmp = tempfile.mkdtemp()
+        self.preset_dir = os.path.join(self.tmp, "presets")
+        shutil.copytree(presets.PRESET_DIR, self.preset_dir)
+        self._real_dir = presets.PRESET_DIR
+        presets.PRESET_DIR = self.preset_dir
+        self.dialogs = []
+        self._real_messagebox = policyviz_ui.messagebox
+        self._real_simpledialog = policyviz_ui.simpledialog
+        self.messagebox = _RecordingMessagebox(self.dialogs)
+        self.simpledialog = _RecordingSimpledialog(self.dialogs, "unit_point")
+        policyviz_ui.messagebox = self.messagebox
+        policyviz_ui.simpledialog = self.simpledialog
+        try:
+            self.root = policyviz_ui.tk.Tk()
+        except Exception as exc:                  # pragma: no cover
+            self._restore()
+            self.skipTest("cannot create Tk window: %s" % exc)
+        self.root.withdraw()
+        self.dialog = policyviz_ui.ParamsDialog(
+            self.root, "ent", "ent_advanced",
+            presets.load_ent_presets()["ent_advanced"],
+            {"d_km": 55.0, "alpha": 0.2, "odr_losses": 0.0})
+        self.dialog.withdraw()
+
+    def _restore(self):
+        presets.PRESET_DIR = self._real_dir
+        self.ui.messagebox = self._real_messagebox
+        self.ui.simpledialog = self._real_simpledialog
+
+    def tearDown(self):
+        self._restore()
+        root = getattr(self, "root", None)
+        if root is not None:
+            root.update_idletasks()
+            root.destroy()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _saved(self, name="unit_point"):
+        return presets.load_ent_presets()[name]
+
+    def test_it_saves_the_edited_values_not_the_presets(self):
+        original = presets.load_ent_presets()["ent_advanced"].mu
+        self.dialog.entries["mu"].set("0.0123")
+        self.dialog._save()
+        self.assertAlmostEqual(self._saved().mu, 0.0123)
+        self.assertNotAlmostEqual(self._saved().mu, original)
+
+    def test_it_saves_every_edited_field(self):
+        self.dialog.entries["mu"].set("0.0123")
+        self.dialog.entries["eta_a"].set("0.55")
+        self.dialog._save()
+        saved = self._saved()
+        self.assertAlmostEqual(saved.mu, 0.0123)
+        self.assertAlmostEqual(saved.eta_a, 0.55)
+
+    def test_the_saved_preset_round_trips_with_its_protocol_tag(self):
+        # A missing "protocol": "ent" would file it under the PM presets,
+        # where EnvParams has none of these fields and _load raises.
+        self.dialog._save()
+        self.assertIn("unit_point", presets.load_ent_presets())
+        self.assertNotIn("unit_point", presets.load_presets())
+
+    def test_the_saved_preset_still_carries_the_shared_fibre(self):
+        # Dropping the read-only fields would leave a file that _load cannot
+        # turn back into a complete dataclass.
+        self.dialog._save()
+        saved = self._saved()
+        for name in policyviz.SHARED_CHANNEL_FIELDS:
+            self.assertIsNotNone(getattr(saved, name))
+        self.assertEqual(saved.d_km, 55.0)
+
+    def test_the_new_preset_is_offered_without_a_restart(self):
+        self.dialog._save()
+        self.assertIn("unit_point", self.dialog.preset_box.cget("values"))
+        self.assertEqual(self.dialog.preset_var.get(), "unit_point")
+
+    def test_the_reserved_name_is_refused_with_a_message(self):
+        self.simpledialog.answer = "default"
+        self.dialog._save()
+        self.assertTrue([d for d in self.dialogs if d[0] == "error"])
+        self.assertFalse(os.path.exists(
+            os.path.join(self.preset_dir, "default.json")))
+        presets.load_ent_presets()          # would raise if the file existed
+
+    def test_an_empty_name_is_refused_with_a_message(self):
+        self.simpledialog.answer = "   "
+        self.dialog._save()
+        self.assertTrue([d for d in self.dialogs if d[0] == "error"])
+
+    def test_cancelling_the_name_prompt_writes_nothing(self):
+        self.simpledialog.answer = None
+        before = sorted(os.listdir(self.preset_dir))
+        self.dialog._save()
+        self.assertEqual(sorted(os.listdir(self.preset_dir)), before)
+
+    def test_an_existing_name_asks_before_overwriting(self):
+        self.simpledialog.answer = "chapman_lowmu"
+        self.messagebox.answer = False
+        original = presets.load_ent_presets()["chapman_lowmu"].mu
+        self.dialog.entries["mu"].set("0.0999")
+        self.dialog._save()
+        self.assertTrue([d for d in self.dialogs if d[0] == "askyesno"])
+        self.assertAlmostEqual(
+            presets.load_ent_presets()["chapman_lowmu"].mu, original)
+
+    def test_a_confirmed_overwrite_goes_through(self):
+        self.simpledialog.answer = "chapman_lowmu"
+        self.messagebox.answer = True
+        self.dialog.entries["mu"].set("0.0999")
+        self.dialog._save()
+        self.assertAlmostEqual(
+            presets.load_ent_presets()["chapman_lowmu"].mu, 0.0999)
+
+    def test_a_bad_number_is_never_written_to_disk(self):
+        self.dialog.entries["mu"].set("banana")
+        before = sorted(os.listdir(self.preset_dir))
+        self.dialog._save()
+        self.assertEqual(sorted(os.listdir(self.preset_dir)), before)
+        self.assertTrue([d for d in self.dialogs if d[0] == "error"])
+        self.assertFalse([d for d in self.dialogs if d[0] == "askstring"],
+                         "asked for a name before checking the numbers")
+
+    def test_saving_does_not_apply_anything(self):
+        # Save writes a file; OK is what adopts the values. A save that also
+        # closed the dialog would make "save then keep editing" impossible.
+        self.dialog._save()
+        self.assertIsNone(self.dialog.result)
+        self.assertTrue(self.dialog.winfo_exists())
+
+
+class TestTheOperatingPointButtons(unittest.TestCase):
+    """The main window's half: two buttons that say what is in force."""
+
+    def setUp(self):
+        try:
+            import policyviz_ui
+        except Exception as exc:                  # pragma: no cover
+            self.skipTest("tkinter/matplotlib unavailable: %s" % exc)
+        self.ui = policyviz_ui
+        self.dialogs = []
+        self._real_messagebox = policyviz_ui.messagebox
+        policyviz_ui.messagebox = _RecordingMessagebox(self.dialogs)
+        try:
+            self.app = policyviz_ui.PolicyVizApp(small_config())
+        except Exception as exc:                  # pragma: no cover
+            policyviz_ui.messagebox = self._real_messagebox
+            self.skipTest("cannot create Tk window: %s" % exc)
+        self.app.withdraw()
+
+    def tearDown(self):
+        self.ui.messagebox = self._real_messagebox
+        app = getattr(self, "app", None)
+        if app is not None:
+            app._running = False
+            app.update_idletasks()
+            app.destroy()
+
+    def _answer(self, protocol, result):
+        """Make the next _edit_params(protocol) get `result`, no window."""
+        self.app._params_dialog_result = (
+            lambda p, _r=result: _r if p == protocol else None)
+
+    def test_the_buttons_name_the_operating_points_in_force(self):
+        self.assertEqual(self.app.mode_buttons["pm"].cget("text"),
+                         "PM: aurea")
+        self.assertEqual(self.app.mode_buttons["ent"].cget("text"),
+                         "ENT: ent_advanced")
+
+    def test_the_button_says_modified_after_an_edit(self):
+        self._answer("ent", ("ent_advanced", _ent_env(mu=0.015)))
+        self.app._edit_params("ent")
+        self.assertIn("modified", self.app.mode_buttons["ent"].cget("text"))
+        self.assertIn("ent_advanced",
+                      self.app.mode_buttons["ent"].cget("text"))
+
+    def test_the_edit_reaches_the_configuration_the_form_builds(self):
+        self._answer("ent", ("ent_advanced", _ent_env(mu=0.015)))
+        self.app._edit_params("ent")
+        config = self.app._read_config()
+        self.assertIsNotNone(config.ent_env)
+        self.assertAlmostEqual(config.ent_env.mu, 0.015)
+
+    def test_the_edit_reaches_the_session_on_apply(self):
+        self._answer("ent", ("ent_advanced", _ent_env(mu=0.015)))
+        self.app._edit_params("ent")
+        self.app._apply()
+        self.assertAlmostEqual(
+            self.app.session.runs[0].env.params.ent_env.mu, 0.015)
+        self.assertIn("modified", self.app.session.ent_label)
+
+    def test_cancel_changes_nothing(self):
+        self._answer("ent", ("ent_advanced", _ent_env(mu=0.015)))
+        self.app._edit_params("ent")
+        before = self.app.mode_buttons["ent"].cget("text")
+        self.app._params_dialog_result = lambda p: None
+        self.app._edit_params("ent")
+        self.assertEqual(self.app.mode_buttons["ent"].cget("text"), before)
+        self.assertAlmostEqual(self.app.mode_env["ent"].mu, 0.015)
+
+    def test_cancel_on_an_untouched_mode_leaves_it_on_the_preset(self):
+        self.app._params_dialog_result = lambda p: None
+        self.app._edit_params("pm")
+        self.assertIsNone(self.app.mode_env["pm"])
+        self.assertEqual(self.app._read_config().pm_env, None)
+
+    def test_choosing_another_preset_switches_without_marking_modified(self):
+        self._answer("ent", ("chapman_lowmu",
+                             presets.load_ent_presets()["chapman_lowmu"]))
+        self.app._edit_params("ent")
+        self.assertEqual(self.app.mode_buttons["ent"].cget("text"),
+                         "ENT: chapman_lowmu")
+        self.assertIsNone(self.app.mode_env["ent"])
+        self.assertEqual(self.app._read_config().ent_preset, "chapman_lowmu")
+
+    def test_ok_on_an_untouched_dialog_is_not_an_edit(self):
+        table = presets.load_ent_presets()
+        self._answer("ent", ("ent_advanced",
+                             dataclasses.replace(table["ent_advanced"],
+                                                 d_km=55.0, alpha=0.2,
+                                                 odr_losses=0.0)))
+        self.app._edit_params("ent")
+        self.assertIsNone(self.app.mode_env["ent"])
+        self.assertNotIn("modified",
+                         self.app.mode_buttons["ent"].cget("text"))
+
+    def test_the_dialog_is_opened_on_the_main_windows_fibre(self):
+        self.app.entries["d_km"].set("12")
+        self.assertEqual(self.app._shared_channel()["d_km"], 12.0)
+
+    def test_a_half_typed_link_still_opens_the_dialog(self):
+        self.app.entries["d_km"].set("")
+        self.assertEqual(self.app._shared_channel()["d_km"],
+                         float(self.app.config_obj.d_km))
+
+    def test_the_status_line_says_an_apply_is_needed(self):
+        self._answer("ent", ("ent_advanced", _ent_env(mu=0.015)))
+        self.app._edit_params("ent")
+        self.assertIn("Apply", self.app.status.cget("text"))
