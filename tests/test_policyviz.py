@@ -1582,7 +1582,7 @@ if __name__ == "__main__":
 # property is removed (see the mutation table in the task report):
 #
 #   * the edits are COLLECTED but never REACH the environment, so the run
-#     shows the old preset under a button that says "modified";
+#     shows the old preset under a button that says "custom";
 #   * the DQN cache is keyed on the preset NAME, so an agent trained on the
 #     old mu is silently reused for the new one and the curve looks fine;
 #   * a per-mode fibre reaches _setup_modes, which is the trap CLAUDE.md
@@ -1606,7 +1606,7 @@ def _pm_env(**kw):
 class TestEditedParametersReachTheEnvironment(unittest.TestCase):
     """Collecting an edit and running it are two different things.
 
-    A window that stores the numbers, labels its button "(modified)" and then
+    A window that stores the numbers, labels its button "custom" and then
     builds the environment from the preset file would look completely correct
     on screen and report the wrong physics.
     """
@@ -1872,6 +1872,18 @@ class TestPresetNameValidation(unittest.TestCase):
             self.assertEqual(policyviz.validate_preset_name(good), good)
 
 
+class TestCustomIsAReservedPresetName(unittest.TestCase):
+    def test_a_preset_may_not_be_called_custom(self):
+        # A preset named "custom" could not be told apart from the state that
+        # word denotes, so the chooser would show one name for two things.
+        with self.assertRaises(ValueError):
+            policyviz.validate_preset_name(policyviz.CUSTOM_NAME)
+
+    def test_an_ordinary_name_is_still_accepted(self):
+        self.assertEqual(policyviz.validate_preset_name("my_point"),
+                         "my_point")
+
+
 class TestTheOperatingPointLabel(unittest.TestCase):
     """The button, and the figure header, must never hide an edit."""
 
@@ -1884,32 +1896,35 @@ class TestTheOperatingPointLabel(unittest.TestCase):
                                             self.table),
             "ENT: ent_advanced")
 
-    def test_an_env_equal_to_the_preset_is_not_modified(self):
+    def test_an_env_equal_to_the_preset_is_not_marked_custom(self):
         self.assertEqual(
             policyviz.operating_point_label("ent", "ent_advanced", _ent_env(),
                                             self.table),
             "ENT: ent_advanced")
 
     def test_an_edited_env_is_marked(self):
+        # The preset name is REPLACED, not annotated: once the numbers have
+        # been edited the preset no longer describes the run, so naming it
+        # would invite a reader to look up physics that is not in force.
         label = policyviz.operating_point_label(
             "ent", "ent_advanced", _ent_env(mu=0.015), self.table)
-        self.assertIn("ent_advanced", label)
-        self.assertIn("modified", label)
+        self.assertEqual(label, "ENT: custom")
+        self.assertNotIn("ent_advanced", label)
 
     def test_the_shared_fibre_alone_is_not_an_edit(self):
         # The dialog shows the MAIN WINDOW's link, which routinely differs
         # from the one the preset file ships (aurea has 13 dB of optics
         # losses; the visualiser's default link has none). Counting that as
-        # an edit would mark every preset "modified" on sight.
+        # an edit would mark every preset "custom" on sight.
         label = policyviz.operating_point_label(
             "pm", "aurea", _pm_env(d_km=999.0, odr_losses=1.0),
             presets.load_presets())
-        self.assertNotIn("modified", label)
+        self.assertNotIn("custom", label)
 
     def test_a_config_reports_both_of_its_operating_points(self):
         pm, ent = small_config(ent_env=_ent_env(mu=0.015)).operating_points()
         self.assertEqual(pm, "PM: aurea")
-        self.assertIn("modified", ent)
+        self.assertIn("custom", ent)
 
     def test_the_figure_header_names_both_operating_points(self):
         session = VizSession(small_config(specs=("always-pm",),
@@ -1919,7 +1934,7 @@ class TestTheOperatingPointLabel(unittest.TestCase):
         draw_panels(fig, session)
         head = fig._suptitle.get_text()
         self.assertIn("PM: aurea", head)
-        self.assertIn("ENT: ent_advanced (modified)", head)
+        self.assertIn("ENT: custom", head)
 
 
 class TestTheParameterDialog(unittest.TestCase):
@@ -1961,6 +1976,54 @@ class TestTheParameterDialog(unittest.TestCase):
                                       self.shared)
         dialog.withdraw()
         return dialog
+
+    def test_editing_a_field_flips_the_chooser_to_custom(self):
+        # The chooser is the only thing in the dialog that names the physics.
+        # Left showing "ent_advanced" over hand-edited numbers it is a lie.
+        dialog = self._dialog()
+        self.assertEqual(dialog.preset_var.get(), "ent_advanced")
+        dialog.entries["mu"].set("0.015")
+        self.assertEqual(dialog.preset_var.get(), policyviz.CUSTOM_NAME)
+
+    def test_opening_on_an_already_edited_env_says_custom_at_once(self):
+        dialog = self._dialog(env=_ent_env(mu=0.015))
+        self.assertEqual(dialog.preset_var.get(), policyviz.CUSTOM_NAME)
+
+    def test_refilling_from_a_preset_does_not_mark_it_custom(self):
+        # fill() writes every field, which would trip the edit trace. If it
+        # did, choosing a preset would immediately claim to be custom and the
+        # chooser could never show a preset name again.
+        dialog = self._dialog()
+        dialog.preset_var.set("chapman_lowmu")
+        dialog._on_preset()
+        self.assertEqual(dialog.preset_var.get(), "chapman_lowmu")
+
+    def test_ok_returns_the_base_preset_name_never_custom(self):
+        # THE dangerous one. "custom" is a label, not a lookup key: handed
+        # back as the preset name it reaches HybridParams.ent_preset and the
+        # next presets.load_ent_presets()[name] raises KeyError.
+        dialog = self._dialog()
+        dialog.entries["mu"].set("0.015")
+        self.assertEqual(dialog.preset_var.get(), policyviz.CUSTOM_NAME)
+        dialog._ok()
+        name, env = dialog.result
+        self.assertEqual(name, "ent_advanced")
+        self.assertIn(name, policyviz.preset_table("ent"))
+        self.assertAlmostEqual(env.mu, 0.015)
+
+    def test_choosing_custom_from_the_chooser_changes_no_field(self):
+        # "custom" describes the fields; it cannot supply them.
+        dialog = self._dialog()
+        before = {k: v.get() for k, v in dialog.entries.items()}
+        dialog.preset_var.set(policyviz.CUSTOM_NAME)
+        dialog._on_preset()
+        self.assertEqual({k: v.get() for k, v in dialog.entries.items()},
+                         before)
+
+    def test_the_chooser_offers_custom(self):
+        dialog = self._dialog()
+        self.assertIn(policyviz.CUSTOM_NAME,
+                      list(dialog.preset_box.cget("values")))
 
     def test_it_shows_the_presets_actual_parameters(self):
         dialog = self._dialog()
@@ -2212,12 +2275,10 @@ class TestTheOperatingPointButtons(unittest.TestCase):
         self.assertEqual(self.app.mode_buttons["ent"].cget("text"),
                          "ENT: ent_advanced")
 
-    def test_the_button_says_modified_after_an_edit(self):
+    def test_the_button_says_custom_after_an_edit(self):
         self._answer("ent", ("ent_advanced", _ent_env(mu=0.015)))
         self.app._edit_params("ent")
-        self.assertIn("modified", self.app.mode_buttons["ent"].cget("text"))
-        self.assertIn("ent_advanced",
-                      self.app.mode_buttons["ent"].cget("text"))
+        self.assertIn("custom", self.app.mode_buttons["ent"].cget("text"))
 
     def test_the_edit_reaches_the_configuration_the_form_builds(self):
         self._answer("ent", ("ent_advanced", _ent_env(mu=0.015)))
@@ -2232,7 +2293,7 @@ class TestTheOperatingPointButtons(unittest.TestCase):
         self.app._apply()
         self.assertAlmostEqual(
             self.app.session.runs[0].env.params.ent_env.mu, 0.015)
-        self.assertIn("modified", self.app.session.ent_label)
+        self.assertIn("custom", self.app.session.ent_label)
 
     def test_cancel_changes_nothing(self):
         self._answer("ent", ("ent_advanced", _ent_env(mu=0.015)))
@@ -2249,7 +2310,7 @@ class TestTheOperatingPointButtons(unittest.TestCase):
         self.assertIsNone(self.app.mode_env["pm"])
         self.assertEqual(self.app._read_config().pm_env, None)
 
-    def test_choosing_another_preset_switches_without_marking_modified(self):
+    def test_choosing_another_preset_switches_without_marking_custom(self):
         self._answer("ent", ("chapman_lowmu",
                              presets.load_ent_presets()["chapman_lowmu"]))
         self.app._edit_params("ent")
@@ -2266,7 +2327,7 @@ class TestTheOperatingPointButtons(unittest.TestCase):
                                                  odr_losses=0.0)))
         self.app._edit_params("ent")
         self.assertIsNone(self.app.mode_env["ent"])
-        self.assertNotIn("modified",
+        self.assertNotIn("custom",
                          self.app.mode_buttons["ent"].cget("text"))
 
     def test_the_dialog_is_opened_on_the_main_windows_fibre(self):

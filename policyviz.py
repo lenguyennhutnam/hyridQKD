@@ -310,17 +310,17 @@ def is_modified(env, preset_env):
 def operating_point_label(protocol, preset_name, env, table):
     """What the main window's button (and the figure header) says.
 
-    "PM: aurea" when the preset is running unchanged, "PM: aurea (modified)"
-    when it is not. A reader must never be unable to tell which physics
-    produced the curve in front of them, and a bare preset name on an edited
-    configuration is exactly that failure.
+    "PM: aurea" when the preset is running unchanged, "PM: custom" when the
+    numbers have been edited away from it. A reader must never be unable to
+    tell which physics produced the curve in front of them, and a bare preset
+    name on an edited configuration is exactly that failure.
     """
     tag = str(protocol).upper()
     name = str(preset_name)
     preset_env = (table or {}).get(name)
     if env is not None and (preset_env is None
                             or is_modified(env, preset_env)):
-        return "%s: %s (modified)" % (tag, name)
+        return "%s: %s" % (tag, CUSTOM_NAME)
     return "%s: %s" % (tag, name)
 
 
@@ -332,6 +332,15 @@ def preset_table(protocol):
     """
     return (presets.load_presets() if str(protocol) == "pm"
             else presets.load_ent_presets())
+
+
+# Shown wherever an operating point has been edited away from its preset.
+# It is a DISPLAY name, never a lookup key: the configuration keeps the base
+# preset name so the physics can still be resolved, and only the label says
+# "custom". Reserved in validate_preset_name for the same reason `default` is
+# -- a preset actually called "custom" would be indistinguishable from the
+# edited state it denotes.
+CUSTOM_NAME = "custom"
 
 
 def validate_preset_name(name, existing=()):
@@ -351,6 +360,11 @@ def validate_preset_name(name, existing=()):
     if cleaned == panelstate.RESERVED_NAME:
         raise ValueError("%r is reserved for the saved panel state -- choose "
                          "another name" % (panelstate.RESERVED_NAME,))
+    if cleaned == CUSTOM_NAME:
+        raise ValueError("%r is reserved: it is what an edited operating "
+                         "point is called, so a preset of that name could "
+                         "not be told apart from one -- choose another name"
+                         % (CUSTOM_NAME,))
     if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$", cleaned):
         raise ValueError("preset names may use letters, digits, '_', '-' and "
                          "'.', and must start with a letter or digit (got %r)"

@@ -100,10 +100,15 @@ class ParamsDialog(tk.Toplevel):
         frame.pack(fill="both", expand=True)
         row = 0
         ttk.Label(frame, text="preset").grid(row=row, column=0, sticky="w")
+        # The chooser DISPLAYS "custom" once the fields no longer match a
+        # preset, but the dialog keeps the real preset name in _base_preset:
+        # that is what resolves to physics, and "custom" is not a lookup key.
+        self._base_preset = str(preset_name)
+        self._filling = False
         self.preset_var = tk.StringVar(value=str(preset_name))
         self.preset_box = ttk.Combobox(
             frame, textvariable=self.preset_var, width=20, state="readonly",
-            values=sorted(self.table))
+            values=self._chooser_values())
         self.preset_box.grid(row=row, column=1, sticky="w")
         self.preset_box.bind("<<ComboboxSelected>>", self._on_preset)
         row += 1
@@ -130,6 +135,10 @@ class ParamsDialog(tk.Toplevel):
                 self.shared_vars[name] = var
             else:
                 self.entries[name] = var
+                # A hand edit means the fields stop describing any preset.
+                # Guarded by _filling so refilling from a preset (or the
+                # initial fill) does not mark the dialog custom on sight.
+                var.trace_add("write", self._mark_custom)
             row += 1
         ttk.Label(frame, text="fibre length, attenuation and optics losses "
                               "are SHARED by both modes and are set in the "
@@ -150,8 +159,23 @@ class ParamsDialog(tk.Toplevel):
                    ).pack(side="right", padx=4)
 
         self.fill(env)
+        # Opened on an already-edited operating point: say so straight away
+        # rather than showing the preset name the numbers no longer match.
+        if policyviz.is_modified(env, self.table.get(self._base_preset)):
+            self.preset_var.set(policyviz.CUSTOM_NAME)
 
     # ------------------------------------------------------------------
+
+    def _chooser_values(self):
+        """Preset names with "custom" first -- it is a state, not a source."""
+        return [policyviz.CUSTOM_NAME] + sorted(self.table)
+
+    def _mark_custom(self, *_args):
+        """Any hand edit means the fields no longer describe a preset."""
+        if self._filling:
+            return
+        if self.preset_var.get() != policyviz.CUSTOM_NAME:
+            self.preset_var.set(policyviz.CUSTOM_NAME)
 
     def fill(self, env):
         """Write `env` into the fields. The fibre always comes from `shared`.
@@ -161,10 +185,14 @@ class ParamsDialog(tk.Toplevel):
         would display 13 while the environment ran the main window's 0.
         """
         data = dataclasses.asdict(env)
-        for name, var in self.entries.items():
-            var.set(policyviz.format_param(data[name]))
-        for name, var in self.shared_vars.items():
-            var.set(policyviz.format_param(self.shared[name]))
+        self._filling = True
+        try:
+            for name, var in self.entries.items():
+                var.set(policyviz.format_param(data[name]))
+            for name, var in self.shared_vars.items():
+                var.set(policyviz.format_param(self.shared[name]))
+        finally:
+            self._filling = False
 
     def read_env(self):
         """The params dataclass the fields currently describe.
@@ -179,8 +207,13 @@ class ParamsDialog(tk.Toplevel):
             self.shared)
 
     def _on_preset(self, *_event):
-        env = self.table.get(self.preset_var.get())
+        name = self.preset_var.get()
+        if name == policyviz.CUSTOM_NAME:
+            # "custom" describes the fields; it cannot supply them.
+            return
+        env = self.table.get(name)
         if env is not None:
+            self._base_preset = name
             self.fill(env)
 
     def _ok(self):
@@ -192,7 +225,9 @@ class ParamsDialog(tk.Toplevel):
             messagebox.showerror("%s operating point"
                                  % self.protocol_name.upper(), str(exc))
             return
-        self.result = (self.preset_var.get(), env)
+        # The base preset name, never the chooser's text: "custom" is a
+        # label, and handing it back would make the next preset lookup fail.
+        self.result = (self._base_preset, env)
         self.destroy()
 
     def _cancel(self):
@@ -233,7 +268,8 @@ class ParamsDialog(tk.Toplevel):
         # is the only version that proves the file we just wrote can be read
         # back, and it is what the chooser must offer without a restart.
         self.table = policyviz.preset_table(self.protocol_name)
-        self.preset_box.configure(values=sorted(self.table))
+        self.preset_box.configure(values=self._chooser_values())
+        self._base_preset = name
         self.preset_var.set(name)
         messagebox.showinfo(title, "saved %s" % path)
 
