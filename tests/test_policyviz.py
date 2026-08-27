@@ -1872,6 +1872,96 @@ class TestPresetNameValidation(unittest.TestCase):
             self.assertEqual(policyviz.validate_preset_name(good), good)
 
 
+class TestTheTrafficAndFibreFieldsReachTheEnvironment(unittest.TestCase):
+    """l0, T0, alpha and odr_losses used to be unreachable from the window:
+    l0 and w_window were not on VizConfig at all, and alpha/odr_losses were on
+    it but not on the form, so they were pinned to defaults no matter what the
+    experiment needed. A field that shows a number the run does not use is
+    worse than a missing field."""
+
+    def setUp(self):
+        try:
+            import policyviz_ui
+        except Exception as exc:                  # pragma: no cover
+            self.skipTest("tkinter/matplotlib unavailable: %s" % exc)
+        self.ui = policyviz_ui
+        self.dialogs = []
+        self._real_messagebox = policyviz_ui.messagebox
+        policyviz_ui.messagebox = _RecordingMessagebox(self.dialogs)
+        try:
+            self.app = policyviz_ui.PolicyVizApp(small_config())
+        except Exception as exc:                  # pragma: no cover
+            policyviz_ui.messagebox = self._real_messagebox
+            self.skipTest("cannot create Tk window: %s" % exc)
+        self.app.withdraw()
+
+    def tearDown(self):
+        self.ui.messagebox = self._real_messagebox
+        app = getattr(self, "app", None)
+        if app is not None:
+            app.destroy()
+
+    def test_every_traffic_and_fibre_field_reaches_hybrid_params(self):
+        typed = {"l0": "4096", "t0_deadline": "7", "alpha": "0.25",
+                 "odr_losses": "3.5", "w_window": "9", "lam": "1.25"}
+        for name, text in typed.items():
+            self.app.entries[name].set(text)
+        params = self.app._read_config().hybrid_params()
+        self.assertEqual(params.l0, 4096)
+        self.assertEqual(params.t0_deadline, 7)
+        self.assertAlmostEqual(params.alpha, 0.25)
+        self.assertAlmostEqual(params.odr_losses, 3.5)
+        self.assertEqual(params.w_window, 9)
+        self.assertAlmostEqual(params.lam, 1.25)
+
+    def test_the_fibre_fields_are_read_as_floats(self):
+        # int(float("0.25")) is 0 -- a lossless fibre, silently.
+        self.app.entries["alpha"].set("0.25")
+        self.app.entries["odr_losses"].set("13.0")
+        params = self.app._read_config().hybrid_params()
+        self.assertNotEqual(params.alpha, 0)
+        self.assertAlmostEqual(params.alpha, 0.25)
+        self.assertAlmostEqual(params.odr_losses, 13.0)
+
+    def test_a_heading_row_is_not_treated_as_a_field(self):
+        self.assertTrue(any(n is None for n, _, _ in self.ui.FIELDS))
+        for name, _, _ in self.ui.FIELDS:
+            if name is not None:
+                self.assertIn(name, self.app.entries)
+        self.assertNotIn(None, self.app.entries)
+
+    def test_a_bad_traffic_number_names_the_field(self):
+        # The message names the field the way the FORM labels it, not the
+        # way the dataclass spells it -- the reader is looking at the form.
+        self.app.entries["l0"].set("nonsense")
+        with self.assertRaises(ValueError) as ctx:
+            self.app._read_config()
+        self.assertIn("bits per message", str(ctx.exception))
+        self.assertIn("nonsense", str(ctx.exception))
+
+
+class TestTheCacheKeyCoversTheTrafficModel(unittest.TestCase):
+    """An agent trained where one message costs 8192 bits is not the agent for
+    a link where it costs 4096. Keying the cache without those numbers would
+    hand back the wrong agent and the result would look entirely plausible."""
+
+    def _key(self, **kw):
+        cfg = policyviz.VizConfig()
+        for k, v in kw.items():
+            setattr(cfg, k, v)
+        return policyviz._cache_key(cfg, DQNConfig(episodes=5))
+
+    def test_l0_changes_the_key(self):
+        self.assertNotEqual(self._key(l0=8192), self._key(l0=4096))
+
+    def test_the_qber_window_changes_the_key(self):
+        self.assertNotEqual(self._key(w_window=5), self._key(w_window=9))
+
+    def test_the_deadline_changes_the_key(self):
+        self.assertNotEqual(self._key(t0_deadline=20),
+                            self._key(t0_deadline=7))
+
+
 class TestCustomIsAReservedPresetName(unittest.TestCase):
     def test_a_preset_may_not_be_called_custom(self):
         # A preset named "custom" could not be told apart from the state that

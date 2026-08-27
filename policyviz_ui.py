@@ -64,10 +64,30 @@ STATUS_COLORS = {"idle": "#9e9e9e", "training": "#f0ad4e",
                  "finished": "#2E75B6", "error": "#d9534f"}
 
 # (field, label, width) for the plain numeric entries.
-FIELDS = [("lam", "λ arrivals/slot", 8), ("b_max", "B_max [bits]", 10),
-          ("horizon", "horizon [slots]", 8), ("n_x", "n_X block [bits]", 10),
-          ("d_km", "d [km]", 8), ("seed_index", "seed (episode #)", 8),
-          ("dqn_episodes", "DQN episodes", 8)]
+# (name, label, entry width). A row whose name is None is a heading, not a
+# field: the form had grown to the point where a flat list of nine numbers
+# gave no clue which described the traffic, which the fibre and which the run.
+FIELDS = [
+    (None, "traffic", None),
+    ("lam", "λ arrivals/slot", 8),
+    ("l0", "bits per message  l₀", 10),
+    ("t0_deadline", "deadline T₀ [slots]", 8),
+    ("b_max", "B_max [bits]", 10),
+    (None, "fibre (shared by both modes)", None),
+    ("d_km", "d [km]", 8),
+    ("alpha", "α [dB/km]", 8),
+    ("odr_losses", "optics losses [dB]", 8),
+    (None, "run", None),
+    ("horizon", "horizon [slots]", 8),
+    ("n_x", "n_X block [bits]", 10),
+    ("w_window", "QBER window [slots]", 8),
+    ("seed_index", "seed (episode #)", 8),
+    ("dqn_episodes", "DQN episodes", 8),
+]
+
+# Everything else is read as an int. Getting this wrong turns 0.2 dB/km into
+# 0 dB/km -- a lossless fibre -- without raising anything.
+FLOAT_FIELDS = frozenset(("lam", "d_km", "alpha", "odr_losses"))
 
 
 class ParamsDialog(tk.Toplevel):
@@ -394,6 +414,12 @@ class PolicyVizApp(tk.Tk):
 
         self.entries = {}
         for name, label, width in FIELDS:
+            if name is None:
+                ttk.Label(left, text=label, font=("TkDefaultFont", 8, "bold")
+                          ).grid(row=row, column=0, columnspan=2, sticky="w",
+                                 pady=(6, 1))
+                row += 1
+                continue
             ttk.Label(left, text=label).grid(row=row, column=0, sticky="w")
             var = tk.StringVar(value=str(getattr(self.config_obj, name)))
             ttk.Entry(left, textvariable=var, width=width).grid(
@@ -616,9 +642,11 @@ class PolicyVizApp(tk.Tk):
             raise ValueError("select at least one policy")
         values = {}
         for name, label, _ in FIELDS:
+            if name is None:
+                continue
             text = self.entries[name].get().strip()
             try:
-                values[name] = (float(text) if name in ("lam", "d_km")
+                values[name] = (float(text) if name in FLOAT_FIELDS
                                 else int(float(text)))
             except ValueError:
                 raise ValueError("%s: %r is not a number" % (label, text))

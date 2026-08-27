@@ -71,7 +71,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from hybridenv import OBS_DIM
+from hybridenv import OBS_DIM, PM
 from policies import Policy
 
 # Distance between the seed blocks of two config seeds. Also the hard cap on
@@ -99,6 +99,12 @@ class DQNConfig:
     eps_end: float = 0.05
     eps_decay_episodes: int = 150
     seed: int = 0
+    # Subtracted from the TRAINING reward on a slot whose action differs from
+    # the previous one. The environment's reward is untouched: eq (24) is what
+    # every policy is scored on, and a shaped reward that reached evaluation
+    # would have the agent judged on a different objective from its baselines.
+    # 0.0 reproduces the unshaped agent exactly.
+    switch_penalty: float = 0.0
 
 
 class QNetwork:
@@ -375,6 +381,11 @@ def validate_config(config):
             "warmup=%d exceeds capacity=%d: the buffer saturates at capacity "
             "so no gradient step would ever fire" % (config.warmup,
                                                      config.capacity))
+    if config.switch_penalty < 0.0:
+        raise ValueError(
+            "switch_penalty must be >= 0, got %r: a negative value pays the "
+            "agent to change mode, which is the opposite of the thrashing it "
+            "exists to suppress" % (config.switch_penalty,))
 
 
 def train(env, config=None, progress=None):
@@ -410,6 +421,7 @@ def train(env, config=None, progress=None):
         eps = epsilon_at(episode, cfg)
         obs = env.reset(episode_seed(cfg, episode))
         norm.update(obs)
+        prev_action = PM
         done = False
         while not done:
             if rng.rand() < eps:
@@ -421,7 +433,18 @@ def train(env, config=None, progress=None):
                 action = int(np.argmax(online.forward(norm.transform(obs))[0]))
             next_obs, reward, done, _ = env.step(action)
             norm.update(next_obs)
-            buf.add(obs, action, reward, next_obs, done)
+            # Thrashing is the observed failure: the unshaped agent flips mode
+            # hundreds of times an episode because eq (5) charges a switch as
+            # a partial block whose cost only shows up as fewer served
+            # messages many slots later. This makes that cost immediate.
+            # PM is the mode reset() leaves the environment in, so the first
+            # slot of an episode is charged like any other -- picking ENT
+            # there really is a switch and eq (5) really does bill it.
+            shaped = reward
+            if cfg.switch_penalty and action != prev_action:
+                shaped -= cfg.switch_penalty
+            buf.add(obs, action, shaped, next_obs, done)
+            prev_action = action
             obs = next_obs
             if len(buf) >= cfg.warmup:
                 batch = buf.sample(cfg.batch_size)

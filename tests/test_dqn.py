@@ -139,6 +139,115 @@ def _tiny_cfg(**kw):
     return DQNConfig(**base)
 
 
+class _RecordingBuffer(dqn.ReplayBuffer):
+    """A replay buffer that keeps every (action, reward) it was handed.
+
+    The shaped reward is written into the buffer and nowhere else, so this is
+    the only place a test can see whether the penalty was applied, applied to
+    the right slots, or applied at all.
+    """
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.seen = []
+
+    def add(self, obs, action, reward, next_obs, done):
+        self.seen.append((int(action), float(reward)))
+        return super().add(obs, action, reward, next_obs, done)
+
+
+def _record_training(cfg, env):
+    """Train, and return every (action, reward) that reached the buffer."""
+    real = dqn.ReplayBuffer
+    box = {}
+
+    def factory(*a, **kw):
+        buf = _RecordingBuffer(*a, **kw)
+        box["buf"] = buf
+        return buf
+
+    dqn.ReplayBuffer = factory
+    try:
+        policy = dqn.train(env, cfg)
+    finally:
+        dqn.ReplayBuffer = real
+    return policy, box["buf"].seen
+
+
+class TestTheSwitchPenalty(unittest.TestCase):
+    """The unshaped agent flips mode hundreds of times an episode. eq (5)
+    already charges a switch, but only as a partial block whose cost surfaces
+    many slots later; the penalty makes it immediate. It is a TRAINING device
+    -- the environment's reward, and therefore every policy's eta, is
+    untouched."""
+
+    def test_zero_penalty_reproduces_the_unshaped_agent_exactly(self):
+        # The default must be a no-op, or every result recorded before this
+        # feature silently stops being reproducible.
+        a, _ = _record_training(_tiny_cfg(switch_penalty=0.0), _BanditEnv(1))
+        b, _ = _record_training(_tiny_cfg(), _BanditEnv(1))
+        for name in ("w1", "b1", "w2", "b2", "w3", "b3"):
+            np.testing.assert_array_equal(getattr(a.net, name),
+                                          getattr(b.net, name))
+
+    def test_only_a_slot_that_changed_action_is_charged(self):
+        # Kills a penalty subtracted from every step, which would merely
+        # shift the reward baseline and change no preference at all.
+        # ONE episode: prev_action is re-seeded to PM at every reset, so a
+        # test that tracked `prev` across episode boundaries would disagree
+        # with the code at exactly the first slot of episodes 2..N.
+        cfg = _tiny_cfg(switch_penalty=0.25, eps_start=1.0, eps_end=1.0,
+                        episodes=1)
+        _, seen = _record_training(cfg, _BanditEnv(1, horizon=30))
+        prev = 0                      # PM: what reset() leaves behind
+        for action, reward in seen:
+            base = 1.0 if action == 1 else 0.0
+            want = base - (0.25 if action != prev else 0.0)
+            self.assertAlmostEqual(reward, want)
+            prev = action
+
+    def test_the_first_slot_of_an_episode_is_charged_against_pm(self):
+        # reset() leaves the environment in PM, so choosing ENT on slot 1
+        # really is a switch and eq (5) really does bill it. Treating the
+        # first slot as free would teach the agent a discount that the
+        # environment does not give.
+        cfg = _tiny_cfg(switch_penalty=0.5, eps_start=1.0, eps_end=1.0,
+                        episodes=1)
+        _, seen = _record_training(cfg, _BanditEnv(1, horizon=6))
+        first_action, first_reward = seen[0]
+        base = 1.0 if first_action == 1 else 0.0
+        if first_action != 0:
+            self.assertAlmostEqual(first_reward, base - 0.5)
+        else:
+            self.assertAlmostEqual(first_reward, base)
+
+    def test_a_bigger_penalty_lowers_the_reward_it_stores(self):
+        small = _record_training(
+            _tiny_cfg(switch_penalty=0.1, eps_start=1.0, eps_end=1.0),
+            _BanditEnv(1))[1]
+        big = _record_training(
+            _tiny_cfg(switch_penalty=2.0, eps_start=1.0, eps_end=1.0),
+            _BanditEnv(1))[1]
+        self.assertEqual([a for a, _ in small], [a for a, _ in big])
+        self.assertLess(sum(r for _, r in big), sum(r for _, r in small))
+
+    def test_the_environment_reward_is_never_shaped(self):
+        # The penalty must not reach eta. If it did, the DQN would be scored
+        # on a different objective from the baselines it is compared against
+        # and the whole comparison would be meaningless.
+        env = _BanditEnv(1, horizon=10)
+        cfg = _tiny_cfg(switch_penalty=5.0, eps_start=1.0, eps_end=1.0)
+        _record_training(cfg, env)
+        self.assertGreaterEqual(env.eta, 0.0)
+        self.assertLessEqual(env.eta, 1.0)
+        _, r, _, _ = _BanditEnv(1).step(1)
+        self.assertEqual(r, 1.0)
+
+    def test_a_negative_penalty_is_refused(self):
+        with self.assertRaises(ValueError):
+            dqn.validate_config(_tiny_cfg(switch_penalty=-0.1))
+
+
 class TestQNetwork(unittest.TestCase):
     def test_forward_returns_one_value_per_action(self):
         net = QNetwork(OBS_DIM, 16, 2, seed=0)

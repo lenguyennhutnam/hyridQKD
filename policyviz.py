@@ -416,6 +416,8 @@ class VizConfig:
     alpha: float = 0.2
     odr_losses: float = 0.0
     t0_deadline: int = 20
+    l0: int = 8192              # key bits to encrypt one message (OTP)
+    w_window: int = 5           # slots the observed QBER averages over
     seed_index: int = 0
     dqn_episodes: int = 20
     # EDITED OPERATING POINTS. None = "run the named preset as it ships".
@@ -447,7 +449,8 @@ class VizConfig:
         seed = self.env_seed() if seed is None else int(seed)
         return HybridParams(
             n_x=int(self.n_x), lam=float(self.lam), b_max=int(self.b_max),
-            t0_deadline=int(self.t0_deadline), horizon=int(self.horizon),
+            t0_deadline=int(self.t0_deadline), l0=int(self.l0),
+            w_window=int(self.w_window), horizon=int(self.horizon),
             d_km=float(self.d_km), alpha=float(self.alpha),
             odr_losses=float(self.odr_losses), seed=seed,
             pm_preset=self.pm_preset, ent_preset=self.ent_preset,
@@ -817,6 +820,7 @@ def _cache_key(config, cfg):
         "horizon": int(config.horizon), "n_x": int(config.n_x),
         "d_km": float(config.d_km), "alpha": float(config.alpha),
         "odr": float(config.odr_losses), "t0": int(config.t0_deadline),
+        "l0": int(config.l0), "w_window": int(config.w_window),
         # dqn.py is under active development in a parallel session (an
         # observation normaliser). A pickle from before that change would
         # unpickle into the new class without __init__ ever running, leaving
