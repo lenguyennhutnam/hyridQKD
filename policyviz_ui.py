@@ -89,6 +89,18 @@ FIELDS = [
 # 0 dB/km -- a lossless fibre -- without raising anything.
 FLOAT_FIELDS = frozenset(("lam", "d_km", "alpha", "odr_losses"))
 
+# How tall the scrolling control column is allowed to be. Chosen to leave a
+# usable strip of the desktop (a terminal, usually) visible under the window
+# on a 1080-line screen.
+LEFT_VIEW_HEIGHT = 620
+
+# The same rows, split into the two side-by-side columns the form draws them
+# in. Stacked in one column the panel grew taller than the screen and hid the
+# terminal behind it. FIELDS stays the flat concatenation, so read-back and
+# every test that walks it are unaffected by the layout.
+FIELD_COLUMNS = [FIELDS[:FIELDS.index((None, "run", None))],
+                 FIELDS[FIELDS.index((None, "run", None)):]]
+
 
 class ParamsDialog(tk.Toplevel):
     """Edit ONE mode's operating point: choose a preset, or type the numbers.
@@ -339,8 +351,36 @@ class PolicyVizApp(tk.Tk):
                           wraplength=1180, justify="left", padx=8, pady=4)
         banner.grid(row=0, column=0, columnspan=2, sticky="ew")
 
-        left = ttk.Frame(self, padding=8)
-        left.grid(row=1, column=0, sticky="ns")
+        # The control column is TALLER THAN THE SCREEN on a 1080-line display
+        # (it asked for 965 px of a 1080 px screen, so the window covered the
+        # terminal behind it). Rather than keep trimming rows every time a
+        # parameter is added, it lives in a scrolling viewport: the window can
+        # then be any height and the column simply scrolls inside it.
+        viewport = ttk.Frame(self)
+        viewport.grid(row=1, column=0, sticky="ns")
+        canvas = tk.Canvas(viewport, borderwidth=0, highlightthickness=0,
+                           height=LEFT_VIEW_HEIGHT)
+        bar = ttk.Scrollbar(viewport, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        left = ttk.Frame(canvas, padding=8)
+        canvas.create_window((0, 0), window=left, anchor="nw")
+
+        def _fit(_event=None):
+            # Width follows the content so nothing is cut off sideways; height
+            # stays at the viewport and the scrollbar covers the rest.
+            canvas.configure(scrollregion=canvas.bbox("all"),
+                             width=left.winfo_reqwidth())
+
+        left.bind("<Configure>", _fit)
+        # Button-4/5 are X11's wheel events, which is what WSLg delivers.
+        for seq, delta in (("<Button-4>", -1), ("<Button-5>", 1)):
+            canvas.bind_all(seq, lambda e, d=delta: canvas.yview_scroll(d, "units"))
+        canvas.bind_all("<MouseWheel>",
+                        lambda e: canvas.yview_scroll(-1 if e.delta > 0 else 1,
+                                                      "units"))
+        self._left_canvas = canvas
         right = ttk.Frame(self, padding=4)
         right.grid(row=1, column=1, sticky="nsew")
         self.rowconfigure(1, weight=1)
@@ -413,19 +453,30 @@ class PolicyVizApp(tk.Tk):
         self._refresh_mode_buttons()
 
         self.entries = {}
-        for name, label, width in FIELDS:
-            if name is None:
-                ttk.Label(left, text=label, font=("TkDefaultFont", 8, "bold")
-                          ).grid(row=row, column=0, columnspan=2, sticky="w",
-                                 pady=(6, 1))
-                row += 1
-                continue
-            ttk.Label(left, text=label).grid(row=row, column=0, sticky="w")
-            var = tk.StringVar(value=str(getattr(self.config_obj, name)))
-            ttk.Entry(left, textvariable=var, width=width).grid(
-                row=row, column=1, sticky="w")
-            self.entries[name] = var
-            row += 1
+        fields = ttk.Frame(left)
+        fields.grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        for col, group in enumerate(FIELD_COLUMNS):
+            base = col * 2
+            if base:
+                # A little air between the two columns of entries.
+                fields.grid_columnconfigure(base, minsize=14)
+            frow = 0
+            for name, label, width in group:
+                if name is None:
+                    ttk.Label(fields, text=label,
+                              font=("TkDefaultFont", 8, "bold")
+                              ).grid(row=frow, column=base, columnspan=2,
+                                     sticky="w", pady=(6, 1))
+                    frow += 1
+                    continue
+                ttk.Label(fields, text=label).grid(row=frow, column=base,
+                                                   sticky="w", padx=(0, 4))
+                var = tk.StringVar(value=str(getattr(self.config_obj, name)))
+                ttk.Entry(fields, textvariable=var, width=width).grid(
+                    row=frow, column=base + 1, sticky="w")
+                self.entries[name] = var
+                frow += 1
 
         ttk.Separator(left, orient="horizontal").grid(
             row=row, column=0, columnspan=2, sticky="ew", pady=6)
@@ -467,7 +518,7 @@ class PolicyVizApp(tk.Tk):
         ttk.Separator(left, orient="horizontal").grid(
             row=row, column=0, columnspan=2, sticky="ew", pady=6)
         row += 1
-        ttk.Label(left, text="QBER panel traces",
+        ttk.Label(left, text="show lines for  (QBER + η panels)",
                   font=("TkDefaultFont", 9, "bold")
                   ).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
@@ -477,20 +528,24 @@ class PolicyVizApp(tk.Tk):
                   wraplength=200, justify="left"
                   ).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
-        # Populated by _rebuild_qber_checks, never here: at this point there
+        # Populated by _rebuild_trace_checks, never here: at this point there
         # is no session yet (_apply() runs after _build()), and the set of
         # policies it will need checkboxes for is not known until then.
-        self.qber_check_frame = ttk.Frame(left)
-        self.qber_check_frame.grid(row=row, column=0, columnspan=2, sticky="w")
+        self.trace_check_frame = ttk.Frame(left)
+        self.trace_check_frame.grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
-        self.qber_checks = {}   # display name -> tk.BooleanVar
+        self.trace_checks = {}   # display name -> tk.BooleanVar
 
         self.board = tk.Text(left, height=12, width=52, font=("TkFixedFont", 8),
                              state="disabled", wrap="none")
         self.board.grid(row=row, column=0, columnspan=2, sticky="nsew")
         left.rowconfigure(row, weight=1)
 
-        self.figure = Figure(figsize=(9.2, 8.4), dpi=100)
+        # 8.4 in at 100 dpi asked for 840 px of plot, which put the window
+        # at 990 px on a 1080 px screen and buried the terminal behind it.
+        # The exported figure (policyviz.py's --figure path) keeps its own,
+        # larger size: this number is about fitting a screen, not print.
+        self.figure = Figure(figsize=(9.2, 6.6), dpi=100)
         self.canvas = FigureCanvasTkAgg(self.figure, master=right)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         # ONE connection, for the life of the window.
@@ -735,19 +790,19 @@ class PolicyVizApp(tk.Tk):
         name = self.session.legend_picks.get(event.artist)
         if name is None:
             return
-        self.session.toggle_qber(name)
+        self.session.toggle_trace(name)
         # The checkbox group is the OTHER control over this same bit of
         # state (see the group's heading). Without this line a legend click
         # would leave that policy's checkbox showing the visibility it had
         # a moment ago -- ticked while the trace is actually hidden -- and
         # the checkbox would be lying about what is on screen.
-        self._sync_qber_checks()
+        self._sync_trace_checks()
         self._redraw(force=True)
 
-    def _rebuild_qber_checks(self):
+    def _rebuild_trace_checks(self):
         """One checkbox per policy in the CURRENT session, keyed by its
         display name -- the same string draw_panels labels its legend and
-        y-ticks with, and the same string `hidden_qber` stores.
+        y-ticks with, and the same string `hidden_traces` stores.
 
         Called every time a session is (re)built, i.e. on every Apply,
         because the policy set can change: a policy just ticked off in the
@@ -756,28 +811,28 @@ class PolicyVizApp(tk.Tk):
         diffing the old group against the new is what guarantees a stale
         checkbox for a dropped policy can never linger.
 
-        `hidden_qber` is the only source of truth for visibility -- this
+        `hidden_traces` is the only source of truth for visibility -- this
         method reads it once to seed each fresh BooleanVar and never keeps
         a second copy that could drift out of agreement with it.
         """
-        for child in self.qber_check_frame.winfo_children():
+        for child in self.trace_check_frame.winfo_children():
             child.destroy()
-        self.qber_checks = {}
+        self.trace_checks = {}
         if self.session is None:
             return
         for run in self.session.runs:
             name = run.display_name
-            var = tk.BooleanVar(value=self.session.qber_visible(name))
+            var = tk.BooleanVar(value=self.session.trace_visible(name))
             ttk.Checkbutton(
-                self.qber_check_frame, text=name, variable=var,
-                command=lambda n=name: self._on_qber_check(n)
+                self.trace_check_frame, text=name, variable=var,
+                command=lambda n=name: self._on_trace_check(n)
                 ).pack(anchor="w")
-            self.qber_checks[name] = var
+            self.trace_checks[name] = var
 
-    def _sync_qber_checks(self):
-        """Make every checkbox var agree with `hidden_qber`.
+    def _sync_trace_checks(self):
+        """Make every checkbox var agree with `hidden_traces`.
 
-        This is a ONE-WAY read: `hidden_qber` is never inferred from a
+        This is a ONE-WAY read: `hidden_traces` is never inferred from a
         checkbox's value, only written to it. That is what keeps the legend
         and the checkbox group from being two copies of the state that
         happen to agree most of the time -- whichever control was used last,
@@ -785,27 +840,27 @@ class PolicyVizApp(tk.Tk):
         """
         if self.session is None:
             return
-        for name, var in self.qber_checks.items():
-            var.set(self.session.qber_visible(name))
+        for name, var in self.trace_checks.items():
+            var.set(self.session.trace_visible(name))
 
-    def _on_qber_check(self, name):
+    def _on_trace_check(self, name):
         """A checkbox was clicked: flip the shared state and redraw.
 
-        This always TOGGLES `hidden_qber` rather than reading the
+        This always TOGGLES `hidden_traces` rather than reading the
         checkbox's own post-click value and writing that in. A Tk
         Checkbutton flips its variable before invoking `command`, so the two
-        are equivalent when the checkbox and `hidden_qber` already agree --
+        are equivalent when the checkbox and `hidden_traces` already agree --
         but toggling is also exactly what `_on_pick` does, and having both
         entry points agree on "flip the shared bit" rather than "impose
         whatever this widget now shows" is what keeps them from disagreeing
         about which one wins if they were ever out of step to begin with.
-        `_sync_qber_checks` right after is what actually reconciles the
-        widget with `hidden_qber`, not this method's belief about the click.
+        `_sync_trace_checks` right after is what actually reconciles the
+        widget with `hidden_traces`, not this method's belief about the click.
         """
         if self.session is None:
             return
-        self.session.toggle_qber(name)
-        self._sync_qber_checks()
+        self.session.toggle_trace(name)
+        self._sync_trace_checks()
         self._redraw(force=True)
 
     def _build_session(self, config, dqn_policy):
@@ -819,7 +874,7 @@ class PolicyVizApp(tk.Tk):
         # hidden", so a stale name cannot reach the draw. Keeping them means
         # re-ticking a policy restores the visibility it had rather than
         # springing back on top of the traces the reader was comparing.
-        carried = (set(self.session.hidden_qber)
+        carried = (set(self.session.hidden_traces)
                    if self.session is not None else set())
         try:
             self.session = policyviz.VizSession(
@@ -827,16 +882,16 @@ class PolicyVizApp(tk.Tk):
                 dqn_episodes=config.dqn_episodes)
         except Exception as exc:
             self.session = None
-            self._rebuild_qber_checks()
+            self._rebuild_trace_checks()
             self._set_status("cannot build session: %s" % exc, "error")
             messagebox.showerror("policy visualiser", str(exc))
             return
-        self.session.hidden_qber.update(carried)
-        # Rebuilt AFTER the carried toggles land in hidden_qber, and not
+        self.session.hidden_traces.update(carried)
+        # Rebuilt AFTER the carried toggles land in hidden_traces, and not
         # before: a policy that survived Apply must show the visibility it
-        # already had, which _rebuild_qber_checks can only read correctly
-        # once hidden_qber reflects it.
-        self._rebuild_qber_checks()
+        # already had, which _rebuild_trace_checks can only read correctly
+        # once hidden_traces reflects it.
+        self._rebuild_trace_checks()
         self._set_status("ready — seed %d, %d slots"
                          % (self.session.seed, config.horizon), "idle")
         self._redraw()

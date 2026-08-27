@@ -761,28 +761,58 @@ class TestHidingAQberTrace(unittest.TestCase):
         self.assertTrue(self._traces()[self.name].get_visible())
 
     def test_hiding_a_policy_takes_its_trace_off_the_qber_panel(self):
-        self.session.hidden_qber.add(self.name)
+        self.session.hidden_traces.add(self.name)
         self._draw()
         self.assertFalse(self._traces()[self.name].get_visible(),
                          "%s is hidden but its QBER trace is still drawn"
                          % (self.name,))
 
+    def _eta_lines(self):
+        """The cumulative-eta panel's lines, keyed by run label."""
+        runs = self.session.runs
+        return {r.display_name: ln
+                for r, ln in zip(runs, self.fig.axes[3].get_lines())}
+
+    def test_hiding_a_policy_takes_its_line_off_the_eta_panel_too(self):
+        # The eta curves bunch as tightly as the QBER traces, so the same
+        # control has to reach both or the panel the reader cares about most
+        # stays unreadable.
+        self.session.hidden_traces.add(self.name)
+        self._draw()
+        self.assertFalse(self._eta_lines()[self.name].get_visible(),
+                         "%s is hidden but its eta curve is still drawn"
+                         % (self.name,))
+
+    def test_hiding_one_policy_leaves_the_other_eta_curves_drawn(self):
+        self.session.hidden_traces.add(self.name)
+        self._draw()
+        self.assertTrue(self._eta_lines()[self.other].get_visible())
+
+    def test_hiding_a_line_never_touches_the_mode_lanes(self):
+        # The mode lanes are the evidence that a policy is RUNNING. If the
+        # visibility control reached them, a reader could hide a policy from
+        # the line panels and conclude it had never been selected.
+        self.session.hidden_traces.add(self.name)
+        self._draw()
+        labels = [t.get_text() for t in self.fig.axes[0].get_yticklabels()]
+        self.assertIn(self.name, labels)
+
     def test_hiding_one_policy_leaves_the_others_drawn(self):
-        self.session.hidden_qber.add(self.name)
+        self.session.hidden_traces.add(self.name)
         self._draw()
         self.assertTrue(self._traces()[self.other].get_visible())
 
     def test_toggling_twice_brings_the_trace_back(self):
-        self.session.toggle_qber(self.name)
-        self.session.toggle_qber(self.name)
+        self.session.toggle_trace(self.name)
+        self.session.toggle_trace(self.name)
         self._draw()
         self.assertTrue(self._traces()[self.name].get_visible())
 
     def test_toggle_reports_the_visibility_it_leaves_behind(self):
-        self.assertFalse(self.session.toggle_qber(self.name))
-        self.assertFalse(self.session.qber_visible(self.name))
-        self.assertTrue(self.session.toggle_qber(self.name))
-        self.assertTrue(self.session.qber_visible(self.name))
+        self.assertFalse(self.session.toggle_trace(self.name))
+        self.assertFalse(self.session.trace_visible(self.name))
+        self.assertTrue(self.session.toggle_trace(self.name))
+        self.assertTrue(self.session.trace_visible(self.name))
 
     # -- the state cannot live on the artist ---------------------------
 
@@ -793,7 +823,7 @@ class TestHidingAQberTrace(unittest.TestCase):
         # a second and the user's click would silently undo itself while the
         # episode ran.
         self._draw()
-        self.session.toggle_qber(self.name)
+        self.session.toggle_trace(self.name)
         self._draw()
         self._draw()
         self.assertFalse(self._traces()[self.name].get_visible(),
@@ -811,7 +841,7 @@ class TestHidingAQberTrace(unittest.TestCase):
 
     def test_the_state_is_not_read_back_off_the_figure(self):
         # A fresh figure, never drawn to, must render the same hiding.
-        self.session.toggle_qber(self.name)
+        self.session.toggle_trace(self.name)
         self._draw()
         other = Figure(figsize=(9, 8))
         FigureCanvasAgg(other)
@@ -822,23 +852,23 @@ class TestHidingAQberTrace(unittest.TestCase):
     def test_reset_keeps_the_toggles(self):
         # Reset rewinds the EPISODE. Which traces the reader switched off is
         # not part of the trajectory.
-        self.session.toggle_qber(self.name)
+        self.session.toggle_trace(self.name)
         self.session.reset()
-        self.assertFalse(self.session.qber_visible(self.name))
+        self.assertFalse(self.session.trace_visible(self.name))
 
     # -- it must not leak out of panel 2 -------------------------------
 
     def test_hiding_a_trace_leaves_the_mode_lanes_alone(self):
         # A reader who could hide a policy from the QBER panel and thereby
         # lose its lane would conclude it was never selected.
-        self.session.hidden_qber.add(self.name)
+        self.session.hidden_traces.add(self.name)
         self._draw()
         labels = [t.get_text() for t in self.fig.axes[0].get_yticklabels()]
         self.assertEqual(labels,
                          [r.display_name for r in self.session.runs])
 
     def test_hiding_a_trace_leaves_the_mode_bands_drawn(self):
-        self.session.hidden_qber.add(self.name)
+        self.session.hidden_traces.add(self.name)
         self._draw()
         hidden_lane = [i for i, r in enumerate(self.session.runs)
                        if r.display_name == self.name][0]
@@ -852,21 +882,26 @@ class TestHidingAQberTrace(unittest.TestCase):
         self.assertIn(round(hidden_lane - 0.38, 2), lows)
 
     def test_hiding_a_trace_leaves_the_buffer_panel_alone(self):
-        self.session.hidden_qber.add(self.name)
+        self.session.hidden_traces.add(self.name)
         self._draw()
         drawn = [ln for ln in self.fig.axes[2].get_lines()
                  if ln.get_visible()]
         self.assertEqual(len(drawn), len(self.session.runs))
 
-    def test_hiding_a_trace_leaves_the_eta_panel_alone(self):
-        self.session.hidden_qber.add(self.name)
+    def test_hiding_a_trace_hides_exactly_one_eta_curve(self):
+        # This test used to assert the opposite -- that the eta panel was
+        # untouched. The control was deliberately widened to cover it, on the
+        # grounds that the eta curves bunch as tightly as the QBER traces.
+        # What must NOT widen is the mode lanes and the scoreboard: those are
+        # the evidence a policy is running at all.
+        self.session.hidden_traces.add(self.name)
         self._draw()
         drawn = [ln for ln in self.fig.axes[3].get_lines()
                  if ln.get_visible()]
-        self.assertEqual(len(drawn), len(self.session.runs))
+        self.assertEqual(len(drawn), len(self.session.runs) - 1)
 
     def test_hiding_a_trace_leaves_the_scoreboard_alone(self):
-        self.session.hidden_qber.add(self.name)
+        self.session.hidden_traces.add(self.name)
         self._draw()
         board = format_scoreboard(self.session)
         for run in self.session.runs:
@@ -877,14 +912,14 @@ class TestHidingAQberTrace(unittest.TestCase):
     def test_a_hidden_policy_keeps_its_legend_entry(self):
         # It is the only way back. An entry that vanished with its trace
         # would make the hiding irreversible.
-        self.session.hidden_qber.add(self.name)
+        self.session.hidden_traces.add(self.name)
         self._draw()
         texts = [t.get_text()
                  for t in self.fig.axes[1].get_legend().get_texts()]
         self.assertIn(self.name, texts)
 
     def test_a_hidden_legend_entry_is_greyed_out(self):
-        self.session.hidden_qber.add(self.name)
+        self.session.hidden_traces.add(self.name)
         self._draw()
         handle, text = self._entry(self.name)
         self.assertEqual(text.get_color(), policyviz.HIDDEN_LEGEND_COLOR)
@@ -896,7 +931,7 @@ class TestHidingAQberTrace(unittest.TestCase):
         self.assertLess(handle.get_alpha(), 1.0)
 
     def test_a_visible_legend_entry_is_not_greyed_out(self):
-        self.session.hidden_qber.add(self.name)
+        self.session.hidden_traces.add(self.name)
         self._draw()
         handle, text = self._entry(self.other)
         self.assertNotEqual(text.get_color(), policyviz.HIDDEN_LEGEND_COLOR)
@@ -904,9 +939,9 @@ class TestHidingAQberTrace(unittest.TestCase):
         self.assertIn(handle.get_alpha(), (None, 1.0))
 
     def test_the_greying_is_undone_when_the_trace_comes_back(self):
-        self.session.toggle_qber(self.name)
+        self.session.toggle_trace(self.name)
         self._draw()
-        self.session.toggle_qber(self.name)
+        self.session.toggle_trace(self.name)
         self._draw()
         handle, text = self._entry(self.name)
         self.assertNotEqual(text.get_color(), policyviz.HIDDEN_LEGEND_COLOR)
@@ -947,7 +982,7 @@ class TestHidingAQberTrace(unittest.TestCase):
         FigureCanvasAgg(fig)
         draw_panels(fig, session)
         before = fig.axes[1].get_ylim()
-        session.hidden_qber.add(tall)
+        session.hidden_traces.add(tall)
         draw_panels(fig, session)
         self.assertEqual(fig.axes[1].get_ylim(), before)
 
@@ -955,7 +990,7 @@ class TestHidingAQberTrace(unittest.TestCase):
         # Pins the value, not just its stability: an axis frozen at some
         # other number would also "not move".
         session, tall = self._session_with_one_tall_trace()
-        session.hidden_qber.add(tall)
+        session.hidden_traces.add(tall)
         fig = Figure(figsize=(9, 8))
         FigureCanvasAgg(fig)
         draw_panels(fig, session)
@@ -966,7 +1001,7 @@ class TestHidingAQberTrace(unittest.TestCase):
 
     def test_hiding_every_trace_still_renders(self):
         for run in self.session.runs:
-            self.session.hidden_qber.add(run.display_name)
+            self.session.hidden_traces.add(run.display_name)
         self._draw()
         self.assertEqual(len(self.fig.axes), 4)
         self.assertTrue(all(not ln.get_visible()
@@ -987,7 +1022,7 @@ class TestHidingAQberTrace(unittest.TestCase):
 
     def test_the_death_thresholds_survive_every_policy_being_hidden(self):
         for run in self.session.runs:
-            self.session.hidden_qber.add(run.display_name)
+            self.session.hidden_traces.add(run.display_name)
         self._draw()
         levels = {round(ln.get_ydata()[0], 4)
                   for ln in self.fig.axes[1].get_lines()
@@ -1033,7 +1068,7 @@ class TestHidingAQberTrace(unittest.TestCase):
     def test_a_name_no_longer_selected_does_not_break_the_draw(self):
         # Apply carries the hidden set across a change of policy selection,
         # so names for policies that are gone are normal, not exceptional.
-        self.session.hidden_qber.add("a policy that is not selected")
+        self.session.hidden_traces.add("a policy that is not selected")
         self._draw()
         self.assertEqual(len(self.fig.axes), 4)
         self.assertTrue(all(ln.get_visible()
@@ -1262,7 +1297,7 @@ class TestTheWindowConstructsAndRenders(unittest.TestCase):
         name = self.app.session.runs[0].display_name
         self.app._redraw(force=True)
         self._click(self._legend_entry(name))
-        self.assertFalse(self.app.session.qber_visible(name))
+        self.assertFalse(self.app.session.trace_visible(name))
         self.assertFalse(self._trace(name).get_visible())
 
     def test_one_click_after_several_redraws_makes_exactly_one_toggle(self):
@@ -1281,13 +1316,13 @@ class TestTheWindowConstructsAndRenders(unittest.TestCase):
             self.app._redraw(force=True)
         entry = self._legend_entry(name)
         toggles = []
-        real = self.app.session.toggle_qber
-        self.app.session.toggle_qber = lambda n: toggles.append(n)
+        real = self.app.session.toggle_trace
+        self.app.session.toggle_trace = lambda n: toggles.append(n)
         self.app._redraw = lambda *a, **k: None
         try:
             self._click(entry)
         finally:
-            self.app.session.toggle_qber = real
+            self.app.session.toggle_trace = real
             del self.app._redraw
         self.assertEqual(toggles, [name])
 
@@ -1295,26 +1330,26 @@ class TestTheWindowConstructsAndRenders(unittest.TestCase):
         name = self.app.session.runs[0].display_name
         self._click(self._legend_entry(name))
         self._click(self._legend_entry(name))
-        self.assertTrue(self.app.session.qber_visible(name))
+        self.assertTrue(self.app.session.trace_visible(name))
         self.assertTrue(self._trace(name).get_visible())
 
     def test_clicking_a_death_threshold_caption_changes_nothing(self):
-        before = set(self.app.session.hidden_qber)
+        before = set(self.app.session.hidden_traces)
         caption = [t for t in self.app.figure.axes[1].get_legend().get_texts()
                    if "dies" in t.get_text()][0]
         self._click(caption)
-        self.assertEqual(self.app.session.hidden_qber, before)
+        self.assertEqual(self.app.session.hidden_traces, before)
 
     def test_a_click_on_something_else_entirely_is_ignored(self):
         # pick_event fires for any pickable artist on the canvas.
         self._click(self.app.figure.axes[0])
-        self.assertEqual(self.app.session.hidden_qber, set())
+        self.assertEqual(self.app.session.hidden_traces, set())
 
     def test_a_hidden_trace_stays_hidden_across_step(self):
         name = self.app.session.runs[0].display_name
         self._click(self._legend_entry(name))
         self.app._step_once()
-        self.assertFalse(self.app.session.qber_visible(name))
+        self.assertFalse(self.app.session.trace_visible(name))
         self.assertFalse(self._trace(name).get_visible())
 
     def test_a_hidden_trace_stays_hidden_across_start_pause_and_a_tick(self):
@@ -1324,14 +1359,14 @@ class TestTheWindowConstructsAndRenders(unittest.TestCase):
         self.app.session.step(5)
         self.app._redraw(force=True)
         self.app._toggle_run()
-        self.assertFalse(self.app.session.qber_visible(name))
+        self.assertFalse(self.app.session.trace_visible(name))
         self.assertFalse(self._trace(name).get_visible())
 
     def test_a_hidden_trace_stays_hidden_across_reset(self):
         name = self.app.session.runs[0].display_name
         self._click(self._legend_entry(name))
         self.app._reset()
-        self.assertFalse(self.app.session.qber_visible(name))
+        self.assertFalse(self.app.session.trace_visible(name))
 
     def test_apply_carries_the_toggles_over(self):
         # Apply rebuilds the session, but which traces are switched off is a
@@ -1342,7 +1377,7 @@ class TestTheWindowConstructsAndRenders(unittest.TestCase):
         self.app.entries["lam"].set("2.0")
         self.app._apply()
         self.assertEqual(self.dialogs, [])
-        self.assertFalse(self.app.session.qber_visible(name))
+        self.assertFalse(self.app.session.trace_visible(name))
 
     def test_a_toggle_for_a_policy_that_is_dropped_does_not_break_apply(self):
         # A stale name in the carried set is normal, not exceptional.
@@ -1350,7 +1385,7 @@ class TestTheWindowConstructsAndRenders(unittest.TestCase):
         self.app.checks["always-ent"].set(False)
         self.app._apply()
         self.assertEqual(self.dialogs, [])
-        self.assertIn("always-ent", self.app.session.hidden_qber)
+        self.assertIn("always-ent", self.app.session.hidden_traces)
         self.assertEqual(len(self.app.figure.axes), 4)
 
     def test_apply_reports_a_bad_form_instead_of_crashing(self):
@@ -1365,7 +1400,7 @@ class TestTheWindowConstructsAndRenders(unittest.TestCase):
 
 
 class TestTheQberVisibilityCheckboxGroup(unittest.TestCase):
-    """Checkboxes are a SECOND control over `hidden_qber`, alongside the
+    """Checkboxes are a SECOND control over `hidden_traces`, alongside the
     legend click tested above. Two controls over one piece of state is the
     trap: if either one can change the state without the other finding out,
     they desync and whichever widget is stale starts lying about what is on
@@ -1419,7 +1454,7 @@ class TestTheQberVisibilityCheckboxGroup(unittest.TestCase):
         self.app.canvas.callbacks.process("pick_event", event)
 
     def _qber_widget(self, name):
-        for child in self.app.qber_check_frame.winfo_children():
+        for child in self.app.trace_check_frame.winfo_children():
             if isinstance(child, self.ui.ttk.Checkbutton) \
                     and child.cget("text") == name:
                 return child
@@ -1428,19 +1463,19 @@ class TestTheQberVisibilityCheckboxGroup(unittest.TestCase):
     # -- the group matches the session -----------------------------------
 
     def test_there_is_a_checkbox_for_every_policy_in_the_session(self):
-        self.assertEqual(set(self.app.qber_checks),
+        self.assertEqual(set(self.app.trace_checks),
                          {r.display_name for r in self.app.session.runs})
 
     def test_the_death_thresholds_get_no_checkbox(self):
         # Only session.runs feed the group; the two reference lines never
         # appear as a policy name, so this also covers "the group has
         # exactly as many entries as there are runs, no more".
-        self.assertEqual(len(self.app.qber_checks),
+        self.assertEqual(len(self.app.trace_checks),
                          len(self.app.session.runs))
-        self.assertFalse(any("dies" in name for name in self.app.qber_checks))
+        self.assertFalse(any("dies" in name for name in self.app.trace_checks))
 
     def test_checkboxes_start_checked_when_nothing_is_hidden(self):
-        for var in self.app.qber_checks.values():
+        for var in self.app.trace_checks.values():
             self.assertTrue(var.get())
 
     # -- unticking actually hides the trace -------------------------------
@@ -1449,7 +1484,7 @@ class TestTheQberVisibilityCheckboxGroup(unittest.TestCase):
         name = self.app.session.runs[0].display_name
         self.app._redraw(force=True)
         self._qber_widget(name).invoke()
-        self.assertFalse(self.app.session.qber_visible(name))
+        self.assertFalse(self.app.session.trace_visible(name))
         self.assertFalse(self._trace(name).get_visible())
 
     def test_unticking_leaves_a_different_policys_trace_alone(self):
@@ -1464,7 +1499,7 @@ class TestTheQberVisibilityCheckboxGroup(unittest.TestCase):
         widget = self._qber_widget(name)
         widget.invoke()
         widget.invoke()
-        self.assertTrue(self.app.session.qber_visible(name))
+        self.assertTrue(self.app.session.trace_visible(name))
         self.assertTrue(self._trace(name).get_visible())
 
     def test_unticking_greys_out_the_legend_entry_too(self):
@@ -1480,8 +1515,8 @@ class TestTheQberVisibilityCheckboxGroup(unittest.TestCase):
         # must not leave the checkbox showing the old visibility.
         name = self.app.session.runs[0].display_name
         self._click(self._legend_entry(name))
-        self.assertFalse(self.app.session.qber_visible(name))
-        self.assertFalse(self.app.qber_checks[name].get(),
+        self.assertFalse(self.app.session.trace_visible(name))
+        self.assertFalse(self.app.trace_checks[name].get(),
                          "checkbox still says visible after a legend click "
                          "hid the trace -- the two controls have desynced")
 
@@ -1490,8 +1525,8 @@ class TestTheQberVisibilityCheckboxGroup(unittest.TestCase):
         entry = self._legend_entry(name)
         self._click(entry)
         self._click(self._legend_entry(name))
-        self.assertTrue(self.app.session.qber_visible(name))
-        self.assertTrue(self.app.qber_checks[name].get())
+        self.assertTrue(self.app.session.trace_visible(name))
+        self.assertTrue(self.app.trace_checks[name].get())
 
     def test_unticking_a_checkbox_leaves_the_legend_entry_in_step(self):
         # The reverse direction: a checkbox click updates the legend's own
@@ -1500,35 +1535,35 @@ class TestTheQberVisibilityCheckboxGroup(unittest.TestCase):
         name = self.app.session.runs[0].display_name
         self._qber_widget(name).invoke()
         self.assertFalse(self._trace(name).get_visible())
-        self.assertFalse(self.app.qber_checks[name].get())
+        self.assertFalse(self.app.trace_checks[name].get())
 
     # -- the group is rebuilt on Apply, not left stale ---------------------
 
     def test_apply_adds_a_checkbox_for_a_newly_selected_policy(self):
-        self.assertNotIn("buffer-aware-0.045-0.25", self.app.qber_checks)
+        self.assertNotIn("buffer-aware-0.045-0.25", self.app.trace_checks)
         self.app.checks["buffer-aware"].set(True)
         self.app._apply()
         self.assertEqual(self.dialogs, [])
-        self.assertIn("buffer-aware-0.045-0.25", self.app.qber_checks)
+        self.assertIn("buffer-aware-0.045-0.25", self.app.trace_checks)
 
     def test_apply_drops_the_checkbox_for_a_deselected_policy(self):
-        self.assertIn("always-ent", self.app.qber_checks)
+        self.assertIn("always-ent", self.app.trace_checks)
         self.app.checks["always-ent"].set(False)
         self.app._apply()
         self.assertEqual(self.dialogs, [])
-        self.assertNotIn("always-ent", self.app.qber_checks)
+        self.assertNotIn("always-ent", self.app.trace_checks)
 
     def test_apply_keeps_the_visibility_a_surviving_policy_had(self):
         self._qber_widget("always-pm").invoke()
         self.app.entries["lam"].set("2.0")
         self.app._apply()
         self.assertEqual(self.dialogs, [])
-        self.assertIn("always-pm", self.app.qber_checks)
-        self.assertFalse(self.app.qber_checks["always-pm"].get())
-        self.assertFalse(self.app.session.qber_visible("always-pm"))
+        self.assertIn("always-pm", self.app.trace_checks)
+        self.assertFalse(self.app.trace_checks["always-pm"].get())
+        self.assertFalse(self.app.session.trace_visible("always-pm"))
 
     def test_apply_does_not_resurrect_a_hidden_trace_as_a_stray_checkbox(self):
-        # A toggle for a policy no longer selected is carried in hidden_qber
+        # A toggle for a policy no longer selected is carried in hidden_traces
         # (see _build_session), but it must not grow a checkbox: there is no
         # run to draw a trace for it, and a checkbox with nothing behind it
         # would be a control that does nothing when clicked.
@@ -1536,7 +1571,7 @@ class TestTheQberVisibilityCheckboxGroup(unittest.TestCase):
         self.app.checks["always-ent"].set(False)
         self.app._apply()
         self.assertEqual(self.dialogs, [])
-        self.assertNotIn("always-ent", self.app.qber_checks)
+        self.assertNotIn("always-ent", self.app.trace_checks)
 
     # -- unticking touches ONLY the QBER panel ------------------------------
 

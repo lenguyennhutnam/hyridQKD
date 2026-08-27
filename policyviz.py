@@ -704,7 +704,7 @@ class VizSession:
         # hashed into the DQN cache key, and two configurations that differ
         # only in which curve is on screen are not two different experiments.
         # The session is also the only object `draw_panels` is handed.
-        self.hidden_qber = set()
+        self.hidden_traces = set()
         # {artist: policy name} for this frame's clickable legend entries.
         # Refreshed by every `draw_panels`; it is a lookup table, not state.
         self.legend_picks = {}
@@ -748,11 +748,11 @@ class VizSession:
     def slot(self):
         return max((r.slot for r in self.runs), default=0)
 
-    def qber_visible(self, name):
-        """Is this policy's QBER trace switched on?"""
-        return name not in self.hidden_qber
+    def trace_visible(self, name):
+        """Is this policy's line switched on in the QBER and eta panels?"""
+        return name not in self.hidden_traces
 
-    def toggle_qber(self, name):
+    def toggle_trace(self, name):
         """Flip one policy's QBER trace. Returns its new visibility.
 
         Only panel 2 consults this. The mode lanes, the buffer panel, the
@@ -761,10 +761,10 @@ class VizSession:
         and a figure that let a click erase it everywhere would let someone
         conclude a policy was never selected.
         """
-        if name in self.hidden_qber:
-            self.hidden_qber.discard(name)
+        if name in self.hidden_traces:
+            self.hidden_traces.discard(name)
             return True
-        self.hidden_qber.add(name)
+        self.hidden_traces.add(name)
         return False
 
     def reset(self):
@@ -922,7 +922,7 @@ def _wire_qber_legend(legend, session, names):
         text.set_picker(True)
         picks[handle] = name
         picks[text] = name
-        if not session.qber_visible(name):
+        if not session.trace_visible(name):
             handle.set_color(HIDDEN_LEGEND_COLOR)
             handle.set_alpha(HIDDEN_LEGEND_ALPHA)
             text.set_color(HIDDEN_LEGEND_COLOR)
@@ -938,7 +938,7 @@ def draw_panels(fig, session, title=None):
     "export" path is how a live panel and its published figure drift apart.
 
     Every artist here is thrown away and rebuilt on each call (`fig.clear()`
-    below), which is why panel 2 reads `session.hidden_qber` rather than
+    below), which is why panel 2 reads `session.hidden_traces` rather than
     trusting any flag left on a line. As a side effect the call refreshes
     `session.legend_picks`, the map the window's pick handler resolves a
     clicked legend entry through.
@@ -988,9 +988,9 @@ def draw_panels(fig, session, title=None):
         line, = ax_qber.plot([t for t in run.t], [100.0 * q for q in run.qber],
                              color=run.color, lw=1.0, ls=run.linestyle,
                              label=run.display_name)
-        # READ from the session, every frame. See VizSession.hidden_qber for
+        # READ from the session, every frame. See VizSession.hidden_traces for
         # why the flag cannot be left on this line.
-        line.set_visible(session.qber_visible(run.display_name))
+        line.set_visible(session.trace_visible(run.display_name))
         handles.append(line)
         labels.append(run.display_name)
         names.append(run.display_name)
@@ -1003,7 +1003,7 @@ def draw_panels(fig, session, title=None):
         names.append(None)
     plots.style_axis(ax_qber,
                      title="observed QBER (windowed)  —  click a policy in "
-                           "the legend to hide/show its trace",
+                           "the legend to hide/show it here and in η",
                      ylabel="QBER [%]")
     # Headroom for the legend, which would otherwise sit on top of the first
     # few hundred slots -- the stretch where the policies first diverge.
@@ -1045,9 +1045,15 @@ def draw_panels(fig, session, title=None):
                   % (b_max, peak_buffer))
 
     # --- panel 4: cumulative eta ----------------------------------------
+    # Same visibility set as panel 2: with six tracks the eta curves bunch as
+    # tightly as the QBER traces do. The MODE LANES and the SCOREBOARD still
+    # ignore it, deliberately -- a policy cleared off the line panels is still
+    # running, and hiding it everywhere would let someone conclude it was
+    # never selected.
     for run in runs:
-        ax_eta.plot(run.t, run.eta_trace, color=run.color, lw=1.2,
-                    ls=run.linestyle)
+        line, = ax_eta.plot(run.t, run.eta_trace, color=run.color, lw=1.2,
+                            ls=run.linestyle)
+        line.set_visible(session.trace_visible(run.display_name))
     plots.style_axis(ax_eta, title="cumulative η  (served / arrived, eq 24)",
                      xlabel="slot", ylabel="η")
     ax_eta.set_ylim(0.0, 1.02)
