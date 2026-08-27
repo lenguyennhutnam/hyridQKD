@@ -6,3 +6,4 @@ build/
 *.csv
 panel_default.json
 figs/
+policyviz_default.json

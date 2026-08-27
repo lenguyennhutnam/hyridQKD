@@ -28,6 +28,7 @@ from matplotlib.figure import Figure  # noqa: E402
 import channel  # noqa: E402
 import policyviz  # noqa: E402
 import presets  # noqa: E402
+import vizstate  # noqa: E402
 from dqn import DQNConfig, training_seed_range  # noqa: E402
 import plots  # noqa: E402
 from evemarkov import EveParams  # noqa: E402
@@ -2468,3 +2469,382 @@ class TestTheOperatingPointButtons(unittest.TestCase):
         self._answer("ent", ("ent_advanced", _ent_env(mu=0.015)))
         self.app._edit_params("ent")
         self.assertIn("Apply", self.app.status.cget("text"))
+
+
+class TestTheSavedConfiguration(unittest.TestCase):
+    """The Save button, and coming back up in exactly that state.
+
+    The complaint this answers: load a preset, change one number, and the only
+    way to keep it was to invent a preset name for it.
+
+    `vizstate.DEFAULT_PATH` is redirected into a temp directory for the whole
+    class. A test that wrote the real file would replace the developer's own
+    startup configuration -- panelstate's tests take the same precaution, and
+    its docstring records the trap being hit for real.
+    """
+
+    def setUp(self):
+        try:
+            import policyviz_ui
+        except Exception as exc:                  # pragma: no cover
+            self.skipTest("tkinter/matplotlib unavailable: %s" % exc)
+        self.ui = policyviz_ui
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "policyviz_default.json")
+        self._real_path = vizstate.DEFAULT_PATH
+        vizstate.DEFAULT_PATH = self.path
+        # Save reports a bad box with messagebox.showerror, which BLOCKS the
+        # mainloop until someone clicks it; WSLg provides a display here, so
+        # an unstubbed one would hang the run rather than fail it.
+        self.dialogs = []
+        self._real_messagebox = policyviz_ui.messagebox
+        policyviz_ui.messagebox = _RecordingMessagebox(self.dialogs)
+        self.apps = []
+        self.app = self._open()
+
+    def _open(self, saved=None, config=None):
+        try:
+            app = self.ui.PolicyVizApp(config or small_config(), saved=saved)
+        except Exception as exc:                  # pragma: no cover
+            self._restore()
+            self.skipTest("cannot create Tk window: %s" % exc)
+        app.withdraw()
+        self.apps.append(app)
+        return app
+
+    def _reopen(self, saved=None):
+        """Close the window and open a fresh one -- a restart, in one process.
+
+        The old one is destroyed FIRST: two live Tk roots in one process is
+        its own source of trouble, and this suite already avoids it elsewhere.
+        """
+        self._close(self.app)
+        self.apps.remove(self.app)
+        self.app = self._open(saved=saved)
+        return self.app
+
+    @staticmethod
+    def _close(app):
+        app._running = False
+        app.update_idletasks()
+        app.destroy()
+
+    def _restore(self):
+        vizstate.DEFAULT_PATH = self._real_path
+        if getattr(self, "_real_messagebox", None) is not None:
+            self.ui.messagebox = self._real_messagebox
+
+    def tearDown(self):
+        self._restore()
+        for app in getattr(self, "apps", []):
+            self._close(app)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # --- what gets written -------------------------------------------------
+
+    def test_it_saves_what_the_form_shows_not_what_was_applied(self):
+        """THE point of the button.
+
+        Saving from `config_obj` -- the configuration Apply last built --
+        would write the previously applied numbers and silently discard the
+        edit the user pressed Save to keep.
+        """
+        self.app.entries["lam"].set("3.75")
+        self.app._save_state()
+        self.assertAlmostEqual(vizstate.load_state()["fields"]["lam"], 3.75)
+        # ... and the applied session is untouched by the save.
+        self.assertAlmostEqual(self.app.session.params.lam, 2.5)
+
+    def test_it_saves_every_field_on_the_form(self):
+        state = self.app._collect_state()
+        for name, _label, _width in self.ui.FIELDS:
+            if name is None:                      # a heading row
+                continue
+            self.assertIn(name, state["fields"])
+
+    def test_an_edited_operating_point_is_saved_as_its_numbers(self):
+        """A preset that has been edited is "custom": the base preset name
+        alone cannot describe it, so the dataclass itself is written."""
+        self.app._set_operating_point("ent", "ent_advanced",
+                                      _ent_env(mu=0.031))
+        self.app._save_state()
+        loaded = vizstate.load_state()
+        self.assertEqual(loaded["ent_preset"], "ent_advanced")
+        self.assertAlmostEqual(loaded["ent_env"].mu, 0.031)
+
+    def test_an_unedited_operating_point_is_saved_as_none(self):
+        """None means "run presets/aurea.json as it ships".
+
+        Writing a frozen copy of the preset instead would load cleanly and
+        quietly stop tracking the preset file: a later edit to
+        presets/aurea.json would never be picked up again.
+        """
+        self.assertIsNone(self.app._collect_state()["pm_env"])
+        self.app._save_state()
+        loaded = vizstate.load_state()
+        self.assertIn("pm_env", loaded)
+        self.assertIsNone(loaded["pm_env"])
+
+    # --- coming back up ----------------------------------------------------
+
+    def test_the_edit_and_the_form_survive_a_restart(self):
+        self.app._set_operating_point("ent", "ent_advanced",
+                                      _ent_env(mu=0.031))
+        self.app.entries["lam"].set("3.75")
+        self.app._save_state()
+        app = self._reopen(saved=vizstate.load_state())
+        self.assertAlmostEqual(app.mode_env["ent"].mu, 0.031)
+        self.assertEqual(app.entries["lam"].get(), "3.75")
+        # Restored AND applied: the reopened window is running the physics it
+        # is displaying, not merely showing the numbers on the form.
+        self.assertAlmostEqual(app.session.params.ent_env.mu, 0.031)
+        self.assertAlmostEqual(app.session.params.lam, 3.75)
+        self.assertEqual(app.mode_buttons["ent"].cget("text"), "ENT: custom")
+
+    def test_an_unedited_point_still_tracks_its_preset_after_a_restart(self):
+        self.app._save_state()
+        app = self._reopen(saved=vizstate.load_state())
+        self.assertIsNone(app.mode_env["pm"])
+        self.assertEqual(app.preset_var["pm"].get(), "aurea")
+        self.assertEqual(app.mode_buttons["pm"].cget("text"), "PM: aurea")
+
+    def test_the_policy_selection_comes_back(self):
+        chosen = {"always-pm", "buffer-aware"}
+        for stem, var in self.app.checks.items():
+            var.set(stem in chosen)
+        self.app._save_state()
+        app = self._reopen(saved=vizstate.load_state())
+        self.assertEqual({s for s, v in app.checks.items() if v.get()}, chosen)
+        self.assertIn("buffer-aware-0.045-0.25", app.config_obj.specs)
+
+    def test_a_threshold_comes_back_even_with_its_policy_unticked(self):
+        # A number that was typed and then set aside is still a thing the
+        # user chose; losing it means retyping it next session.
+        self.app.checks["greedy"].set(False)
+        self.app.theta.set("0.02")
+        self.app._save_state()
+        app = self._reopen(saved=vizstate.load_state())
+        self.assertEqual(app.theta.get(), "0.02")
+        self.assertFalse(app.checks["greedy"].get())
+
+    def test_the_hidden_traces_come_back(self):
+        name = self.app.session.runs[1].display_name
+        self.app.session.toggle_trace(name)
+        self.app._save_state()
+        app = self._reopen(saved=vizstate.load_state())
+        self.assertIn(name, app.session.hidden_traces)
+        self.assertFalse(app.trace_checks[name].get())
+
+    def test_the_speed_comes_back(self):
+        self.app.speed.set(137)
+        self.app._save_state()
+        app = self._reopen(saved=vizstate.load_state())
+        self.assertEqual(app.speed.get(), 137)
+
+    def test_a_speed_off_the_scale_is_clamped_to_the_slider(self):
+        self.app._apply_state({"fields": {}, "speed": 10000})
+        self.assertEqual(self.app.speed.get(), self.ui.SPEED_MAX)
+
+    # --- the startup order -------------------------------------------------
+
+    def test_a_field_absent_from_an_old_saved_file_keeps_its_default(self):
+        """THE ORDER: seed from the configuration first, overlay the saved
+        file second.
+
+        Overlaying first (or letting the saved file be the only thing that
+        fills the form) leaves every control the file predates BLANK, so a
+        default written before a field existed would break the form.
+        """
+        app = self._reopen(saved={"fields": {"lam": 9.5}})
+        self.assertEqual(app.entries["lam"].get(), "9.5")
+        self.assertEqual(app.entries["horizon"].get(), str(SLOTS))
+        self.assertEqual(app.entries["n_x"].get(), str(VizConfig.n_x))
+
+    def test_a_control_the_saved_file_omits_is_left_alone(self):
+        app = self._reopen(saved={"fields": {}})
+        self.assertEqual({s for s, v in app.checks.items() if v.get()},
+                         set(self.ui.PolicyVizApp._stems(small_config().specs)))
+        self.assertEqual(app.preset_var["pm"].get(), "aurea")
+        self.assertIsNone(app.mode_env["ent"])
+        self.assertEqual(app.theta.get(), "0.045")
+
+    def test_the_window_does_not_read_the_file_on_its_own(self):
+        # The caller reads it and hands it in. A constructor that read the
+        # disk itself would make every OTHER test in this suite depend on
+        # whether the developer happened to have saved a configuration.
+        self.app.entries["lam"].set("9.9")
+        self.app._save_state()
+        app = self._reopen()                      # saved=None
+        self.assertEqual(app.entries["lam"].get(), "2.5")
+
+    def test_the_module_entry_point_reads_the_file(self):
+        """`python3 policyviz_ui.py` is a second way in, and it must reach the
+        saved configuration too -- the CALLER reads the file, so every caller
+        has to. (`python3 policyviz.py` goes through policyviz.main, which the
+        next class covers.)"""
+        self.app._save_state()
+        seen = {}
+
+        class _Recorder:
+            def __init__(self, config=None, saved=None):
+                seen["config"], seen["saved"] = config, saved
+
+            def mainloop(self):
+                pass
+
+        real = self.ui.PolicyVizApp
+        self.ui.PolicyVizApp = _Recorder
+        try:
+            self.ui.main()
+        finally:
+            self.ui.PolicyVizApp = real
+        self.assertIsNotNone(seen["saved"])
+        self.assertAlmostEqual(seen["saved"]["fields"]["lam"], 2.5)
+
+    # --- Save and Apply are separate ---------------------------------------
+
+    def test_save_does_not_apply(self):
+        """Apply rebuilds the session, which throws away the episode on
+        screen and, with "dqn" ticked, starts a training thread. A Save that
+        did that as a side effect would cost the user the run they were
+        watching."""
+        self.app.session.step(5)
+        self.app.entries["lam"].set("3.75")
+        self.app._save_state()
+        self.assertAlmostEqual(self.app.config_obj.lam, 2.5)
+        self.assertEqual(self.app.session.slot, 5)
+        # And it says so, rather than leaving the user to guess.
+        self.assertIn("Apply", self.app.status.cget("text"))
+
+    def test_apply_does_not_save(self):
+        # The reverse coupling is just as bad: it would overwrite the saved
+        # configuration every time someone nudged a parameter to try it.
+        self.app.entries["lam"].set("3.75")
+        self.app._apply()
+        self.assertFalse(os.path.exists(self.path))
+        self.assertIsNone(vizstate.load_state())
+
+    def test_save_refuses_a_form_it_could_not_apply(self):
+        self.app.entries["lam"].set("")
+        self.app._save_state()
+        self.assertFalse(os.path.exists(self.path))
+        self.assertTrue(self.app.status.cget("text").startswith("save failed"))
+        self.assertTrue([d for d in self.dialogs if d[0] == "error"])
+
+    def test_save_refuses_an_empty_policy_selection(self):
+        for var in self.app.checks.values():
+            var.set(False)
+        self.app._save_state()
+        self.assertFalse(os.path.exists(self.path))
+
+    # --- Restore -----------------------------------------------------------
+
+    def test_restore_puts_the_saved_form_back_mid_session(self):
+        self.app._save_state()
+        self.app.entries["lam"].set("9.9")
+        self.app._restore_state()
+        self.assertEqual(self.app.entries["lam"].get(), "2.5")
+
+    def test_restore_does_not_apply_either(self):
+        self.app._save_state()
+        self.app.entries["lam"].set("9.9")
+        self.app._apply()
+        self.app._restore_state()
+        self.assertEqual(self.app.entries["lam"].get(), "2.5")
+        self.assertAlmostEqual(self.app.session.params.lam, 9.9)
+        self.assertIn("Apply", self.app.status.cget("text"))
+
+    def test_restore_puts_the_hidden_traces_back_on_the_live_session(self):
+        # hidden_traces is the one restored thing Apply has nothing to do
+        # with -- it is a view choice, not part of the configuration -- so it
+        # is imposed on the running session straight away.
+        name = self.app.session.runs[1].display_name
+        self.app.session.toggle_trace(name)
+        self.app._save_state()
+        self.app.session.toggle_trace(name)
+        self.assertNotIn(name, self.app.session.hidden_traces)
+        self.app._restore_state()
+        self.assertIn(name, self.app.session.hidden_traces)
+        self.assertFalse(self.app.trace_checks[name].get())
+
+    def test_restore_without_a_saved_file_says_so(self):
+        self.app.entries["lam"].set("9.9")
+        self.app._restore_state()
+        self.assertIn("nothing saved", self.app.status.cget("text"))
+        self.assertEqual(self.app.entries["lam"].get(), "9.9")
+
+    def test_a_corrupt_saved_file_is_treated_as_nothing_saved(self):
+        # It must not raise: the same read runs during startup, where an
+        # exception would stop the window opening at all.
+        with open(self.path, "w") as f:
+            f.write("{not json at all")
+        self.app.entries["lam"].set("9.9")
+        self.app._restore_state()
+        self.assertIn("nothing saved", self.app.status.cget("text"))
+        self.assertEqual(self.app.entries["lam"].get(), "9.9")
+
+
+class TestTheCommandLineBeatsTheSavedConfiguration(unittest.TestCase):
+    """`--lam 3.0` must not be silently overlaid away by the saved file.
+
+    The saved configuration is the startup state, so it has to be skipped
+    whenever the user actually typed an option -- otherwise the option looks
+    ignored, with nothing on screen to explain it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._real_path = vizstate.DEFAULT_PATH
+        vizstate.DEFAULT_PATH = os.path.join(self.tmp, "policyviz_default.json")
+        vizstate.save_state({"fields": {"lam": 9.5}, "policies": ["always-pm"]})
+        self.seen = {}
+        self._real_build = policyviz._build_app
+
+        class _Recorder:
+            def __init__(_self, config, saved=None):
+                self.seen["config"], self.seen["saved"] = config, saved
+
+            def mainloop(_self):
+                pass
+
+        policyviz._build_app = lambda config, saved=None: _Recorder(config,
+                                                                    saved)
+
+    def tearDown(self):
+        policyviz._build_app = self._real_build
+        vizstate.DEFAULT_PATH = self._real_path
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_no_options_starts_on_the_saved_configuration(self):
+        policyviz.main([])
+        self.assertIsNotNone(self.seen["saved"])
+        self.assertAlmostEqual(self.seen["saved"]["fields"]["lam"], 9.5)
+
+    def test_a_typed_option_wins_and_the_saved_file_is_skipped(self):
+        policyviz.main(["--lam", "3.0"])
+        self.assertIsNone(self.seen["saved"])
+        self.assertAlmostEqual(self.seen["config"].lam, 3.0)
+
+    def test_an_untyped_option_still_gets_its_dataclass_default(self):
+        policyviz.main(["--lam", "3.0"])
+        self.assertEqual(self.seen["config"].horizon, VizConfig.horizon)
+        self.assertEqual(self.seen["config"].specs, VizConfig.specs)
+
+    def test_headless_never_reads_the_saved_configuration(self):
+        # --no-gui is the reproducible path: a scoreboard printed for the
+        # study must depend on the arguments and the presets, never on what
+        # happens to be in one machine's policyviz_default.json.
+        calls = []
+        real = vizstate.load_state
+
+        def _counting(*args, **kw):
+            calls.append(1)
+            return real(*args, **kw)
+
+        vizstate.load_state = _counting
+        try:
+            policyviz.main(["--no-gui", "--policies", "always-pm",
+                            "--horizon", "5"])
+        finally:
+            vizstate.load_state = real
+        self.assertEqual(calls, [])

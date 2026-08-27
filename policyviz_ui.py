@@ -17,6 +17,17 @@ Two states this window owes the viewer an explanation for:
 * **bound** -- the Oracle row is dashed and labelled, in the figure and in the
   scoreboard both. See policyviz's module docstring.
 
+THE SAVED CONFIGURATION
+-----------------------
+Save snapshots the panel to `vizstate`; Restore puts it back; the startup
+overlay happens in `__init__`, AFTER `_build()` has seeded the form from the
+incoming `VizConfig`. SAVE DOES NOT APPLY AND APPLY DOES NOT SAVE -- see
+`_save_state` for why either coupling would cost the user something they did
+not ask to give up. Neither the module nor the class reads the file on its
+own: the two entry points (`policyviz._build_app` and `main()` here) read it
+and hand the state in, which is what keeps the test suite independent of
+whether the developer has saved a configuration of their own.
+
 THE PARAMETER DIALOGS
 ---------------------
 `ParamsDialog` edits one mode's operating point. It owns no physics: every
@@ -35,6 +46,7 @@ minutes on exactly that.
 """
 
 import dataclasses
+import os
 import threading
 import time
 import tkinter as tk
@@ -47,6 +59,7 @@ from matplotlib.figure import Figure  # noqa: E402
 
 import presets as preset_store  # noqa: E402
 import policyviz  # noqa: E402
+import vizstate  # noqa: E402
 from policies import BufferAwareThreshold, GreedyThreshold  # noqa: E402
 
 TICK_MS = 80            # timer period; `speed` sets slots advanced per tick
@@ -100,6 +113,30 @@ LEFT_VIEW_HEIGHT = 620
 # every test that walks it are unaffected by the layout.
 FIELD_COLUMNS = [FIELDS[:FIELDS.index((None, "run", None))],
                  FIELDS[FIELDS.index((None, "run", None)):]]
+
+# The policy-parameter boxes, as (saved key, attribute name, label).
+THRESHOLD_FIELDS = (("theta", "theta", "greedy θ"),
+                    ("ba_theta", "ba_theta", "buffer-aware θ"),
+                    ("ba_reserve", "ba_reserve", "buffer-aware reserve"))
+
+# The speed slider's range. A saved value is clamped into it: a file holding
+# 10000 would leave the slider pinned off its own scale, showing a number the
+# widget cannot represent.
+SPEED_MIN, SPEED_MAX = 1, 400
+
+
+def format_field(name, value):
+    """How a saved number is written back INTO a form field.
+
+    The int-valued boxes are restored as integers, and through str() rather
+    than "%g": `repr(3600.0)` would put "3600.0" in the horizon box and "%g"
+    would put "1e+06" in B_max. Both survive `_read_config` (it reads every
+    box through float()), but both read as a typo to the user, who then
+    "corrects" a number that was already right.
+    """
+    if name in FLOAT_FIELDS:
+        return "%g" % float(value)
+    return str(int(float(value)))
 
 
 class ParamsDialog(tk.Toplevel):
@@ -313,7 +350,17 @@ class ParamsDialog(tk.Toplevel):
 
 
 class PolicyVizApp(tk.Tk):
-    def __init__(self, config=None):
+    """The window.
+
+    `saved` is a `vizstate.load_state()` dict overlaid on the form once it has
+    been built, or None for "start on `config` alone". THE FILE IS NOT READ
+    HERE: the callers that own a real session (`policyviz._build_app` and
+    `main()` below) read it and hand the result in. A constructor that read
+    the disk by default would make every test in the suite depend on whether
+    the developer happened to have saved a configuration.
+    """
+
+    def __init__(self, config=None, saved=None):
         super().__init__()
         self.title("Hybrid policy visualiser — NUMERIC MODEL (not the stack)")
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -337,7 +384,20 @@ class PolicyVizApp(tk.Tk):
         self._last_draw = 0.0
         self._train_state = {"episode": 0, "total": 0, "policy": None,
                              "error": None, "cached": False}
+        # Traces to switch off in the session that has not been built yet.
+        # A restored `hidden_traces` cannot be written to `self.session`
+        # (there is none during startup), so it waits here and
+        # `_build_session` folds it in.
+        self._pending_hidden = set()
         self._build()
+        # ORDER: the form is SEEDED from `config` in _build() and the saved
+        # state is overlaid on top of it here. The other way round -- overlay
+        # first, seed second -- would have the seeding wipe the restored
+        # values; and seeding first is also what lets a file written before a
+        # control existed still load, because a control the file says nothing
+        # about is left holding its seeded value rather than being blanked.
+        if saved is not None:
+            self._apply_state(saved)
         self._apply()
         self.after(TICK_MS, self._tick)
 
@@ -412,9 +472,8 @@ class PolicyVizApp(tk.Tk):
         self.theta = tk.StringVar(value=theta)
         self.ba_theta = tk.StringVar(value=ba_theta)
         self.ba_reserve = tk.StringVar(value=ba_reserve)
-        for label, var in (("greedy θ", self.theta),
-                           ("buffer-aware θ", self.ba_theta),
-                           ("buffer-aware reserve", self.ba_reserve)):
+        for _key, attr, label in THRESHOLD_FIELDS:
+            var = getattr(self, attr)
             ttk.Label(left, text=label).grid(row=row, column=0, sticky="w")
             ttk.Entry(left, textvariable=var, width=8).grid(row=row, column=1,
                                                             sticky="w")
@@ -494,6 +553,18 @@ class PolicyVizApp(tk.Tk):
                    ).pack(side="left")
         ttk.Button(buttons, text="Apply", command=self._apply
                    ).pack(side="left", padx=3)
+
+        # SAVE DOES NOT APPLY, AND APPLY DOES NOT SAVE. See _save_state.
+        saved_row = ttk.Frame(left)
+        saved_row.grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        ttk.Button(saved_row, text="Save", command=self._save_state
+                   ).pack(side="left")
+        ttk.Button(saved_row, text="Restore", command=self._restore_state
+                   ).pack(side="left", padx=3)
+        ttk.Label(saved_row, text="(this form, reloaded at startup)",
+                  font=("TkDefaultFont", 7), foreground="#666666"
+                  ).pack(side="left", padx=2)
 
         ttk.Label(left, text="speed [slots/tick]").grid(row=row, column=0,
                                                         sticky="w")
@@ -712,6 +783,148 @@ class PolicyVizApp(tk.Tk):
             **values)
 
     # ------------------------------------------------------------------
+    # the saved configuration
+    # ------------------------------------------------------------------
+
+    def _collect_state(self):
+        """Snapshot the panel EXACTLY AS IT STANDS, for vizstate.save_state.
+
+        Read from the WIDGETS, not from `self.config_obj`: the config object
+        is the last thing Apply built, so saving from it would write the
+        previously applied configuration and quietly discard the edit the user
+        pressed Save to keep -- which is the whole complaint this exists to
+        answer.
+
+        The thresholds are read even when their policy is unticked, so a
+        threshold that was typed and then set aside is still there next time.
+
+        Parsed here, so a malformed box raises BEFORE anything is written and
+        the saved file can never hold text the form would refuse to apply.
+        """
+        fields = {}
+        for name, label, _width in FIELDS:
+            if name is None:
+                continue
+            text = self.entries[name].get().strip()
+            try:
+                fields[name] = (float(text) if name in FLOAT_FIELDS
+                                else int(float(text)))
+            except ValueError:
+                raise ValueError("%s: %r is not a number" % (label, text))
+        policies = [stem for stem in policyviz.SPEC_CHOICES
+                    if self.checks[stem].get()]
+        if not policies:
+            # Same refusal as Apply: a saved state with nothing ticked would
+            # restore a form that cannot be run.
+            raise ValueError("select at least one policy")
+        state = {"fields": fields, "policies": policies}
+        for key, attr, label in THRESHOLD_FIELDS:
+            text = getattr(self, attr).get().strip()
+            try:
+                state[key] = float(text)
+            except ValueError:
+                raise ValueError("%s: %r is not a number" % (label, text))
+        for protocol in ("pm", "ent"):
+            state["%s_preset" % protocol] = self.preset_var[protocol].get()
+            # THE DATACLASS, not the preset name -- and None when the mode is
+            # tracking its preset file unedited. `_set_operating_point` keeps
+            # `mode_env` normalised to exactly that, and both halves of the
+            # distinction have to survive (see vizstate's docstring).
+            state["%s_env" % protocol] = self.mode_env.get(protocol)
+        hidden = (set(self.session.hidden_traces)
+                  if self.session is not None else set(self._pending_hidden))
+        state["hidden_traces"] = sorted(hidden)
+        state["speed"] = int(self.speed.get())
+        return state
+
+    def _apply_state(self, state):
+        """Overlay a saved snapshot onto the form. Absent keys are LEFT ALONE.
+
+        Only the form is touched: nothing here rebuilds the session, so a
+        Restore behaves like every other control in this column and takes
+        effect on Apply. The exception is `hidden_traces`, which is a view
+        choice with no place in `VizConfig` -- there is nothing for Apply to
+        do with it, so it is imposed on the live session immediately.
+        """
+        for name, value in state.get("fields", {}).items():
+            if name in self.entries:      # a field this version dropped
+                self.entries[name].set(format_field(name, value))
+        policies = state.get("policies")
+        if policies is not None:
+            chosen = set(policies)
+            for stem, var in self.checks.items():
+                var.set(stem in chosen)
+        for key, attr, _label in THRESHOLD_FIELDS:
+            if key in state:
+                getattr(self, attr).set("%g" % state[key])
+        for protocol in ("pm", "ent"):
+            name_key, env_key = "%s_preset" % protocol, "%s_env" % protocol
+            name = state.get(name_key, self.preset_var[protocol].get())
+            if env_key in state:
+                # Through _set_operating_point, so a saved env that now
+                # matches its preset (the file having been edited meanwhile)
+                # normalises back to None exactly as an OK from the dialog
+                # would. `is None` stays a reliable "vanilla preset" test.
+                if state[env_key] is None:
+                    self.preset_var[protocol].set(name)
+                    self.mode_env[protocol] = None
+                else:
+                    self._set_operating_point(protocol, name, state[env_key])
+            elif name_key in state:
+                self.preset_var[protocol].set(name)
+        self._refresh_mode_buttons()
+        if "hidden_traces" in state:
+            self._pending_hidden = set(state["hidden_traces"])
+            if self.session is not None:
+                self.session.hidden_traces.clear()
+                self.session.hidden_traces.update(self._pending_hidden)
+                self._sync_trace_checks()
+                self._redraw(force=True)
+        if "speed" in state:
+            self.speed.set(max(SPEED_MIN, min(SPEED_MAX, int(state["speed"]))))
+
+    def _save_state(self):
+        """The Save button: RECORD THE FORM. It does not Apply.
+
+        Apply rebuilds the session, which throws away the episode running on
+        screen and, with "dqn" ticked, starts a training thread the user then
+        waits on. Making Save do that as a side effect would mean a user who
+        wanted to keep a number lost the run they were watching. The reverse
+        coupling is just as bad: an Apply that saved would overwrite the saved
+        configuration every time someone nudged a parameter to try something.
+
+        So the two stay separate, and the status line says which one just
+        happened -- the button must not silently do the other one.
+        """
+        try:
+            path = vizstate.save_state(self._collect_state())
+        except Exception as exc:      # bad box, unwritable file, full disk
+            self._set_status("save failed: %s" % exc, "error")
+            messagebox.showerror("policy visualiser",
+                                 "could not save the configuration:\n%s" % exc)
+            return
+        self._set_status("saved → %s — press Apply to run it"
+                         % os.path.basename(path), "idle")
+
+    def _restore_state(self):
+        """The Restore button: put the saved configuration back on the form.
+
+        The saved state is otherwise only reachable by restarting the app,
+        which is a poor answer to "I have been experimenting and want my
+        settings back". (gui.py solves the same problem by adding a "default"
+        entry to its preset dropdown; this window's dropdown lives in the
+        per-mode dialog and lists ONE mode's operating points, so a whole-panel
+        snapshot has no honest place in it.)
+        """
+        state = vizstate.load_state()
+        if state is None:
+            self._set_status("nothing saved yet — press Save first", "error")
+            return
+        self._apply_state(state)
+        self._set_status("restored %s — press Apply to run it"
+                         % os.path.basename(vizstate.DEFAULT_PATH), "paused")
+
+    # ------------------------------------------------------------------
     # actions
     # ------------------------------------------------------------------
 
@@ -874,8 +1087,15 @@ class PolicyVizApp(tk.Tk):
         # hidden", so a stale name cannot reach the draw. Keeping them means
         # re-ticking a policy restores the visibility it had rather than
         # springing back on top of the traces the reader was comparing.
-        carried = (set(self.session.hidden_traces)
-                   if self.session is not None else set())
+        #
+        # `_pending_hidden` is the same set arriving from the SAVED
+        # configuration, which was read before any session existed. It is
+        # consumed here rather than left in place: keeping it would make a
+        # trace the user switched back on spring off again on the next Apply.
+        carried = set(self._pending_hidden)
+        self._pending_hidden = set()
+        if self.session is not None:
+            carried |= set(self.session.hidden_traces)
         try:
             self.session = policyviz.VizSession(
                 config, dqn_policy=dqn_policy,
@@ -960,7 +1180,10 @@ class PolicyVizApp(tk.Tk):
 
 
 def main():
-    PolicyVizApp().mainloop()
+    # Reading the saved configuration is the CALLER's job, never the
+    # constructor's (see PolicyVizApp's docstring). policyviz._build_app does
+    # the same for the `python3 policyviz.py` entry point.
+    PolicyVizApp(saved=vizstate.load_state()).mainloop()
 
 
 if __name__ == "__main__":

@@ -5,6 +5,17 @@
     python3 policyviz.py --no-gui             # the scoreboard, as text
     python3 policyviz.py --ent-preset chapman_lowmu --lam 2.5 --b-max 1e6
 
+THE SAVED CONFIGURATION
+-----------------------
+The window's Save button writes the whole panel to policyviz_default.json
+(`vizstate.py`) and `python3 policyviz.py` comes back up on it -- which is how
+a preset with one number changed gets kept without inventing a preset name for
+it. Two deliberate exceptions: an option TYPED on the command line skips the
+saved file entirely (otherwise `--lam 3.0` would be overlaid away and look
+ignored), and `--no-gui` never reads it at all, so a scoreboard printed for the
+study depends on the arguments and the presets rather than on what happens to
+be saved on one machine.
+
 WHAT THIS DRIVES -- and what it does NOT
 ----------------------------------------
 `gui.py` drives the REAL qline stack: an Apply there restarts hw_sim, gc and
@@ -69,6 +80,7 @@ import dqn as dqn_module
 import panelstate
 import plots
 import presets
+import vizstate
 from dqn import DQNConfig, training_seed_range
 from eval_hybrid import evaluation_seeds
 from evemarkov import EveParams
@@ -1094,23 +1106,32 @@ def format_scoreboard(session):
 # the Tk shell -- thin on purpose
 # --------------------------------------------------------------------------
 
-def _build_app(config):
+def _build_app(config, saved=None):
     """Import Tk and construct the window. Kept behind a function so that
     importing policyviz costs nothing on a machine with no display."""
     from policyviz_ui import PolicyVizApp
-    return PolicyVizApp(config)
+    return PolicyVizApp(config, saved=saved)
+
+
+# CLI option -> (VizConfig field, how to read it). Every default is None, so
+# an option the user TYPED can be told apart from one that was merely
+# defaulted -- which is what lets the saved configuration be overlaid without
+# silently swallowing an explicit "--lam 3.0".
+_CLI_FIELDS = (("pm_preset", str), ("ent_preset", str), ("lam", float),
+               ("b_max", int), ("horizon", int), ("seed_index", int),
+               ("dqn_episodes", int))
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--ent-preset", default=VizConfig.ent_preset)
-    ap.add_argument("--pm-preset", default=VizConfig.pm_preset)
-    ap.add_argument("--lam", type=float, default=VizConfig.lam)
-    ap.add_argument("--b-max", type=float, default=VizConfig.b_max)
-    ap.add_argument("--horizon", type=int, default=VizConfig.horizon)
-    ap.add_argument("--seed-index", type=int, default=VizConfig.seed_index)
-    ap.add_argument("--dqn-episodes", type=int, default=VizConfig.dqn_episodes)
-    ap.add_argument("--policies", default=",".join(VizConfig.specs),
+    ap.add_argument("--ent-preset", default=None)
+    ap.add_argument("--pm-preset", default=None)
+    ap.add_argument("--lam", type=float, default=None)
+    ap.add_argument("--b-max", type=float, default=None)
+    ap.add_argument("--horizon", type=int, default=None)
+    ap.add_argument("--seed-index", type=int, default=None)
+    ap.add_argument("--dqn-episodes", type=int, default=None)
+    ap.add_argument("--policies", default=None,
                     help="comma-separated policy specs, e.g. "
                          "'always-pm,greedy-0.045,oracle'")
     ap.add_argument("--no-gui", action="store_true",
@@ -1119,15 +1140,24 @@ def main(argv=None):
                     help="with --no-gui, also write the four panels here")
     args = ap.parse_args(argv)
 
-    config = VizConfig(
-        specs=tuple(s.strip() for s in args.policies.split(",") if s.strip()),
-        pm_preset=args.pm_preset, ent_preset=args.ent_preset, lam=args.lam,
-        b_max=int(args.b_max), horizon=args.horizon,
-        seed_index=args.seed_index, dqn_episodes=args.dqn_episodes)
+    given = {name: cast(getattr(args, name))
+             for name, cast in _CLI_FIELDS if getattr(args, name) is not None}
+    if args.policies is not None:
+        given["specs"] = tuple(s.strip() for s in args.policies.split(",")
+                               if s.strip())
+    config = VizConfig(**given)
 
     if not args.no_gui:
-        _build_app(config).mainloop()
+        # The window starts on the user's saved configuration -- EXCEPT when
+        # options were typed on the command line, which would otherwise be
+        # overlaid away by the saved file and appear to have been ignored.
+        _build_app(config,
+                   saved=None if given else vizstate.load_state()).mainloop()
         return
+    # --no-gui deliberately does NOT read the saved configuration. It is the
+    # reproducible path: a scoreboard printed for the study must depend on the
+    # arguments and the presets, not on what happens to be in one machine's
+    # policyviz_default.json.
 
     trained = None
     if "dqn" in config.specs:
