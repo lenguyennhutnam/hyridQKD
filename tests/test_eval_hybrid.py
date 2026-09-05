@@ -13,8 +13,15 @@ import unittest
 from dqn import DQNConfig, training_seed_range
 from evemarkov import EveParams
 from hybridenv import HybridEnv, HybridParams
+from mobility import MobilityParams
 from policies import (AlwaysENT, AlwaysPM, BufferAwareThreshold,
-                      GreedyThreshold, run_episode)
+                      GreedyThreshold, RangeOrQber, RangeThreshold,
+                      run_episode)
+
+# A patrol band straddling PM's death distance (167.2 km at the default
+# operating point), fast enough that a short episode crosses it.
+CROSSING = MobilityParams(enabled=True, d_min=150.0, d_max=190.0, v_max=0.5,
+                          loiter_min=0, loiter_max=10, seed=5)
 
 # lam = 2.5 with B_max = 1e6. At the spec section 4 defaults AlwaysPM scores
 # eta = 1.0000 and every threshold ties, so a sweep returning its WORST point
@@ -172,6 +179,151 @@ class TestBufferAwareSweep(unittest.TestCase):
                           (0.04, 0.0), (0.04, 0.25), (0.04, 0.5)})
         self.assertEqual(table[best], max(table.values()))
 
+
+class TestTheRangeGrid(unittest.TestCase):
+    """A switch distance only means something relative to where the vessel
+    goes, so the grid is derived from the patrol band rather than fixed."""
+
+    def test_it_spans_the_band_and_overhangs_both_ends(self):
+        # Same discipline as THRESHOLDS: an argmax on the edge of its own grid
+        # means "the largest value we tried", not "the best there is". A point
+        # below d_min is always-ENT and one above d_max is always-PM, so the
+        # optimum is interior by construction.
+        from eval_hybrid import range_switches
+
+        grid = range_switches(HybridParams(mobility=CROSSING))
+        self.assertLess(min(grid), CROSSING.d_min)
+        self.assertGreater(max(grid), CROSSING.d_max)
+        self.assertTrue(any(CROSSING.d_min < d < CROSSING.d_max
+                            for d in grid))
+        self.assertEqual(len(set(grid)), len(grid))
+
+    def test_it_follows_the_band_it_is_given(self):
+        # MUTATION: return a fixed tuple of kilometres. That grid is fine for
+        # one band and useless for every other, and nothing else would notice.
+        from eval_hybrid import range_switches
+
+        far = MobilityParams(enabled=True, d_min=210.0, d_max=240.0)
+        grid = range_switches(HybridParams(mobility=far))
+        self.assertGreater(min(grid), 200.0)
+        self.assertLess(max(grid), 250.0)
+
+    def test_with_mobility_off_it_degenerates_around_the_fixed_link(self):
+        # Honest answer: with nothing moving a range threshold has nothing to
+        # switch on, so the policies reduce to AlwaysPM / AlwaysENT. What must
+        # NOT happen is a crash or a grid of identical points, which _keyed()
+        # would reject as duplicates.
+        from eval_hybrid import range_switches
+
+        grid = range_switches(HybridParams(d_km=55.0))
+        self.assertEqual(len(set(grid)), len(grid))
+        self.assertLess(min(grid), 55.0)
+        self.assertGreater(max(grid), 55.0)
+
+    def test_a_single_point_band_still_produces_distinct_points(self):
+        from eval_hybrid import range_switches
+
+        grid = range_switches(HybridParams(
+            mobility=MobilityParams(enabled=True, d_min=77.0, d_max=77.0)))
+        self.assertEqual(len(set(grid)), len(grid))
+
+
+def mobile_factory(horizon=150, **over):
+    params = HybridParams(horizon=horizon, seed=1, mobility=CROSSING,
+                          d_km=170.0, **dict(NONDEGENERATE, **over))
+
+    def factory(seed):
+        return HybridEnv(dataclasses.replace(params, seed=seed),
+                         EveParams(seed=seed, **MIXED_EVE))
+    return factory
+
+
+class TestRangeSweeps(unittest.TestCase):
+    def test_the_range_sweep_scores_every_candidate_and_returns_the_best(self):
+        from eval_hybrid import sweep_range
+
+        grid = (140.0, 160.0, 180.0, 200.0)
+        best, table = sweep_range(mobile_factory(), switches=grid,
+                                  seeds=(1, 2))
+        self.assertEqual(set(table), set(grid))
+        self.assertEqual(table[best], max(table.values()))
+
+    def test_the_range_qber_sweep_covers_the_full_product_grid(self):
+        # A coordinate descent from the two single-signal optima can miss the
+        # joint optimum; a baseline denied its best point manufactures a win.
+        from eval_hybrid import sweep_range_qber
+
+        best, table = sweep_range_qber(mobile_factory(horizon=120),
+                                       switches=(160.0, 180.0),
+                                       thresholds=(0.02, 0.04, 0.06),
+                                       seeds=(1, 2))
+        self.assertEqual(len(table), 6)
+        self.assertEqual(set(table), {(160.0, 0.02), (160.0, 0.04),
+                                      (160.0, 0.06), (180.0, 0.02),
+                                      (180.0, 0.04), (180.0, 0.06)})
+        self.assertEqual(table[best], max(table.values()))
+
+    def test_the_sweep_is_keyed_on_the_number_not_the_rendered_name(self):
+        # RangeThreshold renders its distance at ONE decimal, so 155.02 and
+        # 155.04 are both "range-155.0". Keying the table on the label would
+        # silently drop one point of the sweep -- the same defect the
+        # threshold sweep's comment warns about.
+        from eval_hybrid import sweep_range
+
+        self.assertEqual(RangeThreshold(155.02).name,
+                         RangeThreshold(155.04).name)
+        _, table = sweep_range(mobile_factory(horizon=60),
+                               switches=(155.02, 155.04), seeds=(1,))
+        self.assertEqual(len(table), 2)
+
+
+class TestTheRangePoliciesAreInTheTable(unittest.TestCase):
+    def test_compare_reports_both_of_them(self):
+        from eval_hybrid import compare, label_rows
+
+        rows = compare(seeds=(99_000_000, 99_000_001),
+                       params=HybridParams(horizon=120, mobility=CROSSING,
+                                           d_km=170.0, **NONDEGENERATE),
+                       dqn_config={}, thresholds=(0.02, 0.05),
+                       switches=(160.0, 180.0))
+        by = label_rows(rows)
+        self.assertTrue(any(k.startswith("range-") and
+                            not k.startswith("range-qber-") for k in by))
+        self.assertTrue(any(k.startswith("range-qber-") for k in by))
+        # Every row carries the distance it was measured at, so a table can
+        # never quietly mix a mobile run with a fixed one.
+        for row in rows:
+            self.assertIn("mean_d_km", row)
+
+    def test_the_reported_row_is_the_one_the_sweep_chose(self):
+        from eval_hybrid import compare, label_rows
+
+        sweeps = {}
+        rows = compare(seeds=(99_000_000, 99_000_001),
+                       params=HybridParams(horizon=120, mobility=CROSSING,
+                                           d_km=170.0, **NONDEGENERATE),
+                       dqn_config={}, thresholds=(0.02, 0.05),
+                       switches=(160.0, 180.0), sweeps=sweeps)
+        best_d = max(sweeps["range"], key=sweeps["range"].get)
+        best_rq = max(sweeps["range_qber"], key=sweeps["range_qber"].get)
+        by = label_rows(rows)
+        self.assertIn(RangeThreshold(best_d).name, by)
+        self.assertIn(RangeOrQber(*best_rq).name, by)
+
+    def test_the_vessel_really_moved_during_the_comparison(self):
+        # Without this the two rows above could be measured on a stationary
+        # link and still look perfectly healthy.
+        from eval_hybrid import compare, label_rows
+
+        rows = compare(seeds=(99_000_000,),
+                       params=HybridParams(horizon=200, mobility=CROSSING,
+                                           d_km=170.0, **NONDEGENERATE),
+                       dqn_config={}, thresholds=(0.05,),
+                       switches=(160.0, 180.0))
+        pm = label_rows(rows)[AlwaysPM.name]
+        self.assertNotEqual(round(pm["mean_d_km"], 6), 170.0)
+        self.assertGreater(pm["mean_d_km"], CROSSING.d_min - 1)
+        self.assertLess(pm["mean_d_km"], CROSSING.d_max + 1)
 
 class TestEvaluationSeedsAreDisjointFromTraining(unittest.TestCase):
     """Scoring the agent on a trajectory it trained on is not a measurement."""

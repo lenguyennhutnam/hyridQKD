@@ -12,18 +12,24 @@ import numpy as np
 
 import hybridenv
 from evemarkov import EveParams
-from hybridenv import (ENT, I_BUFFER, I_QBER, PM, HybridEnv, HybridParams)
+from hybridenv import (DIST_REF_KM, ENT, I_BUFFER, I_DIST, I_QBER, PM,
+                       HybridEnv, HybridParams)
 from policies import (AlwaysENT, AlwaysPM, BufferAwareThreshold,
-                      GreedyThreshold, Oracle, Policy, RelaxationBound,
-                      RelaxedAlwaysPM, run_episode, run_relaxed_episode)
+                      GreedyThreshold, Oracle, Policy, RangeOrQber,
+                      RangeThreshold, RelaxationBound, RelaxedAlwaysPM,
+                      observed_distance_km, run_episode, run_relaxed_episode)
 
 
-def obs_with(qber=0.0, mode=PM, block=0.0, buffer=0.0, queue=0.0, age=0.0):
+def obs_with(qber=0.0, mode=PM, block=0.0, buffer=0.0, queue=0.0, age=0.0,
+             d_km=0.0):
     """Build an observation by NAME, using the layout hybridenv owns.
 
     Positional literals would keep passing if the index constants ever drifted
     apart from hybridenv._observe(); routing through the real constants means
     a drift shows up here.
+
+    `d_km` is given in KILOMETRES and scaled here, so a test reads as the
+    physical situation it means rather than as a normalised fraction.
     """
     v = np.zeros(hybridenv.OBS_DIM)
     v[hybridenv.I_QBER] = qber
@@ -32,7 +38,13 @@ def obs_with(qber=0.0, mode=PM, block=0.0, buffer=0.0, queue=0.0, age=0.0):
     v[hybridenv.I_BUFFER] = buffer
     v[hybridenv.I_QUEUE] = queue
     v[hybridenv.I_AGE] = age
+    v[hybridenv.I_DIST] = d_km / DIST_REF_KM
     return v
+
+
+def obs_at_distance(d_km):
+    """An otherwise-blank observation of a vessel `d_km` from HQ."""
+    return obs_with(d_km=d_km)
 
 
 class TestPolicyBase(unittest.TestCase):
@@ -46,7 +58,10 @@ class TestPolicyBase(unittest.TestCase):
         names = [AlwaysPM().name, AlwaysENT().name,
                  GreedyThreshold(0.03).name, GreedyThreshold(0.05).name,
                  BufferAwareThreshold(0.03, 0.5).name,
-                 BufferAwareThreshold(0.03, 0.8).name]
+                 BufferAwareThreshold(0.03, 0.8).name,
+                 RangeThreshold(150.0).name, RangeThreshold(190.0).name,
+                 RangeOrQber(150.0, 0.03).name,
+                 RangeOrQber(150.0, 0.05).name]
         self.assertEqual(len(set(names)), len(names))
 
 
@@ -56,7 +71,7 @@ class TestObservationConstantsAreShared(unittest.TestCase):
         # second copy that can drift out of step with it.
         import policies
         for name in ("I_QBER", "I_MODE", "I_BLOCK", "I_BUFFER", "I_QUEUE",
-                     "I_AGE"):
+                     "I_AGE", "I_DIST", "DIST_REF_KM"):
             self.assertEqual(getattr(policies, name),
                              getattr(hybridenv, name), name)
 
@@ -219,6 +234,120 @@ class TestBufferAwareThreshold(unittest.TestCase):
         self.assertEqual(GreedyThreshold(threshold=0.04).act(obs), PM)
         self.assertEqual(BufferAwareThreshold(0.04, 0.5).act(obs), ENT)
 
+
+class TestRangeThreshold(unittest.TestCase):
+    """PM close in, ENT far out. The SENSE of the comparison is the whole
+    policy, so it is pinned from both sides."""
+
+    def test_it_uses_pm_when_the_vessel_is_close(self):
+        p = RangeThreshold(170.0)
+        for d in (0.0, 55.0, 120.0, 169.9):
+            self.assertEqual(p.act(obs_at_distance(d)), PM,
+                             "should be PM at %.1f km" % d)
+
+    def test_it_uses_ent_when_the_vessel_is_far(self):
+        # MUTATION: flip the comparison, so the vessel uses ENT close in and
+        # PM out past PM's death distance. Either half of this pair alone is
+        # satisfied by a policy that returns one constant, so both are needed.
+        p = RangeThreshold(170.0)
+        for d in (170.1, 200.0, 249.0):
+            self.assertEqual(p.act(obs_at_distance(d)), ENT,
+                             "should be ENT at %.1f km" % d)
+
+    def test_the_boundary_itself_belongs_to_ent(self):
+        # Same convention as GreedyThreshold, for the same reason: the natural
+        # setting is PM's death distance, at which PM already distils nothing.
+        self.assertEqual(RangeThreshold(170.0).act(obs_at_distance(170.0)),
+                         ENT)
+
+    def test_it_reads_kilometres_not_the_normalised_feature(self):
+        # MUTATION: compare obs[I_DIST] against d_switch without undoing the
+        # scaling. Every distance in the study is then below every threshold
+        # and the policy silently degenerates to AlwaysPM.
+        self.assertEqual(RangeThreshold(0.5).act(obs_at_distance(100.0)), ENT)
+        self.assertEqual(RangeThreshold(300.0).act(obs_at_distance(240.0)), PM)
+
+    def test_it_ignores_the_qber(self):
+        # Deliberate: paired with RangeOrQber it separates "what is knowing
+        # the range worth" from "what does the inferred signal add on top".
+        p = RangeThreshold(170.0)
+        loud = obs_at_distance(120.0)
+        loud[I_QBER] = 0.49
+        self.assertEqual(p.act(obs_at_distance(120.0)), p.act(loud))
+
+    def test_the_switch_distance_is_in_the_name(self):
+        self.assertEqual(RangeThreshold(167.25).name, "range-167.2")
+        self.assertNotEqual(RangeThreshold(150.0).name,
+                            RangeThreshold(190.0).name)
+
+
+class TestRangeOrQber(unittest.TestCase):
+    def test_either_signal_alone_fires_it(self):
+        p = RangeOrQber(170.0, 0.04)
+        near_loud = obs_at_distance(120.0)
+        near_loud[I_QBER] = 0.05
+        self.assertEqual(p.act(obs_at_distance(180.0)), ENT)
+        self.assertEqual(p.act(near_loud), ENT)
+
+    def test_neither_signal_leaves_it_on_pm(self):
+        # MUTATION: `and` for `or`, or a bare `return ENT`. Without this the
+        # assertions above pass on a policy that never chooses PM at all.
+        p = RangeOrQber(170.0, 0.04)
+        near_quiet = obs_at_distance(120.0)
+        near_quiet[I_QBER] = 0.01
+        self.assertEqual(p.act(near_quiet), PM)
+
+    def test_both_signals_together_still_fire_it(self):
+        p = RangeOrQber(170.0, 0.04)
+        far_loud = obs_at_distance(200.0)
+        far_loud[I_QBER] = 0.05
+        self.assertEqual(p.act(far_loud), ENT)
+
+    def test_an_unreachable_distance_makes_it_exactly_greedy_threshold(self):
+        # This is what guarantees the swept RangeOrQber row can never score
+        # BELOW the swept greedy row because of the search: the QBER-only
+        # policy is a point of its own grid.
+        far_off = RangeOrQber(1e9, 0.035)
+        greedy = GreedyThreshold(0.035)
+        for d in (0.0, 55.0, 170.0, 240.0):
+            for q in (0.0, 0.0349, 0.035, 0.2):
+                obs = obs_at_distance(d)
+                obs[I_QBER] = q
+                self.assertEqual(far_off.act(obs), greedy.act(obs))
+
+    def test_a_reachable_distance_is_not_greedy_threshold(self):
+        # ...and that equivalence is a property of the SETTING, not of the
+        # policy quietly ignoring its distance argument.
+        obs = obs_at_distance(200.0)
+        obs[I_QBER] = 0.0
+        self.assertEqual(RangeOrQber(170.0, 0.035).act(obs), ENT)
+        self.assertEqual(GreedyThreshold(0.035).act(obs), PM)
+
+    def test_both_coordinates_are_in_the_name(self):
+        self.assertEqual(RangeOrQber(167.25, 0.0355).name,
+                         "range-qber-167.2-0.035")
+        names = {RangeOrQber(d, t).name
+                 for d in (150.0, 190.0) for t in (0.02, 0.05)}
+        self.assertEqual(len(names), 4)
+
+
+class TestObservedDistance(unittest.TestCase):
+    def test_it_undoes_the_normalisation(self):
+        self.assertAlmostEqual(observed_distance_km(obs_at_distance(137.5)),
+                               137.5)
+
+    def test_both_range_policies_go_through_it(self):
+        # One place knows the scale, so a change to DIST_REF_KM cannot leave
+        # one policy reading kilometres and the other a fraction.
+        obs = obs_at_distance(200.0)
+        self.assertEqual(RangeThreshold(199.0).act(obs), ENT)
+        self.assertEqual(RangeOrQber(199.0, 1.0).act(obs), ENT)
+
+    def test_it_tracks_a_real_environment(self):
+        # The helper above builds observations by hand; this checks the
+        # conversion against one the environment actually produced.
+        env = HybridEnv(HybridParams(horizon=3, d_km=123.0))
+        self.assertAlmostEqual(observed_distance_km(env.reset()), 123.0)
 
 class TestBlockLatencyIsWhatMakesTimingMatter(unittest.TestCase):
     """Spec 2.1: ENT delivers nothing until a whole block completes, so

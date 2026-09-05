@@ -2,9 +2,10 @@
 import unittest
 
 from evemarkov import EveParams
-from hybridenv import (ENT, I_AGE, I_BLOCK, I_BUFFER, I_MODE, I_QBER, I_QUEUE,
-                       OBS_DIM, PM, BlockAccumulator, HybridEnv, HybridParams,
-                       KeyBuffer, MessageQueue)
+from hybridenv import (DIST_REF_KM, ENT, I_AGE, I_BLOCK, I_BUFFER, I_DIST,
+                       I_MODE, I_QBER, I_QUEUE, OBS_DIM, PM,
+                       BlockAccumulator, HybridEnv, HybridParams, KeyBuffer,
+                       MessageQueue)
 
 QUIET_EVE = EveParams(f_levels=(0.0, 0.0, 0.0), seed=1)
 
@@ -267,16 +268,19 @@ class TestHybridEnv(unittest.TestCase):
         obs = self.env.reset()
         self.assertEqual(obs.shape, (OBS_DIM,))
 
-    def test_the_observation_carries_exactly_the_documented_six_features(self):
+    def test_the_observation_carries_exactly_the_documented_features(self):
         # eq (16): the policy may not see f_t, A_t, or anything after slot
         # t-1. Pinning each index to a known quantity is what catches the
         # realistic regression -- someone appending f_t "just as a hint".
+        # The distance IS observable (a vessel knows its own position); the
+        # jamming fraction is not, and that asymmetry is the model.
         self.env.reset()
         obs, _, _, info = self.env.step(ENT)
         self.assertEqual(len(obs), OBS_DIM)
         self.assertEqual(obs[I_MODE], float(ENT))
         self.assertAlmostEqual(obs[I_BUFFER] * self.params.b_max,
                                info["buffer"], places=6)
+        self.assertAlmostEqual(obs[I_DIST] * DIST_REF_KM, info["d_km"])
         # f_t and the arrivals are reported for analysis but never observed.
         self.assertIn("f", info)
         self.assertIn("arrivals", info)
@@ -313,6 +317,8 @@ class TestHybridEnv(unittest.TestCase):
                                    env.queue_length)
             self.assertAlmostEqual(obs[I_AGE] * p.t0_deadline,
                                    env.queue_head_age)
+            self.assertAlmostEqual(obs[I_DIST] * DIST_REF_KM,
+                                   env.distance_km)
         # The run really did exercise non-trivial values in every slot that a
         # leaked f_t could have impersonated.
         self.assertGreater(env.queue_length, 0)
@@ -483,7 +489,11 @@ class TestHybridEnv(unittest.TestCase):
         self.assertGreater(env.buffer_level, 0)
         self.assertGreater(env.block_progress, 0)
         obs = env.reset()
-        self.assertEqual(list(obs), [0.0] * OBS_DIM)
+        # Every entry back to zero EXCEPT the distance, which is a position
+        # and not an accumulator: at reset the vessel is back at the start of
+        # its track, which on a fixed link is d_km.
+        self.assertEqual(list(obs)[:I_DIST], [0.0] * I_DIST)
+        self.assertAlmostEqual(obs[I_DIST], env.params.d_km / DIST_REF_KM)
         self.assertEqual(env.queue_length, 0)
         self.assertEqual(env.block_progress, 0)
         self.assertEqual(env.buffer_level, 0)

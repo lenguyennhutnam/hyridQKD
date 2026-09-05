@@ -21,14 +21,26 @@ import keyrate
 import keyrate_ent
 import presets
 from evemarkov import EveChain, EveParams
+from mobility import MobilityParams, VesselTrack
 
 PM, ENT = 0, 1
 
-OBS_DIM = 6
+OBS_DIM = 7
 # Layout of the observation vector (eq 16). Defined here because _observe()
 # is what fixes the order; policies.py re-exports these so no policy ever
 # indexes the state with a bare integer.
-I_QBER, I_MODE, I_BLOCK, I_BUFFER, I_QUEUE, I_AGE = range(OBS_DIM)
+I_QBER, I_MODE, I_BLOCK, I_BUFFER, I_QUEUE, I_AGE, I_DIST = range(OBS_DIM)
+
+# Divisor for the distance feature. A fixed constant, not the mobility band:
+# the band is a sweep parameter, and normalising by it would make the same
+# physical distance read as a different number in two runs -- and would be
+# degenerate (0/0) with mobility off, where the distance is a constant. 250 km
+# is just past the furthest range at which ANY mode in this study still
+# distils key (ENT/ent_advanced dies at 247.3 km), so the feature sits in
+# roughly [0, 1] like the other bounded entries. Distances beyond it are NOT
+# clipped: a feature that saturates would hide the very region the mobility
+# study is about.
+DIST_REF_KM = 250.0
 
 
 class MessageQueue:
@@ -202,15 +214,37 @@ class HybridParams:
     # handed in here does not get to carry its own link.
     pm_env: object = None
     ent_env: object = None
+    # A MOBILE SSV, when the caller wants one.
+    #
+    # None (and MobilityParams(enabled=False)) means the link length is fixed
+    # at d_km, which is what every result before this existed assumed. With a
+    # track the distance changes each slot and BOTH modes' physics follow it.
+    mobility: object = None
+    # Distance quantisation for the per-mode physics cache, in km. Resolving a
+    # slot's physics means channel.derive()/derive_ent() plus a finite-key
+    # evaluation; at 3,600 slots x hundreds of episodes that is the dominant
+    # cost of the whole study, so distances are snapped to a grid and each
+    # grid point is resolved once (see _physics_at). DECLARED APPROXIMATION:
+    # the vessel gets the physics of a point at most d_grid_km/2 away.
+    # <= 0 disables snapping (exact physics, every distinct distance
+    # recomputed) and is a legal, slow sweep point.
+    #
+    # Snapping applies ONLY when a track is running. With mobility off the
+    # exact d_km is used, so a fixed-distance env is bit-for-bit what it was
+    # before this field existed, whatever d_km happens to be.
+    d_grid_km: float = 0.5
 
 
 class HybridEnv:
     """eq (1)-(24). step() advances one slot and returns the usual RL tuple.
 
-    Per-mode physics is resolved ONCE at construction from the verified
-    channel/keyrate modules: the sifted rate ns_m and the intrinsic error
-    floor e_m. Per slot only the jamming fraction changes, so a step costs a
-    binomial draw plus (rarely) one finite-key evaluation.
+    Per-mode physics comes from the verified channel/keyrate modules: the
+    sifted rate ns_m and the intrinsic error floor e_m. On a FIXED link it is
+    resolved once at construction and a slot costs a binomial draw plus
+    (rarely) one finite-key evaluation. With a MOBILE SSV (params.mobility) it
+    depends on the distance too, so it is resolved once per DISTANCE GRID
+    POINT and memoised -- see _physics_at and HybridParams.d_grid_km for the
+    approximation that buys.
 
     Deliberate divergence from the qline stack: switching mode costs only the
     partial block (eq 20), not the ~2.28 s the stack needs to restart. The
@@ -226,12 +260,18 @@ class HybridEnv:
         self.reset()
 
     def _setup_modes(self):
-        """Resolve both modes' per-slot physics from the verified modules.
+        """Resolve the per-mode physics machinery.
 
         Both modes ride the SAME fibre, so d_km/alpha/odr_losses override
         whatever the presets carried. Comparing presets with different
         channels is the trap CLAUDE.md records having already been published
         once and retracted.
+
+        With a mobile SSV the distance is no longer a constant, so what is
+        fixed here is the pair of *base* operating points (everything except
+        the link length) plus the caches; the distance-dependent quantities
+        are resolved per grid point by _physics_at() and installed by
+        _set_distance().
         """
         p = self.params
         # An explicitly supplied env wins over the preset name; the channel
@@ -241,27 +281,88 @@ class HybridEnv:
                    else presets.load_presets()[p.pm_preset])
         ent_base = (p.ent_env if p.ent_env is not None
                     else presets.load_ent_presets()[p.ent_preset])
-        pm_env = dataclasses.replace(pm_base, d_km=p.d_km, alpha=p.alpha,
-                                     odr_losses=p.odr_losses)
-        ent_env = dataclasses.replace(ent_base, d_km=p.d_km, alpha=p.alpha,
-                                      odr_losses=p.odr_losses)
-        d_pm = channel.derive(pm_env, p.n_x)
-        d_ent = channel.derive_ent(ent_env, p.n_x)
-        # pdc is passed explicitly: KeyParams defaults it, and a preset with a
-        # different dark-count rate would otherwise be silently ignored here
-        # while channel.derive() honoured it.
-        self._key_params = keyrate.KeyParams(mu1=pm_env.mu1, mu2=pm_env.mu2,
-                                             p1=pm_env.p1, eta=d_pm.eta,
-                                             pdc=pm_env.pdc)
-        # PM keys the Z basis only (a quarter of clicks); ENT keys both
-        # sifted bases (half). Getting this wrong doubles ENT's apparent rate.
-        self._sifted = (int(d_pm.clicks_per_s * 0.25 * p.delta_t),
-                        int(d_ent.clicks_per_s * 0.5 * p.delta_t))
-        self._e_floor = (d_pm.e_avg, d_ent.q2)
-        # kappa() memo: f takes one of three values, so the finite-key
-        # routine runs a handful of times per episode instead of 3,600.
-        # Keyed on params, not on the episode, so reset() must NOT clear it.
+        self._pm_base = dataclasses.replace(pm_base, alpha=p.alpha,
+                                            odr_losses=p.odr_losses)
+        self._ent_base = dataclasses.replace(ent_base, alpha=p.alpha,
+                                             odr_losses=p.odr_losses)
+        mobility = p.mobility
+        if isinstance(mobility, MobilityParams) and not mobility.enabled:
+            mobility = None
+        self._track = (VesselTrack(mobility, d_start=p.d_km)
+                       if mobility is not None else None)
+        # Both caches are keyed on the PARAMETERS, never on the episode, so
+        # reset() must NOT clear either of them: a 200-episode training run
+        # would otherwise re-derive the same grid points 200 times over.
+        self._physics_cache = {}
+        # kappa() memo: f takes one of three values and the distance one of a
+        # handful of grid points, so the finite-key routine runs a few dozen
+        # times per episode instead of 3,600.
         self._kappa_cache = {}
+        self._physics_key = None
+        self._distance = None
+        # The track's start is d_km CLAMPED into the patrol band, so ask the
+        # track rather than assuming d_km: otherwise construction resolves --
+        # and caches -- a grid point the vessel may never visit.
+        self._set_distance(p.d_km if self._track is None
+                           else self._track.distance)
+
+    def _grid_key(self, d_km):
+        """Cache key for `d_km`, and the distance that key stands for.
+
+        Returns (key, d_used). With no track running the key is the exact
+        distance and d_used is it unchanged -- the fixed-link case must not
+        move by so much as a metre. With a track, the key is the integer grid
+        index, so two distances in the same cell share one physics.
+        """
+        step = self.params.d_grid_km
+        if self._track is None or step <= 0:
+            return float(d_km), float(d_km)
+        index = int(round(float(d_km) / step))
+        return index, index * step
+
+    def _physics_at(self, d_km):
+        """(sifted, e_floor, key_params) for the link at `d_km`, memoised.
+
+        This is the expensive call the grid exists to amortise:
+        channel.derive() runs the decoy gains and a finite-key evaluation,
+        channel.derive_ent() the BBM92 coincidence model.
+        """
+        key, d_used = self._grid_key(d_km)
+        cached = self._physics_cache.get(key)
+        if cached is None:
+            p = self.params
+            pm_env = dataclasses.replace(self._pm_base, d_km=d_used)
+            ent_env = dataclasses.replace(self._ent_base, d_km=d_used)
+            d_pm = channel.derive(pm_env, p.n_x)
+            d_ent = channel.derive_ent(ent_env, p.n_x)
+            # pdc is passed explicitly: KeyParams defaults it, and a preset
+            # with a different dark-count rate would otherwise be silently
+            # ignored here while channel.derive() honoured it.
+            key_params = keyrate.KeyParams(mu1=pm_env.mu1, mu2=pm_env.mu2,
+                                           p1=pm_env.p1, eta=d_pm.eta,
+                                           pdc=pm_env.pdc)
+            # PM keys the Z basis only (a quarter of clicks); ENT keys both
+            # sifted bases (half). Getting this wrong doubles ENT's apparent
+            # rate.
+            sifted = (int(d_pm.clicks_per_s * 0.25 * p.delta_t),
+                      int(d_ent.clicks_per_s * 0.5 * p.delta_t))
+            cached = (sifted, (d_pm.e_avg, d_ent.q2), key_params)
+            self._physics_cache[key] = cached
+        return key, cached
+
+    def _set_distance(self, d_km):
+        """Install the physics for `d_km`.
+
+        Cheap when the cell has not changed, which is the common case: at
+        0.0129 km/slot the vessel crosses a 0.5 km cell boundary about once
+        every 39 slots.
+        """
+        self._distance = float(d_km)
+        key, (sifted, e_floor, key_params) = self._physics_at(d_km)
+        self._physics_key = key
+        self._sifted = sifted
+        self._e_floor = e_floor
+        self._key_params = key_params
 
     def reset(self, seed=None):
         """Start a fresh episode; return the first observation.
@@ -291,14 +392,23 @@ class HybridEnv:
         # Oracle bound them). SeedSequence(s).generate_state(3) has
         # generate_state(2) as its prefix, so the None path is bit-for-bit
         # what it was before the seed argument existed.
+        # generate_state(n) is a prefix-stable expansion, so widening this
+        # from 3 to 4 leaves the error, arrival and jamming streams bit-for-
+        # bit what they were before the vessel existed: every trajectory the
+        # earlier study recorded still replays exactly.
         streams = np.random.SeedSequence(
-            p.seed if seed is None else int(seed)).generate_state(3)
+            p.seed if seed is None else int(seed)).generate_state(4)
         self._rng = np.random.RandomState(streams[0])
         self._arrivals_rng = np.random.RandomState(streams[1])
         if seed is None:
             self.eve.reset()
         else:
             self.eve.reset(int(streams[2]))
+        # The track rewinds with the episode; the physics CACHE does not -- it
+        # is keyed on the distance grid and outlives every episode.
+        if self._track is not None:
+            self._set_distance(self._track.reset(
+                None if seed is None else int(streams[3])))
         self._queue = MessageQueue(p.t0_deadline)
         self._block = BlockAccumulator(p.n_x)
         self._buffer = KeyBuffer(p.b_max)
@@ -310,7 +420,14 @@ class HybridEnv:
         return self._observe()
 
     def _observe(self):
-        """s_t of eq (16) -- nothing here may depend on slot t or later."""
+        """s_t of eq (16) -- nothing here may depend on slot t or later.
+
+        The distance is the one exogenous quantity the policy DOES see (a
+        vessel knows its own position); Eve's f_t is not, and never appears
+        here. The value reported is the distance the slot just ended at, so a
+        policy acting on it is at most one slot -- 12.9 m at the default speed
+        limit -- behind the vessel.
+        """
         p = self.params
         q = (sum(self._qber_hist) / len(self._qber_hist)
              if self._qber_hist else 0.0)
@@ -325,6 +442,7 @@ class HybridEnv:
             self._buffer.level / p.b_max,             # B_t / B_max
             min(self._queue.length / q_ref, 2.0),     # queue pressure
             self._queue.head_age / age_ref,           # urgency
+            self._distance / DIST_REF_KM,             # d_t / 250 km
         ], dtype=float)
 
     def _key_length(self, mode, n, errors):
@@ -367,6 +485,10 @@ class HybridEnv:
         mode = ENT if int(action) == ENT else PM
 
         # --- quantum side: this slot's harvest under the current jamming ---
+        # The vessel moves first, so this slot's physics is the physics of
+        # where it is now -- exactly as f_t is drawn before it is applied.
+        if self._track is not None:
+            self._set_distance(self._track.step())
         f = self.eve.step()
         e_eff = self._e_floor[mode] * (1.0 - f) + 0.5 * f
         sifted = self._sifted[mode]
@@ -394,7 +516,7 @@ class HybridEnv:
                 "served": served, "expired": expired,
                 "buffer": self._buffer.level, "deposited": deposited,
                 "blocks": len(blocks), "mode": mode,
-                "qber": self._qber_hist[-1]}
+                "qber": self._qber_hist[-1], "d_km": self._distance}
         return self._observe(), float(served), done, info
 
     # ---------------- the Oracle relaxation (spec section 7) ----------------
@@ -436,7 +558,11 @@ class HybridEnv:
         comfortably in practice. It is not an almost-sure inequality, and a
         report that needs one should say so.
         """
-        key = (int(mode), float(f))
+        # Keyed on the distance grid point as well as (mode, f): with a
+        # mobile SSV the same jamming level buys a different number of bits at
+        # 40 km and at 200 km, and a two-part key would hand the bound the
+        # physics of the first distance the episode happened to visit.
+        key = (int(mode), float(f), self._physics_key)
         if key not in self._kappa_cache:
             n = self.params.n_x
             e_eff = self._e_floor[mode] * (1.0 - f) + 0.5 * f
@@ -461,6 +587,11 @@ class HybridEnv:
         under relaxation 3 there is no partial block to lose.
         """
         p = self.params
+        if self._track is not None:
+            self._set_distance(self._track.step())
+        # _observe() AFTER the move: the relaxed chooser is already
+        # clairvoyant about f_t, and handing it a stale distance as well would
+        # make the bound weaker than the policies it has to sit above.
         obs = self._observe()
         f = self.eve.step()
         rates = (self.kappa(PM, f), self.kappa(ENT, f))
@@ -485,7 +616,7 @@ class HybridEnv:
                 "served": served, "expired": expired,
                 "buffer": self._buffer.level, "deposited": deposited,
                 "blocks": 0, "mode": mode, "qber": self._qber_hist[-1],
-                "rates": rates}
+                "rates": rates, "d_km": self._distance}
         return self._observe(), float(served), done, info
 
     @property
@@ -497,6 +628,24 @@ class HybridEnv:
 
     # Read-only views of the internal state. Tests and the analysis scripts
     # need these; nothing outside may mutate them.
+
+    @property
+    def distance_km(self):
+        """The link length this slot ran at [km]. Constant unless a
+        MobilityParams with enabled=True was supplied."""
+        return self._distance
+
+    @property
+    def track(self):
+        """The VesselTrack driving the distance, or None when the link is
+        fixed. A read-only view: nothing outside may step it."""
+        return self._track
+
+    @property
+    def physics_cache_size(self):
+        """Distinct distance grid points resolved so far. The whole point of
+        the grid is that this stays small; a test asserts it."""
+        return len(self._physics_cache)
 
     @property
     def sifted_per_slot(self):

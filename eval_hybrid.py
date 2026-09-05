@@ -50,14 +50,16 @@ import statistics
 from dqn import DQNConfig, train, training_seed_range
 from evemarkov import EveParams
 from hybridenv import HybridEnv, HybridParams
+from mobility import MobilityParams
 from policies import (AlwaysENT, AlwaysPM, BufferAwareThreshold,
-                      GreedyThreshold, Oracle, RelaxedAlwaysPM, run_episode,
-                      run_relaxed_episode)
+                      GreedyThreshold, Oracle, RangeOrQber, RangeThreshold,
+                      RelaxedAlwaysPM, run_episode, run_relaxed_episode)
 
-__all__ = ["THRESHOLDS", "RESERVES", "EVAL_SEED_BASE", "BOUNDS",
-           "evaluation_seeds", "assert_seeds_disjoint", "label_rows",
-           "sweep_threshold", "sweep_buffer_aware", "compare",
-           "switching_value", "format_rows", "main"]
+__all__ = ["THRESHOLDS", "RESERVES", "RANGE_POINTS", "EVAL_SEED_BASE",
+           "BOUNDS", "evaluation_seeds", "assert_seeds_disjoint", "label_rows",
+           "range_switches", "sweep_threshold", "sweep_buffer_aware",
+           "sweep_range", "sweep_range_qber", "compare", "switching_value",
+           "format_rows", "main"]
 
 # Candidate switch points, in measured QBER. At the configured operating point
 # (n_X = 1e5, 55 km) PM dies at QBER 3.3535% and ENT at 8.6194%
@@ -81,6 +83,12 @@ THRESHOLDS = (0.015, 0.02, 0.025, 0.03, 0.035, 0.04, 0.045, 0.05, 0.055,
 # always contains the plain policy: the buffer-aware row can never score
 # below the greedy row because of the sweep.
 RESERVES = (0.0, 0.1, 0.25, 0.5)
+
+# How many switch DISTANCES the range policies are swept over. The grid itself
+# cannot be a module constant the way THRESHOLDS is: a switch distance only
+# means something relative to where the vessel actually goes, and that is a
+# parameter. range_switches() builds the grid from the patrol band.
+RANGE_POINTS = 9
 
 # Evaluation seeds live in a block no plausible training run reaches:
 # dqn.SEED_STRIDE is 100_000, so this is config seed 990's block, and
@@ -127,6 +135,34 @@ def assert_seeds_disjoint(seeds, dqn_config, label="dqn"):
             "(%d..%d): the agent would be scored on trajectories it trained "
             "on. Use evaluation_seeds()." % (clash, label, trained.start,
                                              trained.stop - 1))
+
+
+def range_switches(params, count=RANGE_POINTS):
+    """Candidate switch distances [km] for RangeThreshold / RangeOrQber.
+
+    The grid spans the patrol band and OVERHANGS IT AT BOTH ENDS, for exactly
+    the reason THRESHOLDS runs past the highest QBER Eve can produce: an
+    argmax that lands on the edge of its own grid means "the largest value we
+    tried", not "the best value there is". A point below d_min makes the
+    policy always-ENT and a point above d_max makes it always-PM, so the
+    sweep's optimum is interior by construction.
+
+    With mobility off the distance is a constant, so the band is a point and
+    the grid degenerates to a few values either side of it -- the range
+    policies then reduce to AlwaysPM or AlwaysENT, which is the honest
+    answer: with nothing moving, a range threshold has nothing to switch on.
+    """
+    count = max(int(count), 2)
+    mobility = getattr(params, "mobility", None)
+    if mobility is not None and mobility.enabled:
+        lo, hi = float(mobility.d_min), float(mobility.d_max)
+    else:
+        lo = hi = float(params.d_km)
+    # A one-point band still needs a non-zero span, or every grid point
+    # coincides and _keyed() rejects the duplicates.
+    margin = 0.05 * max(hi - lo, 1.0)
+    lo, hi = lo - margin, hi + margin
+    return tuple(lo + (hi - lo) * i / (count - 1) for i in range(count))
 
 
 def label_rows(rows, what="policy label"):
@@ -253,6 +289,35 @@ def sweep_buffer_aware(env_factory=None, thresholds=THRESHOLDS,
                          for t in thresholds for r in reserves))
 
 
+def sweep_range(env_factory=None, switches=(), seeds=(1, 2, 3), envs=None):
+    """Return (best switch distance, {distance: mean eta}) for RangeThreshold.
+
+    `switches` comes from range_switches(params); it is deliberately not
+    defaulted here, because a distance grid that ignores the patrol band is
+    meaningless.
+    """
+    seeds = tuple(seeds)
+    envs = _resolve_envs(env_factory, envs, seeds)
+    return _sweep(envs, seeds,
+                  _keyed((float(d), RangeThreshold(d)) for d in switches))
+
+
+def sweep_range_qber(env_factory=None, switches=(), thresholds=THRESHOLDS,
+                     seeds=(1, 2, 3), envs=None):
+    """Return (best (distance, threshold), {pair: mean eta}) for RangeOrQber.
+
+    The FULL product grid, like sweep_buffer_aware and for the same reason: a
+    coordinate descent seeded from the two single-signal optima can miss the
+    joint optimum, and a baseline denied its best operating point manufactures
+    a win for whatever it is compared against.
+    """
+    seeds = tuple(seeds)
+    envs = _resolve_envs(env_factory, envs, seeds)
+    return _sweep(envs, seeds,
+                  _keyed(((float(d), float(t)), RangeOrQber(d, t))
+                         for d in switches for t in thresholds))
+
+
 def _mean_row(label, results):
     """One summary row. Each field averages ITS OWN key across episodes."""
     def mean(key):
@@ -261,7 +326,8 @@ def _mean_row(label, results):
             "switches": mean("switches"), "expired": mean("expired"),
             "secret_bits": mean("secret_bits"),
             "ent_fraction": mean("ent_fraction"),
-            "starved": mean("starved_fraction")}
+            "starved": mean("starved_fraction"),
+            "mean_d_km": mean("mean_d_km")}
 
 
 def _dqn_configs(dqn_config):
@@ -278,7 +344,8 @@ def _dqn_configs(dqn_config):
 
 
 def compare(seeds, params=None, eve_params=None, dqn_config=None,
-            thresholds=THRESHOLDS, reserves=RESERVES, sweeps=None):
+            thresholds=THRESHOLDS, reserves=RESERVES, sweeps=None,
+            switches=None):
     """Run every policy over `seeds`; return one summary row each.
 
     `seeds` must lie outside the training range of every config in
@@ -310,12 +377,26 @@ def compare(seeds, params=None, eve_params=None, dqn_config=None,
     best_pair, ba_table = sweep_buffer_aware(thresholds=thresholds,
                                              reserves=reserves, seeds=seeds,
                                              envs=envs)
+    # The distance-aware baselines get the same treatment as the others: their
+    # own full grid, on the same envs and the same seeds. Their grid is
+    # derived from the patrol band rather than fixed, so a mobility setting
+    # the caller chose cannot leave them sweeping distances the vessel never
+    # reaches.
+    switches = (range_switches(params) if switches is None
+                else tuple(float(d) for d in switches))
+    best_d, rg_table = sweep_range(switches=switches, seeds=seeds, envs=envs)
+    best_rq, rq_table = sweep_range_qber(switches=switches,
+                                         thresholds=thresholds, seeds=seeds,
+                                         envs=envs)
     if sweeps is not None:
         sweeps["threshold"] = th_table
         sweeps["buffer_aware"] = ba_table
+        sweeps["range"] = rg_table
+        sweeps["range_qber"] = rq_table
 
     candidates = [AlwaysPM(), AlwaysENT(), GreedyThreshold(best_th),
-                  BufferAwareThreshold(*best_pair)]
+                  BufferAwareThreshold(*best_pair), RangeThreshold(best_d),
+                  RangeOrQber(*best_rq)]
     rows = [_mean_row(p.name, _score(envs, p, seeds)) for p in candidates]
 
     for label, cfg in configs.items():
@@ -372,14 +453,15 @@ def format_rows(rows):
     --lam 2.5 --b-max 1e6 none of it is lost. Two parameter settings printing
     the same figure therefore do NOT mean the same key economy.
     """
-    head = ("%-26s %8s %9s %9s %12s %9s %9s"
+    head = ("%-26s %8s %9s %9s %12s %9s %9s %8s"
             % ("policy", "eta", "switches", "expired", "distilled",
-               "ENT frac", "starved"))
+               "ENT frac", "starved", "mean d"))
     lines = [head, "-" * len(head)]
     for r in rows:
-        lines.append("%-26s %8.4f %9.1f %9.1f %12.3e %9.3f %9.3f"
+        lines.append("%-26s %8.4f %9.1f %9.1f %12.3e %9.3f %9.3f %8.2f"
                      % (r["policy"], r["eta"], r["switches"], r["expired"],
-                        r["secret_bits"], r["ent_fraction"], r["starved"]))
+                        r["secret_bits"], r["ent_fraction"], r["starved"],
+                        r.get("mean_d_km", 0.0)))
     return "\n".join(lines)
 
 
@@ -404,6 +486,32 @@ def main(argv=None):
                          "command line rather than buried in a default.")
     ap.add_argument("--pm-preset", default=None,
                     help="PM operating point (default aurea)")
+    ap.add_argument("--mobility", action="store_true",
+                    help="give the SSV a track: the link length varies over "
+                         "the episode instead of sitting at --d-km. Off by "
+                         "default, and with it off every number this script "
+                         "prints is what it printed before mobility existed.")
+    ap.add_argument("--d-km", type=float, default=None,
+                    help="fixed link length, and the vessel's starting point "
+                         "when --mobility is on (clamped into the band)")
+    ap.add_argument("--d-min", type=float, default=None,
+                    help="closest approach [km] (with --mobility)")
+    ap.add_argument("--d-max", type=float, default=None,
+                    help="furthest excursion [km] (with --mobility). At the "
+                         "default speed limit a 3600-slot episode covers at "
+                         "most 46 km, so a band much wider than that is "
+                         "crossed at most once.")
+    ap.add_argument("--v-max", type=float, default=None,
+                    help="speed limit in km per slot; the default 0.0129 is "
+                         "25 knots at a 1 s slot")
+    ap.add_argument("--loiter-min", type=int, default=None,
+                    help="fewest slots held on station at a waypoint")
+    ap.add_argument("--loiter-max", type=int, default=None,
+                    help="most slots held on station at a waypoint")
+    ap.add_argument("--d-grid", type=float, default=None,
+                    help="distance quantisation [km] for the physics cache "
+                         "(default 0.5; <=0 recomputes every distance, which "
+                         "is exact and much slower)")
     ap.add_argument("--no-dqn", action="store_true",
                     help="baselines only; skips training entirely")
     ap.add_argument("--show-sweep", action="store_true",
@@ -421,6 +529,22 @@ def main(argv=None):
         overrides["ent_preset"] = args.ent_preset
     if args.pm_preset is not None:
         overrides["pm_preset"] = args.pm_preset
+    if args.d_km is not None:
+        overrides["d_km"] = args.d_km
+    if args.d_grid is not None:
+        overrides["d_grid_km"] = args.d_grid
+    # The band flags are read whether or not --mobility is given, but only
+    # take effect through a MobilityParams(enabled=True): passing --d-max
+    # alone must not quietly start the vessel moving.
+    if args.mobility:
+        track = {}
+        for flag, field in (("d_min", "d_min"), ("d_max", "d_max"),
+                            ("v_max", "v_max"), ("loiter_min", "loiter_min"),
+                            ("loiter_max", "loiter_max")):
+            value = getattr(args, flag)
+            if value is not None:
+                track[field] = value
+        overrides["mobility"] = MobilityParams(enabled=True, **track)
     params = HybridParams(**overrides)
 
     cfg = DQNConfig(episodes=args.episodes)
@@ -435,6 +559,16 @@ def main(argv=None):
           % (params.lam, params.b_max, params.horizon, params.t0_deadline,
              params.n_x, params.d_km))
     print("presets: pm=%s ent=%s" % (params.pm_preset, params.ent_preset))
+    if params.mobility is not None and params.mobility.enabled:
+        m = params.mobility
+        print("mobility: d in [%.1f, %.1f] km, v_max=%.4f km/slot "
+              "(<=%.1f km per %d-slot episode), loiter %d..%d slots, "
+              "grid %.2f km"
+              % (m.d_min, m.d_max, m.v_max, m.v_max * params.horizon,
+                 params.horizon, m.loiter_min, m.loiter_max,
+                 params.d_grid_km))
+    else:
+        print("mobility: off (fixed link at %.1f km)" % params.d_km)
     print("evaluation seeds: %d..%d (training range %d..%d)"
           % (seeds[0], seeds[-1], training_seed_range(cfg).start,
              training_seed_range(cfg).stop - 1))
@@ -446,6 +580,13 @@ def main(argv=None):
         for key in sorted(sweeps["buffer_aware"]):
             print("  %.4f %.2f  eta=%.4f"
                   % (key[0], key[1], sweeps["buffer_aware"][key]))
+        print("range switch sweep [km]:")
+        for d in sorted(sweeps["range"]):
+            print("  %8.2f  eta=%.4f" % (d, sweeps["range"][d]))
+        print("range-or-qber grid (distance, threshold):")
+        for key in sorted(sweeps["range_qber"]):
+            print("  %8.2f %.4f  eta=%.4f"
+                  % (key[0], key[1], sweeps["range_qber"][key]))
     print()
     print(format_rows(rows))
 

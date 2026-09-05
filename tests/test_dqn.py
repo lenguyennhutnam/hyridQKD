@@ -1058,8 +1058,11 @@ class TestObsNormalizer(unittest.TestCase):
     def test_it_centres_and_scales_to_the_sample_statistics(self):
         # Welford must agree with the two-pass formula it replaces; an
         # off-by-one in the update leaves a plausible but wrong variance.
+        # One scale per observation feature; the list must track OBS_DIM
+        # (7 since the distance became observable) or numpy broadcasts it
+        # against the wrong axis and the test errors out.
         data = np.random.RandomState(1).randn(500, OBS_DIM) * [
-            1.0, 0.02, 300.0, 5.0, 0.5, 7.0] + 3.0
+            1.0, 0.02, 300.0, 5.0, 0.5, 7.0, 0.3] + 3.0
         norm = ObsNormalizer(OBS_DIM)
         for row in data:
             norm.update(row)
@@ -1070,7 +1073,7 @@ class TestObsNormalizer(unittest.TestCase):
         # The defect in one assertion: raw, the loud feature outweighs the
         # informative one by a factor of 1e4; standardised, they weigh the same.
         data = np.random.RandomState(2).randn(2000, OBS_DIM) * [
-            0.02, 300.0, 1.0, 1.0, 1.0, 1.0]
+            0.02, 300.0, 1.0, 1.0, 1.0, 1.0, 1.0]
         norm = ObsNormalizer(OBS_DIM)
         for row in data:
             norm.update(row)

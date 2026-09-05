@@ -20,17 +20,28 @@ one construction, not the concept; the bound here relaxes the switching cost
 away instead of paying it.
 """
 
-from hybridenv import (ENT, I_AGE, I_BLOCK, I_BUFFER, I_MODE, I_QBER, I_QUEUE,
-                       PM)
+from hybridenv import (DIST_REF_KM, ENT, I_AGE, I_BLOCK, I_BUFFER, I_DIST,
+                       I_MODE, I_QBER, I_QUEUE, PM)
 
 # The observation layout is defined once, in hybridenv, next to the _observe()
 # that fixes the order. It is re-exported here only so a policy never has to
 # index the state vector with a bare integer -- keeping a second definition
 # would let the two drift apart silently.
 __all__ = ["ENT", "PM", "I_QBER", "I_MODE", "I_BLOCK", "I_BUFFER", "I_QUEUE",
-           "I_AGE", "Policy", "AlwaysPM", "AlwaysENT", "GreedyThreshold",
-           "BufferAwareThreshold", "RelaxationBound", "Oracle",
-           "RelaxedAlwaysPM", "run_episode", "run_relaxed_episode"]
+           "I_AGE", "I_DIST", "DIST_REF_KM", "Policy", "AlwaysPM",
+           "AlwaysENT", "GreedyThreshold", "BufferAwareThreshold",
+           "RangeThreshold", "RangeOrQber", "RelaxationBound", "Oracle",
+           "RelaxedAlwaysPM", "run_episode", "run_relaxed_episode",
+           "observed_distance_km"]
+
+
+def observed_distance_km(obs):
+    """The link length in km that `obs` reports (hybridenv.I_DIST is scaled).
+
+    One place undoes the normalisation, so a change to DIST_REF_KM cannot
+    leave one range policy reading kilometres and another reading a fraction.
+    """
+    return float(obs[I_DIST]) * DIST_REF_KM
 
 
 class Policy:
@@ -118,6 +129,55 @@ class BufferAwareThreshold(Policy):
         return PM
 
 
+class RangeThreshold(Policy):
+    """PM while the SSV is closer than `d_switch`; ENT at or beyond it.
+
+    The distance is the half of the weather the vessel actually KNOWS (Eve's
+    jamming is not), so this is the cheapest policy that can exploit the one
+    thing mobility adds. It ignores the QBER entirely -- deliberately: paired
+    with RangeOrQber it separates "how much is knowing the range worth" from
+    "how much does adding the inferred signal add on top".
+
+    `>=` matches GreedyThreshold's convention, and for the same reason: the
+    natural setting is PM's death DISTANCE, at which PM already distils
+    nothing.
+    """
+
+    def __init__(self, d_switch):
+        self.d_switch = float(d_switch)
+        self.name = "range-%.1f" % self.d_switch
+
+    def act(self, obs):
+        return ENT if observed_distance_km(obs) >= self.d_switch else PM
+
+
+class RangeOrQber(Policy):
+    """ENT when the SSV is far OR the link looks noisy; PM otherwise.
+
+    The two signals fail in different ways and neither subsumes the other:
+    the range is exact but says nothing about jamming, while the windowed
+    QBER sees jamming but is lagged by up to w_window slots and noisy in
+    proportion to the block. `or` rather than `and` because either condition
+    alone can already have killed PM, and waiting for both is waiting for PM
+    to be dead twice over.
+
+    Setting `d_switch` beyond the patrol band makes this exactly
+    GreedyThreshold(threshold), so the sweep grid always contains the
+    QBER-only policy and this row can never score below it because of the
+    search.
+    """
+
+    def __init__(self, d_switch, threshold):
+        self.d_switch = float(d_switch)
+        self.threshold = float(threshold)
+        self.name = "range-qber-%.1f-%.3f" % (self.d_switch, self.threshold)
+
+    def act(self, obs):
+        if observed_distance_km(obs) >= self.d_switch:
+            return ENT
+        return ENT if obs[I_QBER] >= self.threshold else PM
+
+
 def _rollout(env, label, seed, advance):
     """Run one episode and account for it. `advance(obs) -> env step tuple`.
 
@@ -132,6 +192,11 @@ def _rollout(env, label, seed, advance):
     slots_empty = 0
     last_mode = None
     ent_slots = 0
+    # Counted rather than taken from params.horizon: mean_d_km is the one
+    # figure that shows whether the vessel moved at all, and dividing it by a
+    # length the loop did not actually run would quietly bias it.
+    slots = 0
+    d_sum = 0.0
     while not done:
         obs, _, done, info = advance(obs)
         if last_mode is not None and info["mode"] != last_mode:
@@ -141,10 +206,13 @@ def _rollout(env, label, seed, advance):
         deposited += info["deposited"]
         ent_slots += 1 if info["mode"] == ENT else 0
         slots_empty += 1 if info["buffer"] < env.params.l0 else 0
+        slots += 1
+        d_sum += info["d_km"]
     return {"policy": label, "eta": env.eta, "switches": switches,
             "expired": expired, "secret_bits": deposited,
             "ent_fraction": ent_slots / env.params.horizon,
-            "starved_fraction": slots_empty / env.params.horizon}
+            "starved_fraction": slots_empty / env.params.horizon,
+            "mean_d_km": d_sum / slots if slots else 0.0}
 
 
 class RelaxationBound:
