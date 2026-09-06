@@ -659,6 +659,10 @@ class PolicyVizApp(tk.Tk):
         for spec in specs:
             if spec.startswith("buffer-aware"):
                 out.append("buffer-aware")
+            elif spec.startswith("block-aware"):
+                # "block-aware-80" from the command line still ticks the
+                # plain checkbox; the horizon comes from the configuration.
+                out.append("block-aware")
             elif spec.startswith("greedy"):
                 out.append("greedy")
             else:

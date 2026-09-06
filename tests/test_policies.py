@@ -14,8 +14,9 @@ import hybridenv
 from evemarkov import EveParams
 from hybridenv import (DIST_REF_KM, ENT, I_BUFFER, I_DIST, I_QBER, PM,
                        HybridEnv, HybridParams)
-from policies import (AlwaysENT, AlwaysPM, BufferAwareThreshold,
-                      GreedyThreshold, Oracle, Policy, RangeOrQber,
+from policies import (AlwaysENT, AlwaysPM, BlockAwareGreedy,
+                      BufferAwareThreshold, GreedyThreshold,
+                      HysteresisThreshold, Oracle, Policy, RangeOrQber,
                       RangeThreshold, RelaxationBound, RelaxedAlwaysPM,
                       observed_distance_km, run_episode, run_relaxed_episode)
 
@@ -653,3 +654,404 @@ class TestTheOracleBound(unittest.TestCase):
         ent = run_episode(env, AlwaysENT(), seed=11)["eta"]
         self.assertEqual(pm, 0.0)
         self.assertGreater(ent, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# The block-aware rule and its model-free cousin.
+#
+# GreedyThreshold compares the two modes and ignores what a switch DESTROYS:
+# eq (5) throws the partial block away. At chapman_lowmu that is not academic
+# -- greedy-0.045 switches 30 times and scores BELOW always-pm. These tests
+# pin the arithmetic that stops that happening, so a future edit cannot
+# quietly drop the cost term and still look like a switching policy.
+# ---------------------------------------------------------------------------
+
+
+class _RateModel:
+    """The hardware model a BlockAwareGreedy is allowed to read.
+
+    Exactly HybridEnv's kappa(mode, f), error_floor, sifted_per_slot and
+    params.n_x -- nothing else, which is the point: every one of those is
+    known at design time from the declared hardware, so a policy reading them
+    is realisable. The true f_t and the future are NOT here.
+
+    Hand-built rather than a real HybridEnv so a test can place the two modes
+    at rates that make the switching arithmetic visible;
+    TestBlockAwareGreedyOnARealEnvironment runs the rule against the real one.
+    """
+
+    def __init__(self, rates, floors=(0.01, 0.02), sifted=(1000, 1000),
+                 n_x=10_000, t0_deadline=20, w_window=5):
+        # rates is either (kappa_PM, kappa_ENT) or a callable (mode, f).
+        self._rates = rates
+        self.error_floor = tuple(floors)
+        self.sifted_per_slot = tuple(sifted)
+        self.params = HybridParams(n_x=int(n_x), t0_deadline=int(t0_deadline),
+                                   w_window=int(w_window))
+
+    def kappa(self, mode, f):
+        if callable(self._rates):
+            return float(self._rates(mode, f))
+        return float(self._rates[mode])
+
+
+class TestBindingAPolicyToItsEnvironment(unittest.TestCase):
+    """A model-based policy needs the environment it is being scored in.
+
+    eval_hybrid._score runs ONE policy object over every seed's env, so a
+    policy that latched a model at construction would read the first env's
+    distance while running in the last env's episode.
+    """
+
+    def test_the_base_policy_ignores_a_bind(self):
+        # Every existing baseline must keep working unchanged.
+        policy = AlwaysPM()
+        policy.bind(_RateModel((1.0, 2.0)))
+        self.assertEqual(policy.act(obs_with()), PM)
+
+    def test_it_refuses_to_act_before_it_is_bound(self):
+        with self.assertRaises(RuntimeError):
+            BlockAwareGreedy().act(obs_with())
+
+    def test_run_episode_binds_it_to_the_environment_it_runs_in(self):
+        env = HybridEnv(HybridParams(horizon=5))
+        policy = BlockAwareGreedy()
+        run_episode(env, policy, seed=1)
+        self.assertIs(policy.model, env)
+
+    def test_one_object_rebinds_between_environments(self):
+        # The failure this prevents: a policy answering for the previous
+        # seed's hardware. Two models, opposite verdicts, one policy object.
+        policy = BlockAwareGreedy(horizon=10)
+        here = obs_with(mode=PM, block=0.0)
+        policy.bind(_RateModel((1.0, 5.0)))
+        self.assertEqual(policy.act(here), ENT)
+        policy.bind(_RateModel((5.0, 1.0)))
+        self.assertEqual(policy.act(here), PM)
+
+
+class TestBlockAwareGreedyEstimatesTheJamming(unittest.TestCase):
+    """f is unobservable; the windowed QBER is not. E_eff(f) is invertible."""
+
+    def test_it_inverts_the_effective_qber(self):
+        policy = BlockAwareGreedy(f_step=0.0)
+        policy.bind(_RateModel((1.0, 1.0), floors=(0.01, 0.02)))
+        # E_eff = e(1-f) + 0.5 f, with e = 0.01 and f = 0.2.
+        q = 0.01 * 0.8 + 0.5 * 0.2
+        self.assertAlmostEqual(policy.estimated_jamming(
+            obs_with(qber=q, mode=PM)), 0.2, places=9)
+
+    def test_it_uses_the_floor_of_the_mode_actually_running(self):
+        # The same measured QBER means LESS jamming under the noisier mode.
+        policy = BlockAwareGreedy(f_step=0.0)
+        policy.bind(_RateModel((1.0, 1.0), floors=(0.01, 0.20)))
+        q = 0.10
+        self.assertGreater(
+            policy.estimated_jamming(obs_with(qber=q, mode=PM)),
+            policy.estimated_jamming(obs_with(qber=q, mode=ENT)))
+
+    def test_a_qber_below_the_floor_estimates_no_jamming(self):
+        # A lucky binomial draw must not produce a negative fraction and a
+        # kappa lookup outside the model's domain.
+        policy = BlockAwareGreedy(f_step=0.0)
+        policy.bind(_RateModel((1.0, 1.0), floors=(0.05, 0.05)))
+        self.assertEqual(policy.estimated_jamming(obs_with(qber=0.0)), 0.0)
+
+    def test_a_dead_link_estimates_full_jamming_and_no_more(self):
+        policy = BlockAwareGreedy(f_step=0.0)
+        policy.bind(_RateModel((1.0, 1.0), floors=(0.01, 0.01)))
+        self.assertEqual(policy.estimated_jamming(obs_with(qber=0.9)), 1.0)
+
+    def test_it_snaps_the_estimate_to_a_grid(self):
+        # Every distinct f costs a finite-key evaluation in HybridEnv.kappa;
+        # an unquantised estimate would miss the memo on all 3,600 slots.
+        policy = BlockAwareGreedy(f_step=0.01)
+        policy.bind(_RateModel((1.0, 1.0), floors=(0.0, 0.0)))
+        self.assertAlmostEqual(
+            policy.estimated_jamming(obs_with(qber=0.5 * 0.2049)), 0.20,
+            places=9)
+
+    def test_the_grid_keeps_the_number_of_distinct_estimates_small(self):
+        policy = BlockAwareGreedy(f_step=0.01)
+        policy.bind(_RateModel((1.0, 1.0), floors=(0.0, 0.0)))
+        seen = {policy.estimated_jamming(obs_with(qber=0.5 * i / 997.0))
+                for i in range(998)}
+        self.assertLessEqual(len(seen), 101)
+
+
+class TestBlockAwareGreedyWeighsTheForfeitedBlock(unittest.TestCase):
+    """Whole blocks retired inside the horizon H, staying versus switching:
+
+        stay = l_m(f)  * floor((b + ns_m  * H) / n_X)
+        go   = l_m'(f) * floor(     ns_m' * H  / n_X)      switch <=> go > stay
+
+    Counted in BLOCKS, not in a continuous rate, and that is not a detail:
+    continuous delivery is relaxation 3 of the Oracle bound, so a policy that
+    priced its own decisions that way would be quietly borrowing the
+    relaxation it is supposed to sit below. Measured, it also matters --
+    at chapman_lowmu the continuous form switches 48 times to a mode that
+    never finishes a block and lands BELOW always-pm.
+
+    Every model here is 10,000 sifted bits to a block and 1,000 bits a slot,
+    so a mode retires one whole block every ten slots and H = 19 buys exactly
+    one -- which is what lets a half-filled block tip the count.
+    """
+
+    H = 19
+
+    def model(self, rates, **kw):
+        kw.setdefault("floors", (0.0, 0.0))
+        kw.setdefault("sifted", (1000, 1000))
+        kw.setdefault("n_x", 10_000)
+        # No settling by default: these tests are about the switching
+        # arithmetic, and a dwell would mask it.
+        kw.setdefault("w_window", 0)
+        return _RateModel(rates, **kw)
+
+    def policy(self, rates, horizon=None, **kw):
+        policy = BlockAwareGreedy(horizon=self.H if horizon is None else horizon)
+        policy.bind(self.model(rates, **kw))
+        return policy
+
+    def test_it_switches_when_the_gain_outruns_the_forfeited_block(self):
+        # b = 0.5 blocks: staying retires floor(0.5 + 1.9) = 2 blocks of 10
+        # bits; switching retires floor(1.9) = 1 block of 30.
+        policy = self.policy((1.0, 3.0))
+        self.assertEqual(policy.act(obs_with(mode=PM, block=0.5)), ENT)
+
+    def test_it_stays_when_the_forfeited_block_outweighs_the_gain(self):
+        # THE DEFECT THIS POLICY EXISTS TO FIX. ENT is ahead on rate, so
+        # GreedyThreshold switches; here staying retires 2 blocks x 10 bits
+        # against switching's 1 x 15.
+        policy = self.policy((1.0, 1.5))
+        self.assertEqual(policy.act(obs_with(mode=PM, block=0.5)), PM)
+
+    def test_the_same_slot_switches_once_the_block_is_cheap_enough(self):
+        # Same rates, same horizon: only the sunk block differs, which is
+        # what makes the forfeited work load-bearing rather than decorative.
+        # floor(0.05 + 1.9) = 1 block either way, so the rates decide.
+        policy = self.policy((1.0, 1.5))
+        self.assertEqual(policy.act(obs_with(mode=PM, block=0.05)), ENT)
+
+    def test_a_block_just_started_costs_nothing_to_abandon(self):
+        policy = self.policy((1.0, 1.0 + 1e-9))
+        self.assertEqual(policy.act(obs_with(mode=PM, block=0.0)), ENT)
+
+    def test_it_never_switches_to_a_mode_that_earns_less(self):
+        policy = self.policy((2.0, 1.0))
+        for block in (0.0, 0.5, 0.99):
+            self.assertEqual(policy.act(obs_with(mode=PM, block=block)), PM)
+
+    def test_it_will_not_move_to_a_mode_that_cannot_finish_a_block_in_time(self):
+        # THE SECOND DEFECT. ENT here is ten times slower, so in H = 19 slots
+        # it retires floor(0.19) = 0 blocks and delivers NOTHING inside the
+        # horizon however rich its rate looks. This is chapman_lowmu exactly:
+        # 3,485 sifted bits a slot against a block of 100,000.
+        policy = self.policy((0.0, 5.0), sifted=(1000, 100))
+        self.assertEqual(policy.act(obs_with(mode=PM, block=0.5)), PM)
+
+    def test_a_horizon_long_enough_for_a_block_does_move_to_it(self):
+        # Same slow mode, same dead PM: with room for two whole ENT blocks
+        # the switch is worth making. The pair is the point -- the rule is
+        # about DELIVERY inside the horizon, not about rate.
+        policy = self.policy((0.0, 5.0), horizon=200, sifted=(1000, 100))
+        self.assertEqual(policy.act(obs_with(mode=PM, block=0.5)), ENT)
+
+    def test_a_slow_mode_earns_more_from_each_block_it_does_finish(self):
+        # l_m = kappa_m * n_X / ns_m -- a mode that takes ten times as long
+        # to fill a block banks ten times as much key when it lands. Here ENT
+        # retires 2 blocks to PM's 20 and still wins on total delivery;
+        # comparing the per-SLOT rates instead would undercount it tenfold.
+        policy = self.policy((1.0, 2.0), horizon=200, sifted=(1000, 100))
+        self.assertEqual(policy.act(obs_with(mode=PM, block=0.0)), ENT)
+
+    def test_it_leaves_a_dead_mode_at_once_however_full_the_block(self):
+        # l_m = 0 makes the forfeited block worth nothing, so a dying link is
+        # abandoned immediately -- the one case where a fixed dead band would
+        # be actively harmful.
+        policy = self.policy((0.0, 0.001))
+        self.assertEqual(policy.act(obs_with(mode=PM, block=0.999)), ENT)
+
+    def test_it_holds_when_both_modes_are_dead(self):
+        # Nothing to gain: a switch here would show up in the tables as
+        # thrashing that bought exactly zero bits.
+        policy = self.policy((0.0, 0.0), horizon=100)
+        self.assertEqual(policy.act(obs_with(mode=PM, block=0.5)), PM)
+        self.assertEqual(policy.act(obs_with(mode=ENT, block=0.5)), ENT)
+
+    def test_it_works_the_other_way_round_too(self):
+        # Sitting on ENT, PM recovers: same rule, mirrored.
+        policy = self.policy((2.0, 1.0))
+        self.assertEqual(policy.act(obs_with(mode=ENT, block=0.0)), PM)
+
+    def test_a_longer_horizon_switches_where_a_shorter_one_holds(self):
+        # H = 2 buys ENT floor(0.2) = 0 blocks while the sunk 0.8 of a block
+        # still tips PM's count to 1; H = 200 buys both of them 20.
+        here = obs_with(mode=PM, block=0.8)
+        self.assertEqual(self.policy((1.0, 1.5), horizon=2).act(here), PM)
+        self.assertEqual(self.policy((1.0, 1.5), horizon=200).act(here), ENT)
+
+    def test_it_holds_a_new_mode_until_the_qber_window_has_flushed(self):
+        # THE OSCILLATION THIS SETTLING TIME EXISTS TO STOP. The observed
+        # QBER averages the last w_window slots, so for w_window slots after
+        # a switch it is a BLEND of the two modes, and inverting that blend
+        # against either floor is meaningless. Measured at ent_advanced
+        # without it: the estimate reads "no jamming" on ENT (the window is
+        # full of PM's 0.0102 against ENT's 0.0458 floor) and "f = 0.073" on
+        # PM (the mirror image) -- a guaranteed two-cycle. 2,140 switches in
+        # 3,600 slots and eta = 0.12 against always-pm's 0.61.
+        policy = BlockAwareGreedy(horizon=self.H, settle=3)
+        policy.bind(self.model((1.0, 5.0)))
+        self.assertEqual(policy.act(obs_with(mode=PM, block=0.0)), ENT)
+        # The environment has switched; now the model reverses its verdict.
+        policy.bind(self.model((5.0, 1.0)))
+        for _ in range(3):
+            self.assertEqual(policy.act(obs_with(mode=ENT, block=0.0)), ENT)
+        self.assertEqual(policy.act(obs_with(mode=ENT, block=0.0)), PM)
+
+    def test_the_settling_time_does_not_delay_the_opening_move(self):
+        # Slot 0 starts on PM by construction, which is not a switch this
+        # policy made; holding a dead mode for w_window slots to honour it
+        # would be pure loss.
+        policy = BlockAwareGreedy(horizon=self.H, settle=5)
+        policy.bind(self.model((1.0, 5.0)))
+        self.assertEqual(policy.act(obs_with(mode=PM, block=0.0)), ENT)
+
+    def test_the_default_settling_time_is_the_qber_window(self):
+        policy = BlockAwareGreedy()
+        policy.bind(self.model((1.0, 1.0), w_window=9))
+        self.assertEqual(policy.settling_slots(), 9)
+
+    def test_reset_clears_the_settling_clock(self):
+        policy = BlockAwareGreedy(horizon=self.H, settle=4)
+        policy.bind(self.model((1.0, 5.0)))
+        policy.act(obs_with(mode=PM, block=0.0))          # -> ENT
+        policy.bind(self.model((5.0, 1.0)))
+        self.assertEqual(policy.act(obs_with(mode=ENT, block=0.0)), ENT)
+        policy.reset()
+        self.assertEqual(policy.act(obs_with(mode=ENT, block=0.0)), PM)
+
+    def test_the_default_horizon_is_the_message_deadline(self):
+        policy = BlockAwareGreedy()
+        policy.bind(self.model((1.0, 1.0), t0_deadline=37))
+        self.assertEqual(policy.planning_horizon(), 37)
+
+    def test_an_explicit_horizon_is_in_the_name(self):
+        self.assertEqual(BlockAwareGreedy().name, "block-aware")
+        self.assertEqual(BlockAwareGreedy(horizon=40).name, "block-aware-40")
+        self.assertNotEqual(BlockAwareGreedy(horizon=5).name,
+                            BlockAwareGreedy(horizon=10).name)
+
+
+class TestBlockAwareGreedyOnARealEnvironment(unittest.TestCase):
+    def test_the_environment_supplies_everything_the_rule_reads(self):
+        # Catches a rename of kappa/error_floor/sifted_per_slot: the stub
+        # model above would happily go on satisfying an obsolete interface.
+        env = HybridEnv(HybridParams(horizon=40))
+        result = run_episode(env, BlockAwareGreedy(), seed=3)
+        self.assertEqual(result["policy"], "block-aware")
+        self.assertGreaterEqual(result["eta"], 0.0)
+        self.assertLessEqual(result["eta"], 1.0)
+
+    def test_it_does_not_flood_the_kappa_memo(self):
+        # 3,600 unquantised estimates would mean 7,200 finite-key
+        # evaluations per episode; the grid is what keeps this usable.
+        env = HybridEnv(HybridParams(horizon=200))
+        run_episode(env, BlockAwareGreedy(f_step=0.01), seed=3)
+        self.assertLess(env.kappa_cache_size, 250)
+
+
+class TestHysteresisThreshold(unittest.TestCase):
+    """The model-free anti-thrash control: one threshold up, a lower one back.
+
+    GreedyThreshold has a single threshold, so a QBER dithering around it
+    switches on every crossing. This is the classical answer, and it needs no
+    hardware model at all -- which is exactly what makes it the honest
+    comparand for the derived rule.
+    """
+
+    def test_it_moves_to_ent_at_the_upper_threshold(self):
+        policy = HysteresisThreshold(0.05, 0.03)
+        policy.reset()
+        self.assertEqual(policy.act(obs_with(qber=0.05, mode=PM)), ENT)
+
+    def test_it_stays_on_pm_below_the_upper_threshold(self):
+        policy = HysteresisThreshold(0.05, 0.03)
+        policy.reset()
+        self.assertEqual(policy.act(obs_with(qber=0.049, mode=PM)), PM)
+
+    def test_it_holds_ent_inside_the_band(self):
+        # The whole point. GreedyThreshold(0.05) would go straight back to PM.
+        policy = HysteresisThreshold(0.05, 0.03)
+        policy.reset()
+        self.assertEqual(policy.act(obs_with(qber=0.04, mode=ENT)), ENT)
+        self.assertEqual(GreedyThreshold(0.05).act(obs_with(qber=0.04)), PM)
+
+    def test_it_returns_to_pm_at_the_lower_threshold(self):
+        policy = HysteresisThreshold(0.05, 0.03)
+        policy.reset()
+        self.assertEqual(policy.act(obs_with(qber=0.03, mode=ENT)), PM)
+
+    def test_a_zero_width_band_is_exactly_the_greedy_threshold(self):
+        # A legal sweep point, and the one that must reproduce the baseline:
+        # otherwise the grid cannot contain the policy it generalises.
+        policy = HysteresisThreshold(0.05, 0.05)
+        greedy = GreedyThreshold(0.05)
+        policy.reset()
+        for q, mode in ((0.049, PM), (0.05, PM), (0.06, ENT), (0.04, ENT)):
+            self.assertEqual(policy.act(obs_with(qber=q, mode=mode)),
+                             greedy.act(obs_with(qber=q)))
+
+    def test_it_refuses_a_band_that_is_upside_down(self):
+        with self.assertRaises(ValueError):
+            HysteresisThreshold(0.03, 0.05)
+
+    def test_the_dwell_blocks_a_reversal_that_comes_too_soon(self):
+        policy = HysteresisThreshold(0.05, 0.03, min_dwell=3)
+        policy.reset()
+        self.assertEqual(policy.act(obs_with(qber=0.06, mode=PM)), ENT)
+        # Now the QBER collapses; the dwell must hold ENT anyway.
+        for _ in range(3):
+            self.assertEqual(policy.act(obs_with(qber=0.0, mode=ENT)), ENT)
+        self.assertEqual(policy.act(obs_with(qber=0.0, mode=ENT)), PM)
+
+    def test_without_a_dwell_the_reversal_is_immediate(self):
+        policy = HysteresisThreshold(0.05, 0.03, min_dwell=0)
+        policy.reset()
+        self.assertEqual(policy.act(obs_with(qber=0.06, mode=PM)), ENT)
+        self.assertEqual(policy.act(obs_with(qber=0.0, mode=ENT)), PM)
+
+    def test_the_dwell_clock_restarts_on_every_switch(self):
+        policy = HysteresisThreshold(0.05, 0.03, min_dwell=2)
+        policy.reset()
+        policy.act(obs_with(qber=0.06, mode=PM))          # -> ENT
+        policy.act(obs_with(qber=0.06, mode=ENT))
+        policy.act(obs_with(qber=0.06, mode=ENT))
+        self.assertEqual(policy.act(obs_with(qber=0.0, mode=ENT)), PM)
+        # Back on PM the clock is fresh again, so a spike cannot bounce it.
+        self.assertEqual(policy.act(obs_with(qber=0.9, mode=PM)), PM)
+
+    def test_reset_clears_the_dwell_between_episodes(self):
+        # run_episode resets; a dwell carried across episode boundaries would
+        # make seed 2's first slots depend on seed 1's last ones.
+        policy = HysteresisThreshold(0.05, 0.03, min_dwell=5)
+        policy.reset()
+        policy.act(obs_with(qber=0.06, mode=PM))         # -> ENT
+        policy.act(obs_with(qber=0.06, mode=ENT))        # the dwell restarts
+        # Mid-episode the dwell now blocks a return to PM ...
+        self.assertEqual(policy.act(obs_with(qber=0.0, mode=ENT)), ENT)
+        policy.reset()
+        # ... and the next episode must not inherit it.
+        self.assertEqual(policy.act(obs_with(qber=0.0, mode=ENT)), PM)
+
+    def test_both_edges_and_the_dwell_are_in_the_name(self):
+        names = {HysteresisThreshold(0.05, 0.03).name,
+                 HysteresisThreshold(0.05, 0.04).name,
+                 HysteresisThreshold(0.06, 0.03).name,
+                 HysteresisThreshold(0.05, 0.03, min_dwell=4).name}
+        self.assertEqual(len(names), 4)
+
+    def test_it_runs_a_real_episode(self):
+        env = HybridEnv(HybridParams(horizon=40))
+        result = run_episode(env, HysteresisThreshold(0.05, 0.03), seed=3)
+        self.assertGreaterEqual(result["eta"], 0.0)

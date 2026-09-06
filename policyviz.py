@@ -85,8 +85,9 @@ from dqn import DQNConfig, training_seed_range
 from eval_hybrid import evaluation_seeds
 from evemarkov import EveParams
 from hybridenv import ENT, PM, HybridEnv, HybridParams
-from policies import (AlwaysENT, AlwaysPM, BufferAwareThreshold,
-                      GreedyThreshold, Oracle, Policy, RelaxationBound,
+from policies import (AlwaysENT, AlwaysPM, BlockAwareGreedy,
+                      BufferAwareThreshold, GreedyThreshold,
+                      HysteresisThreshold, Oracle, Policy, RelaxationBound,
                       RelaxedAlwaysPM)
 
 __all__ = ["BANNER", "SPEC_CHOICES", "TRACK_COLORS",
@@ -110,8 +111,8 @@ BANNER = ("NUMERIC MODEL (HybridEnv, eq 1-24) — this window does NOT drive "
 # What the policy chooser offers. `greedy` and `buffer-aware` are shown with
 # their parameters filled in from the spinboxes, so the strings here are only
 # the stems.
-SPEC_CHOICES = ("always-pm", "always-ent", "greedy", "buffer-aware", "dqn",
-                "oracle", "always-pm-relaxed")
+SPEC_CHOICES = ("always-pm", "always-ent", "greedy", "buffer-aware",
+                "block-aware", "dqn", "oracle", "always-pm-relaxed")
 
 # One colour per track, from the DecoyState palette plots.py already owns, so
 # a screenshot of this window sits next to the analytic figures without a
@@ -503,6 +504,8 @@ def death_thresholds(config):
 
 _GREEDY_RE = re.compile(r"^greedy-([0-9.]+)$")
 _BUFFER_RE = re.compile(r"^buffer-aware-([0-9.]+)-([0-9.]+)$")
+_BLOCK_RE = re.compile(r"^block-aware(?:-([0-9]+))?$")
+_HYST_RE = re.compile(r"^hysteresis-([0-9.]+)-([0-9.]+)-([0-9]+)$")
 
 
 def parse_spec(spec, dqn_policy=None):
@@ -511,7 +514,12 @@ def parse_spec(spec, dqn_policy=None):
     Accepts exactly the labels the study's own tables use, so a row copied out
     of `eval_hybrid.format_rows` can be pasted straight in:
     `always-pm`, `always-ent`, `greedy-<theta>`,
-    `buffer-aware-<theta>-<reserve>`, `dqn`, `oracle`, `always-pm-relaxed`.
+    `buffer-aware-<theta>-<reserve>`, `block-aware`, `block-aware-<H>`,
+    `hysteresis-<up>-<down>-<dwell>`, `dqn`, `oracle`, `always-pm-relaxed`.
+
+    `block-aware` with no horizon is the documented default -- the planning
+    horizon is then the message deadline T0, which is a PROPERTY OF THE
+    CONFIGURATION and so cannot be baked into the label.
 
     `dqn` needs a trained agent handed in -- there is nothing sensible to
     return for it otherwise, and returning an untrained network would put a
@@ -537,6 +545,14 @@ def parse_spec(spec, dqn_policy=None):
     m = _BUFFER_RE.match(spec)
     if m:
         return BufferAwareThreshold(float(m.group(1)), float(m.group(2)))
+    m = _BLOCK_RE.match(spec)
+    if m:
+        return BlockAwareGreedy(
+            horizon=None if m.group(1) is None else int(m.group(1)))
+    m = _HYST_RE.match(spec)
+    if m:
+        return HysteresisThreshold(float(m.group(1)), float(m.group(2)),
+                                   int(m.group(3)))
     raise ValueError("unknown policy spec %r" % (spec,))
 
 
@@ -602,7 +618,15 @@ class PolicyRun:
         return "--" if self.is_bound else "-"
 
     def reset(self):
-        """Rewind to slot 0 on this run's own seed and clear every trace."""
+        """Rewind to slot 0 on this run's own seed and clear every trace.
+
+        The agent is BOUND to this run's environment first, exactly as
+        policies.run_episode does it: a model-based rule reads kappa() and
+        the per-mode rates off the environment, and every run here owns its
+        own (that is what makes the traces comparable), so binding once at
+        construction would point one track's policy at another track's link.
+        """
+        self.agent.bind(self.env)
         self.agent.reset()
         self._obs = self.env.reset(self.seed)
         self.t = []

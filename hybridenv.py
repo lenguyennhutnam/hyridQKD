@@ -648,6 +648,17 @@ class HybridEnv:
         return len(self._physics_cache)
 
     @property
+    def kappa_cache_size(self):
+        """Distinct (mode, f, distance) points kappa() has evaluated.
+
+        A model-based policy calls kappa() with an ESTIMATED f, so unlike the
+        Oracle's three exact levels its keys are only as few as its
+        quantisation makes them; a test watches this rather than the wall
+        clock, because a miss costs a finite-key evaluation.
+        """
+        return len(self._kappa_cache)
+
+    @property
     def sifted_per_slot(self):
         """(PM, ENT) sifted bits harvested per slot at this channel."""
         return self._sifted

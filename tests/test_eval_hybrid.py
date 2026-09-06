@@ -659,3 +659,88 @@ class TestTheSwitchingValueDecomposition(unittest.TestCase):
         self.assertIn("relaxation alone  +0.100000", text)
         self.assertIn("switching itself  +0.050000", text)
         self.assertIn("total headroom    +0.150000", text)
+
+
+class TestBlockAwareSweep(unittest.TestCase):
+    """The derived rule gets its best planning horizon, like every other
+    baseline: a policy denied its operating point proves nothing."""
+
+    def test_the_sweep_scores_every_horizon_and_returns_the_best(self):
+        from eval_hybrid import sweep_block_aware
+
+        grid = (5, 20, 80)
+        best, table = sweep_block_aware(nondegenerate_factory(), horizons=grid,
+                                        seeds=(1, 2))
+        self.assertEqual(set(table), set(grid))
+        self.assertEqual(table[best], max(table.values()))
+
+    def test_one_policy_object_is_not_reused_across_horizons(self):
+        # BlockAwareGreedy carries a bound model and a settling clock; a
+        # sweep that shared one object between grid points would score the
+        # later ones with the earlier one's state.
+        from eval_hybrid import sweep_block_aware
+
+        _, table = sweep_block_aware(nondegenerate_factory(horizon=60),
+                                     horizons=(5, 320), seeds=(1,))
+        self.assertEqual(len(table), 2)
+
+
+class TestHysteresisSweep(unittest.TestCase):
+    def test_the_grid_covers_every_threshold_and_shape(self):
+        from eval_hybrid import sweep_hysteresis
+
+        _, table = sweep_hysteresis(nondegenerate_factory(horizon=120),
+                                    thresholds=(0.02, 0.05),
+                                    shapes=((0.0, 0), (0.01, 20)),
+                                    seeds=(1,))
+        self.assertEqual(set(table), {(0.02, 0.0, 0), (0.02, 0.01, 20),
+                                      (0.05, 0.0, 0), (0.05, 0.01, 20)})
+
+    def test_a_zero_band_and_no_dwell_reproduces_the_greedy_baseline(self):
+        # The fairness property the RESERVES grid has: the generalisation
+        # must contain the policy it generalises, or the hysteresis row could
+        # score below the greedy row purely because of the search.
+        from eval_hybrid import sweep_hysteresis, sweep_threshold
+
+        factory = nondegenerate_factory(horizon=120)
+        envs = {s: factory(s) for s in (1, 2)}
+        _, greedy = sweep_threshold(thresholds=(0.02, 0.05), seeds=(1, 2),
+                                    envs=envs)
+        _, hyst = sweep_hysteresis(thresholds=(0.02, 0.05),
+                                   shapes=((0.0, 0),), seeds=(1, 2),
+                                   envs=envs)
+        for th in (0.02, 0.05):
+            self.assertAlmostEqual(hyst[(th, 0.0, 0)], greedy[th], places=12)
+
+    def test_the_default_shape_grid_contains_that_degenerate_point(self):
+        from eval_hybrid import HYSTERESIS_SHAPES
+
+        self.assertIn((0.0, 0), HYSTERESIS_SHAPES)
+
+
+class TestTheNewPoliciesAreInTheTable(unittest.TestCase):
+    def test_compare_reports_both_of_them(self):
+        from eval_hybrid import compare, label_rows
+
+        rows = compare(seeds=(99_000_000, 99_000_001),
+                       params=HybridParams(horizon=120, **NONDEGENERATE),
+                       dqn_config={}, thresholds=(0.02, 0.05))
+        by = label_rows(rows)
+        self.assertTrue(any(k.startswith("block-aware") for k in by))
+        self.assertTrue(any(k.startswith("hysteresis-") for k in by))
+
+    def test_the_reported_rows_are_the_ones_the_sweeps_chose(self):
+        from eval_hybrid import compare, label_rows
+        from policies import BlockAwareGreedy, HysteresisThreshold
+
+        sweeps = {}
+        rows = compare(seeds=(99_000_000, 99_000_001),
+                       params=HybridParams(horizon=120, **NONDEGENERATE),
+                       dqn_config={}, thresholds=(0.02, 0.05), sweeps=sweeps)
+        by = label_rows(rows)
+        best_h = max(sweeps["block_aware"], key=sweeps["block_aware"].get)
+        self.assertIn(BlockAwareGreedy(horizon=best_h).name, by)
+        th, band, dwell = max(sweeps["hysteresis"],
+                              key=sweeps["hysteresis"].get)
+        self.assertIn(
+            HysteresisThreshold(th, max(0.0, th - band), dwell).name, by)

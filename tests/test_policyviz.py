@@ -33,8 +33,10 @@ from dqn import DQNConfig, training_seed_range  # noqa: E402
 import plots  # noqa: E402
 from evemarkov import EveParams  # noqa: E402
 from hybridenv import ENT, PM, HybridEnv  # noqa: E402
-from policies import (AlwaysENT, AlwaysPM, BufferAwareThreshold,  # noqa: E402
-                      GreedyThreshold, Oracle, RelaxedAlwaysPM, run_episode)
+from policies import (AlwaysENT, AlwaysPM, BlockAwareGreedy,  # noqa: E402
+                      BufferAwareThreshold, GreedyThreshold,
+                      HysteresisThreshold, Oracle, RelaxedAlwaysPM,
+                      run_episode)
 from policyviz import (PolicyRun, VizConfig, VizSession, death_thresholds,
                        dqn_label, draw_panels, format_scoreboard,
                        parse_spec)  # noqa: E402
@@ -458,8 +460,23 @@ class TestSpecParsing(unittest.TestCase):
     def test_a_parsed_policy_round_trips_through_its_own_name(self):
         # eval_hybrid's tables print policy.name; a spec copied from one must
         # come back as the same policy, or the two tools disagree silently.
-        for spec in ("greedy-0.045", "buffer-aware-0.045-0.25"):
+        for spec in ("greedy-0.045", "buffer-aware-0.045-0.25",
+                     "block-aware", "block-aware-80",
+                     "hysteresis-0.050-0.030-20"):
             self.assertEqual(parse_spec(spec).name, spec)
+
+    def test_block_aware_parses_with_and_without_a_horizon(self):
+        bare = parse_spec("block-aware")
+        self.assertIsInstance(bare, BlockAwareGreedy)
+        self.assertIsNone(bare.horizon)
+        self.assertEqual(parse_spec("block-aware-80").horizon, 80)
+
+    def test_hysteresis_carries_all_three_parameters_through(self):
+        policy = parse_spec("hysteresis-0.050-0.030-20")
+        self.assertIsInstance(policy, HysteresisThreshold)
+        self.assertAlmostEqual(policy.up, 0.05)
+        self.assertAlmostEqual(policy.down, 0.03)
+        self.assertEqual(policy.min_dwell, 20)
 
     def test_an_unknown_spec_is_refused(self):
         with self.assertRaises(ValueError):
@@ -470,6 +487,34 @@ class TestSpecParsing(unittest.TestCase):
         # figure with nothing to show it was never trained.
         with self.assertRaises(ValueError):
             parse_spec("dqn")
+
+
+class TestTheBlockAwarePolicyIsReachableFromTheWindow(unittest.TestCase):
+    """The derived rule is the point of the exercise; a policy that can only
+    be run from a script is not one the user can see working."""
+
+    def test_it_is_offered_as_a_checkbox(self):
+        self.assertIn("block-aware", policyviz.SPEC_CHOICES)
+
+    def test_a_parameterised_spec_still_ticks_the_plain_checkbox(self):
+        # --policies block-aware-80 must not open a window with nothing
+        # ticked next to a track that is running.
+        from policyviz_ui import PolicyVizApp
+
+        self.assertIn("block-aware", PolicyVizApp._stems(("block-aware-80",)))
+
+    def test_it_runs_in_a_session_alongside_the_bounds(self):
+        # The model-based rule reads kappa()/error_floor/sifted_per_slot off
+        # the environment; the session builds one env per run, so this is
+        # where a policy bound to the wrong one would show up.
+        session = VizSession(small_config(
+            specs=("always-pm", "block-aware", "oracle")))
+        for _ in range(12):
+            session.step()
+        names = [run.display_name for run in session.runs]
+        self.assertIn("block-aware", names)
+        for row in session.scores():
+            self.assertGreaterEqual(row["eta"], 0.0)
 
 
 class TestTheDQNIsLabelledWithItsEpisodeCount(unittest.TestCase):

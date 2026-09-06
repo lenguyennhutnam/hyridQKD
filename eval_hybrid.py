@@ -51,14 +51,18 @@ from dqn import DQNConfig, train, training_seed_range
 from evemarkov import EveParams
 from hybridenv import HybridEnv, HybridParams
 from mobility import MobilityParams
-from policies import (AlwaysENT, AlwaysPM, BufferAwareThreshold,
-                      GreedyThreshold, Oracle, RangeOrQber, RangeThreshold,
-                      RelaxedAlwaysPM, run_episode, run_relaxed_episode)
+from policies import (AlwaysENT, AlwaysPM, BlockAwareGreedy,
+                      BufferAwareThreshold, GreedyThreshold,
+                      HysteresisThreshold, Oracle, RangeOrQber,
+                      RangeThreshold, RelaxedAlwaysPM, run_episode,
+                      run_relaxed_episode)
 
-__all__ = ["THRESHOLDS", "RESERVES", "RANGE_POINTS", "EVAL_SEED_BASE",
+__all__ = ["THRESHOLDS", "RESERVES", "RANGE_POINTS", "BLOCK_HORIZONS",
+           "HYSTERESIS_SHAPES", "EVAL_SEED_BASE",
            "BOUNDS", "evaluation_seeds", "assert_seeds_disjoint", "label_rows",
            "range_switches", "sweep_threshold", "sweep_buffer_aware",
-           "sweep_range", "sweep_range_qber", "compare", "switching_value",
+           "sweep_range", "sweep_range_qber", "sweep_block_aware",
+           "sweep_hysteresis", "compare", "switching_value",
            "format_rows", "main"]
 
 # Candidate switch points, in measured QBER. At the configured operating point
@@ -89,6 +93,21 @@ RESERVES = (0.0, 0.1, 0.25, 0.5)
 # means something relative to where the vessel actually goes, and that is a
 # parameter. range_switches() builds the grid from the patrol band.
 RANGE_POINTS = 9
+
+# Planning horizons H for BlockAwareGreedy, in slots. H decides how far ahead
+# the rule counts finished blocks, and the grid has to straddle the block fill
+# time of the SLOWER mode or the answer is fixed by arithmetic rather than by
+# the data: at chapman_lowmu ENT needs 28.7 slots to fill n_X = 1e5, so
+# H = 5 can never choose it and H = 320 always can. The default T0 = 20 sits
+# between them deliberately -- that is the whole question the sweep asks.
+BLOCK_HORIZONS = (5, 20, 80, 320)
+
+# (band, min_dwell) shapes for HysteresisThreshold, swept against every
+# threshold: the band is subtracted from the threshold to get the lower edge.
+# (0.0, 0) makes it exactly GreedyThreshold, so -- as with RESERVES -- the
+# grid always contains the policy it generalises and the hysteresis row can
+# never score below the greedy row because of the search.
+HYSTERESIS_SHAPES = ((0.0, 0), (0.010, 0), (0.020, 0), (0.010, 20))
 
 # Evaluation seeds live in a block no plausible training run reaches:
 # dqn.SEED_STRIDE is 100_000, so this is config seed 990's block, and
@@ -318,6 +337,41 @@ def sweep_range_qber(env_factory=None, switches=(), thresholds=THRESHOLDS,
                          for d in switches for t in thresholds))
 
 
+def sweep_block_aware(env_factory=None, horizons=BLOCK_HORIZONS,
+                      seeds=(1, 2, 3), envs=None):
+    """Return (best horizon, {horizon: mean eta}) for BlockAwareGreedy.
+
+    A FRESH policy per grid point, like every other sweep here: this one
+    carries a bound model and a settling clock, so a shared object would
+    score the later horizons with the earlier one's state.
+    """
+    envs = _resolve_envs(env_factory, envs, seeds)
+    return _sweep(envs, seeds,
+                  _keyed((int(h), BlockAwareGreedy(horizon=h))
+                         for h in horizons))
+
+
+def sweep_hysteresis(env_factory=None, thresholds=THRESHOLDS,
+                     shapes=HYSTERESIS_SHAPES, seeds=(1, 2, 3), envs=None):
+    """Return (best (threshold, band, dwell), {key: mean eta}).
+
+    The FULL product grid, not a coordinate descent from the greedy optimum:
+    the best band can easily sit at a threshold that is not the best single
+    threshold, and a baseline denied its joint optimum manufactures a win for
+    whatever is being compared against it.
+
+    The lower edge is clamped at 0, where the policy never returns to PM at
+    all. That is a legal sweep point rather than an error -- it is
+    "switch once and stay" -- and it keeps a wide band from being an
+    exception the caller has to know about.
+    """
+    envs = _resolve_envs(env_factory, envs, seeds)
+    return _sweep(envs, seeds,
+                  _keyed(((float(t), float(band), int(dwell)),
+                          HysteresisThreshold(t, max(0.0, t - band), dwell))
+                         for t in thresholds for band, dwell in shapes))
+
+
 def _mean_row(label, results):
     """One summary row. Each field averages ITS OWN key across episodes."""
     def mean(key):
@@ -345,7 +399,8 @@ def _dqn_configs(dqn_config):
 
 def compare(seeds, params=None, eve_params=None, dqn_config=None,
             thresholds=THRESHOLDS, reserves=RESERVES, sweeps=None,
-            switches=None):
+            switches=None, horizons=BLOCK_HORIZONS,
+            shapes=HYSTERESIS_SHAPES):
     """Run every policy over `seeds`; return one summary row each.
 
     `seeds` must lie outside the training range of every config in
@@ -388,15 +443,25 @@ def compare(seeds, params=None, eve_params=None, dqn_config=None,
     best_rq, rq_table = sweep_range_qber(switches=switches,
                                          thresholds=thresholds, seeds=seeds,
                                          envs=envs)
+    best_h, bh_table = sweep_block_aware(horizons=horizons, seeds=seeds,
+                                         envs=envs)
+    best_hy, hy_table = sweep_hysteresis(thresholds=thresholds, shapes=shapes,
+                                         seeds=seeds, envs=envs)
     if sweeps is not None:
         sweeps["threshold"] = th_table
         sweeps["buffer_aware"] = ba_table
         sweeps["range"] = rg_table
         sweeps["range_qber"] = rq_table
+        sweeps["block_aware"] = bh_table
+        sweeps["hysteresis"] = hy_table
 
+    hy_th, hy_band, hy_dwell = best_hy
     candidates = [AlwaysPM(), AlwaysENT(), GreedyThreshold(best_th),
                   BufferAwareThreshold(*best_pair), RangeThreshold(best_d),
-                  RangeOrQber(*best_rq)]
+                  RangeOrQber(*best_rq),
+                  HysteresisThreshold(hy_th, max(0.0, hy_th - hy_band),
+                                      hy_dwell),
+                  BlockAwareGreedy(horizon=best_h)]
     rows = [_mean_row(p.name, _score(envs, p, seeds)) for p in candidates]
 
     for label, cfg in configs.items():
@@ -587,6 +652,13 @@ def main(argv=None):
         for key in sorted(sweeps["range_qber"]):
             print("  %8.2f %.4f  eta=%.4f"
                   % (key[0], key[1], sweeps["range_qber"][key]))
+        print("block-aware planning horizon sweep [slots]:")
+        for h in sorted(sweeps["block_aware"]):
+            print("  %5d  eta=%.4f" % (h, sweeps["block_aware"][h]))
+        print("hysteresis grid (threshold, band, dwell):")
+        for key in sorted(sweeps["hysteresis"]):
+            print("  %.4f %.4f %3d  eta=%.4f"
+                  % (key[0], key[1], key[2], sweeps["hysteresis"][key]))
     print()
     print(format_rows(rows))
 

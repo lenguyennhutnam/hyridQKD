@@ -20,6 +20,8 @@ one construction, not the concept; the bound here relaxes the switching cost
 away instead of paying it.
 """
 
+import math
+
 from hybridenv import (DIST_REF_KM, ENT, I_AGE, I_BLOCK, I_BUFFER, I_DIST,
                        I_MODE, I_QBER, I_QUEUE, PM)
 
@@ -30,6 +32,7 @@ from hybridenv import (DIST_REF_KM, ENT, I_AGE, I_BLOCK, I_BUFFER, I_DIST,
 __all__ = ["ENT", "PM", "I_QBER", "I_MODE", "I_BLOCK", "I_BUFFER", "I_QUEUE",
            "I_AGE", "I_DIST", "DIST_REF_KM", "Policy", "AlwaysPM",
            "AlwaysENT", "GreedyThreshold", "BufferAwareThreshold",
+           "HysteresisThreshold", "BlockAwareGreedy",
            "RangeThreshold", "RangeOrQber", "RelaxationBound", "Oracle",
            "RelaxedAlwaysPM", "run_episode", "run_relaxed_episode",
            "observed_distance_km"]
@@ -48,6 +51,17 @@ class Policy:
     """Interface every policy shares."""
 
     name = "policy"
+
+    def bind(self, model):
+        """Called by run_episode with the environment this episode runs in.
+
+        Only MODEL-BASED policies need it (BlockAwareGreedy); for everything
+        else it is a no-op, which is why it lives here rather than in a second
+        base class. The reason it is a per-episode hook and not a constructor
+        argument: eval_hybrid._score runs ONE policy object over every seed's
+        environment, so a model latched at construction would answer for the
+        first seed's hardware while running inside the last seed's episode.
+        """
 
     def reset(self):
         """Called once per episode, before the first act()."""
@@ -178,6 +192,251 @@ class RangeOrQber(Policy):
         return ENT if obs[I_QBER] >= self.threshold else PM
 
 
+class _ModeDwell:
+    """Counts the slots the OBSERVED mode has been running.
+
+    Both anti-thrash policies need it, for different reasons -- one to refuse
+    a reversal, one to wait out the QBER window -- so the bookkeeping lives
+    once, here.
+
+    It is driven by obs[I_MODE], the mode the ENVIRONMENT actually ran, not by
+    the policy's own last decision. They cannot disagree today, but a rule
+    counting its own intentions would keep counting through a slot the
+    environment refused, which is the sort of drift that shows up only as a
+    number that will not reproduce.
+
+    The first slot of an episode enters at `entry` rather than 0: the
+    environment starts in PM by construction, and treating that as a switch
+    the policy just made would hold a link that is already noisy on a dead
+    mode for no reason.
+    """
+
+    def _dwell_reset(self):
+        self._dwell = 0
+        self._dwell_mode = None
+
+    def _dwell_tick(self, mode, entry):
+        if self._dwell_mode is None:
+            self._dwell_mode = mode
+            self._dwell = int(entry)
+        elif mode != self._dwell_mode:
+            self._dwell_mode = mode
+            self._dwell = 0
+        else:
+            self._dwell += 1
+        return self._dwell
+
+
+class HysteresisThreshold(_ModeDwell, Policy):
+    """Switch up at `up`, and only back down at `down` -- with `down` < `up`.
+
+    GreedyThreshold has ONE threshold, so a QBER dithering around it switches
+    on every crossing, and each crossing pays eq (5): the partial block is
+    destroyed. Measured, that is not a hypothetical -- greedy-0.045 at
+    chapman_lowmu switches 30 times and lands BELOW always-pm.
+
+    This is the classical control answer to that, and it deliberately needs
+    NO model of the hardware: it is the honest comparand for BlockAwareGreedy,
+    which derives its band instead of being given one. `min_dwell` is the
+    second classical knob -- a floor on how long a mode is held, in slots,
+    whatever the QBER does -- and it caps the switch count at
+    horizon / min_dwell by construction rather than by tuning.
+
+    down == up is a legal (and useful) sweep point: it is exactly
+    GreedyThreshold(up), so a grid over the band always contains the
+    single-threshold baseline this generalises.
+
+    The current mode is read from the OBSERVATION (m_{t-1}), not from a
+    private copy: the environment is what decides which mode actually ran,
+    and a policy tracking its own idea of that would drift the moment the two
+    disagreed.
+    """
+
+    def __init__(self, up, down, min_dwell=0):
+        up, down = float(up), float(down)
+        if down > up:
+            raise ValueError("hysteresis needs down <= up, got %g > %g"
+                             % (down, up))
+        self.up = up
+        self.down = down
+        self.min_dwell = int(min_dwell)
+        self.name = "hysteresis-%.3f-%.3f-%d" % (up, down, self.min_dwell)
+        self.reset()
+
+    def reset(self):
+        # Cleared per episode, so seed 2's first slots cannot depend on
+        # seed 1's last ones.
+        self._dwell_reset()
+
+    def act(self, obs):
+        mode = ENT if int(obs[I_MODE]) == ENT else PM
+        dwell = self._dwell_tick(mode, self.min_dwell)
+        want = mode
+        if mode == PM and obs[I_QBER] >= self.up:
+            want = ENT
+        elif mode == ENT and obs[I_QBER] <= self.down:
+            want = PM
+        if want != mode and dwell < self.min_dwell:
+            return mode
+        return want
+
+
+class BlockAwareGreedy(_ModeDwell, Policy):
+    """Switch only when the gain outruns the block the switch destroys.
+
+    GreedyThreshold's defect is not its threshold, it is that it compares the
+    two modes and ignores the COST of acting on the comparison: eq (5) wipes
+    the partial block on every change of mode. This policy prices that.
+
+    The rule counts the WHOLE BLOCKS each choice retires inside a planning
+    horizon H, with m the mode running, m' the other one, and b the sifted
+    bits already banked toward the current block:
+
+        stay = l_m(f_hat)  * floor((b + ns_m  * H) / n_X)
+        go   = l_m'(f_hat) * floor(     ns_m' * H  / n_X)
+        switch  <=>  go > stay
+
+    where l_m(f) = kappa_m(f) * n_X / ns_m is one finished block's key.
+
+    WHOLE blocks, not a continuous rate, and that is the load-bearing choice.
+    Continuous delivery is relaxation 3 of the Oracle bound; a policy pricing
+    its own decisions that way would be quietly awarding itself the
+    relaxation it is meant to sit below, and it shows: the continuous form
+    switches 48 times at chapman_lowmu to a mode that never finishes a block
+    inside the horizon, and lands BELOW always-pm.
+
+    Three properties fall out of the arithmetic rather than being bolted on:
+
+    * HYSTERESIS. `b` can only ever tip the count by one block, and it does
+      so only when the current mode is close to finishing -- so a block just
+      started is free to abandon and one nearly complete is not. No second
+      threshold and no tuned dead band; the width comes from the physics.
+    * A BOUND ON THRASHING. Switching is only ever free near a block
+      boundary, so the mode cannot change much more often than once a block.
+    * NO MOVE TO A MODE THAT CANNOT DELIVER IN TIME. If m' needs longer than
+      H to fill one block, floor() makes `go` exactly zero however rich its
+      rate looks. This is what the continuous form gets wrong.
+
+    And the case where a fixed dead band would be actively harmful is handled
+    for free: when the current mode is dead, l_m = 0 makes `stay` zero and the
+    policy leaves at once, however full the block.
+
+    WHAT IT IS ALLOWED TO KNOW. `model` supplies kappa_m(.), the error floors
+    e_m and the sifted rates ns_m -- all of them design-time properties of the
+    declared hardware, the same quantities gui.py forecasts before a run. It
+    is NOT clairvoyant: the true f_t never reaches it, and the jamming is
+    estimated by inverting E_eff(f) = e_m (1 - f) + f/2 on the windowed QBER
+    the observation carries, lag, binomial noise and all. That is the whole
+    difference between this and `Oracle`.
+
+    `horizon` is the planning horizon H in slots; None means the message
+    deadline T0, on the grounds that key arriving later than the deadline
+    cannot rescue the messages currently at risk.
+
+    `settle` is the SETTLING TIME of that estimator, in slots, and it is not
+    optional. The observed QBER averages the last w_window slots, so for
+    w_window slots after a change of mode it is a BLEND of the two modes and
+    inverting it against either floor is meaningless -- and the error has a
+    sign that reverses with the mode, which is the worst possible kind. At
+    ent_advanced (floors 0.0102 and 0.0458) the blend reads "no jamming"
+    while on ENT and "f = 0.073" while on PM, so the rule flips every slot:
+    measured, 2,140 switches in 3,600 slots and eta = 0.12 against
+    always-pm's 0.61. Holding the new mode until the window has flushed
+    removes it. None means w_window, which is exactly the contamination
+    length; 0 disables it and reproduces the oscillation.
+
+    `f_step` quantises the estimate. HybridEnv.kappa memoises on (mode, f,
+    distance) and a miss costs a finite-key evaluation, so an unquantised
+    estimate would miss on all 3,600 slots of an episode. DECLARED
+    APPROXIMATION: the rule is evaluated at a jamming level at most
+    f_step/2 from the estimate. f_step <= 0 disables it (exact, slow).
+    """
+
+    def __init__(self, horizon=None, f_step=0.005, settle=None):
+        self.horizon = None if horizon is None else int(horizon)
+        self.f_step = float(f_step)
+        self.settle = None if settle is None else int(settle)
+        self.name = ("block-aware" if self.horizon is None
+                     else "block-aware-%d" % self.horizon)
+        self.model = None
+        self.reset()
+
+    def bind(self, model):
+        self.model = model
+
+    def reset(self):
+        self._dwell_reset()
+
+    def _model(self):
+        if self.model is None:
+            raise RuntimeError(
+                "%s must be bound to an environment before it can act; "
+                "run_episode() does that, a bare act() does not" % self.name)
+        return self.model
+
+    def planning_horizon(self):
+        """H, in slots. The message deadline unless one was given."""
+        if self.horizon is not None:
+            return self.horizon
+        return int(self._model().params.t0_deadline)
+
+    def settling_slots(self):
+        """Slots to hold a new mode while the QBER window flushes."""
+        if self.settle is not None:
+            return self.settle
+        return int(self._model().params.w_window)
+
+    def estimated_jamming(self, obs):
+        """f_hat: E_eff(f) = e_m (1 - f) + f/2 inverted on the windowed QBER.
+
+        Clipped to [0, 1] because a lucky binomial draw can put the measured
+        QBER below the floor, and a negative fraction would ask the rate model
+        for a point outside its domain.
+        """
+        model = self._model()
+        mode = ENT if int(obs[I_MODE]) == ENT else PM
+        floor = model.error_floor[mode]
+        span = 0.5 - floor
+        if span <= 0.0:
+            return 0.0
+        f = (float(obs[I_QBER]) - floor) / span
+        f = min(1.0, max(0.0, f))
+        if self.f_step > 0.0:
+            f = min(1.0, max(0.0, round(f / self.f_step) * self.f_step))
+        return f
+
+    def _key_over(self, mode, f, banked, horizon):
+        """Secret bits `mode` retires in `horizon` slots, starting `banked`
+        sifted bits into a block. Zero when it cannot finish even one."""
+        model = self.model
+        n_x = model.params.n_x
+        sifted = model.sifted_per_slot[mode]
+        if not sifted or not n_x:
+            return 0.0
+        blocks = math.floor((banked + sifted * horizon) / n_x)
+        per_block = model.kappa(mode, f) * n_x / sifted
+        return per_block * blocks
+
+    def act(self, obs):
+        model = self._model()
+        mode = ENT if int(obs[I_MODE]) == ENT else PM
+        other = PM if mode == ENT else ENT
+        settle = self.settling_slots()
+        if self._dwell_tick(mode, settle) < settle:
+            # The estimator has not flushed yet; anything decided from this
+            # observation would be decided from the previous mode's QBER.
+            return mode
+        f = self.estimated_jamming(obs)
+        horizon = self.planning_horizon()
+        banked = float(obs[I_BLOCK]) * model.params.n_x
+        stay = self._key_over(mode, f, banked, horizon)
+        # eq (5): switching wipes the partial block, so the other mode starts
+        # from zero. That subtraction IS the switching cost -- there is no
+        # separate penalty term anywhere in this policy.
+        go = self._key_over(other, f, 0.0, horizon)
+        return other if go > stay else mode
+
+
 def _rollout(env, label, seed, advance):
     """Run one episode and account for it. `advance(obs) -> env step tuple`.
 
@@ -226,6 +485,10 @@ class RelaxationBound:
     """
 
     name = "bound"
+
+    def bind(self, model):
+        """As Policy.bind. Present so a runner can bind either kind without
+        asking which it is holding; no bound currently needs it."""
 
     def reset(self):
         """Called once per episode, before the first choose()."""
@@ -284,6 +547,7 @@ def run_relaxed_episode(env, bound, seed=None):
     they mean elsewhere -- they are what shows an Oracle actually switching
     rather than settling on one mode.
     """
+    bound.bind(env)
     bound.reset()
     return _rollout(env, bound.name, seed,
                     lambda obs: env.step_relaxed(bound.choose))
@@ -312,6 +576,7 @@ def run_episode(env, policy, seed=None):
     constructing one re-runs channel.derive()/derive_ent(), which is by far
     the most expensive thing in the loop and does not depend on the seed.
     """
+    policy.bind(env)
     policy.reset()
     return _rollout(env, policy.name, seed,
                     lambda obs: env.step(policy.act(obs)))
