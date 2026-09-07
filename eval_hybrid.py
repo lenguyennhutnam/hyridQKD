@@ -544,6 +544,15 @@ def main(argv=None):
     ap.add_argument("--b-max", type=float, default=None,
                     help="key buffer capacity in bits, e.g. 1e6")
     ap.add_argument("--t0", type=int, default=None, help="deadline in slots")
+    ap.add_argument("--n-x", type=float, default=None,
+                    help="finite-key block size in sifted bits, e.g. 3e6. "
+                         "This is the second half of the optimisation, and it "
+                         "decides whether the TIMING side of the model does "
+                         "anything: at the default 1e5 a block lands every "
+                         "1.4 slots and eta comes out exactly proportional to "
+                         "the total key distilled, so no scheduling decision "
+                         "can matter. Raise it until the block fill time "
+                         "approaches --t0 and the policies separate.")
     ap.add_argument("--ent-preset", default=None,
                     help="ENT operating point, e.g. ent_advanced. The hardware "
                          "assumption is the single biggest lever on whether "
@@ -590,6 +599,8 @@ def main(argv=None):
         overrides["b_max"] = int(args.b_max)
     if args.t0 is not None:
         overrides["t0_deadline"] = args.t0
+    if args.n_x is not None:
+        overrides["n_x"] = int(args.n_x)
     if args.ent_preset is not None:
         overrides["ent_preset"] = args.ent_preset
     if args.pm_preset is not None:
@@ -620,7 +631,7 @@ def main(argv=None):
     rows = compare(seeds=seeds, params=params, dqn_config=dqn_config,
                    sweeps=sweeps)
 
-    print("params: lam=%.3f b_max=%.3g horizon=%d T0=%d n_x=%d d_km=%.1f"
+    print("params: lam=%.3f b_max=%.3g horizon=%d T0=%d n_x=%.3g d_km=%.1f"
           % (params.lam, params.b_max, params.horizon, params.t0_deadline,
              params.n_x, params.d_km))
     print("presets: pm=%s ent=%s" % (params.pm_preset, params.ent_preset))

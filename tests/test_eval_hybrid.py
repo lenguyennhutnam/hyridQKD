@@ -543,6 +543,19 @@ class TestPresetFlagsReachTheEnvironment(unittest.TestCase):
         self.assertEqual(params.ent_preset, HybridParams().ent_preset)
         self.assertEqual(params.pm_preset, HybridParams().pm_preset)
 
+    def test_the_block_length_is_settable_from_the_command_line(self):
+        # n_X is half of the thesis question and it decides whether the
+        # TIMING side of the model does anything at all: at n_X = 1e5 a block
+        # lands every 1.4 slots and eta is exactly proportional to the total
+        # key, so no scheduling decision can matter. Without a flag that
+        # regime is the only one anyone ever measures.
+        params = self._capture(["--no-dqn", "--seeds", "1", "--n-x", "3e6"])
+        self.assertEqual(params.n_x, 3_000_000)
+
+    def test_omitting_it_keeps_the_documented_block_length(self):
+        params = self._capture(["--no-dqn", "--seeds", "1"])
+        self.assertEqual(params.n_x, HybridParams().n_x)
+
 
 if __name__ == "__main__":
     unittest.main()
