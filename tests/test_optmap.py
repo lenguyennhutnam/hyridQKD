@@ -36,7 +36,9 @@ def proportional(policy, eta, base=(0.60, 4.0e7)):
     like.
     """
     eta_pm, key_pm = base
-    return row(policy, eta, secret_bits=key_pm * eta / eta_pm)
+    # Starved almost always: that is what a supply-limited cell looks like,
+    # and it is what makes eta a linear function of the total key.
+    return row(policy, eta, secret_bits=key_pm * eta / eta_pm, starved=0.95)
 
 
 # A plausible cell: block-aware wins among the realisable rows, the Oracle is
@@ -128,6 +130,21 @@ class TestSummarisingOneCell(unittest.TestCase):
         self.assertEqual(cell["regime"], "supply")
         self.assertLess(cell["coupling_spread"], 1e-9)
 
+    def test_a_cell_whose_buffer_is_almost_never_empty_is_saturated(self):
+        # THE MISLABEL THIS EXISTS TO FIX. A saturated cell also shows a wide
+        # coupling spread -- not because timing binds but because eta is
+        # pinned at its ceiling while the key keeps growing -- so the spread
+        # ALONE cannot separate the two. Measured at d = 20 km: starved 0.10,
+        # spread 0.12, and every policy delivering eta = 1.0000.
+        rows = [proportional("always-pm", 0.95, base=(0.95, 4.0e7)),
+                row("always-ent", 1.0, secret_bits=8.0e7, starved=0.02),
+                proportional("always-pm-relaxed", 0.96, base=(0.95, 4.0e7)),
+                proportional("oracle", 0.99, base=(0.95, 4.0e7))]
+        rows[0]["starved"] = 0.10
+        cell = self.summary(rows=rows)
+        self.assertEqual(cell["regime"], "saturated")
+        self.assertGreater(cell["coupling_spread"], optmap.SUPPLY_SPREAD)
+
     def test_a_cell_where_more_key_buys_less_eta_is_timing_limited(self):
         # THE measured signature of the timing regime, and it is not
         # hypothetical: at n_X = 1e6 block-aware distils MORE key than any
@@ -137,9 +154,21 @@ class TestSummarisingOneCell(unittest.TestCase):
                 row("block-aware-80", 0.62, secret_bits=4.6e7),
                 proportional("always-pm-relaxed", 0.61),
                 proportional("oracle", 0.72)]
+        rows[0]["starved"] = 0.45
         cell = self.summary(rows=rows, fill=(14.4, 10.8), t0_deadline=20)
         self.assertEqual(cell["regime"], "timing")
         self.assertGreater(cell["coupling_spread"], optmap.SUPPLY_SPREAD)
+
+    def test_the_three_regimes_are_separated_by_the_starvation_alone(self):
+        # One quantity, three clusters, measured: the buffer is empty
+        # essentially always (supply), sometimes (timing), or hardly ever
+        # (saturated). Nothing else in the cell changes here.
+        labels = []
+        for starved in (0.98, 0.45, 0.10):
+            rows = [dict(r) for r in ROWS]
+            rows[0]["starved"] = starved
+            labels.append(self.summary(rows=rows)["regime"])
+        self.assertEqual(labels, ["supply", "timing", "saturated"])
 
     def test_the_regime_is_measured_and_not_read_off_the_fill_time(self):
         # Same rows, absurd fill times: the label must not move, because the
@@ -148,14 +177,26 @@ class TestSummarisingOneCell(unittest.TestCase):
         far = self.summary(fill=(400.0, 900.0), t0_deadline=20)
         self.assertEqual(near["regime"], far["regime"])
 
-    def test_a_cell_whose_control_delivered_nothing_has_no_regime(self):
-        rows = [row("always-pm", 0.0, secret_bits=0.0),
-                row("always-ent", 0.4, secret_bits=1e7),
-                row("always-pm-relaxed", 0.0, secret_bits=0.0),
-                row("oracle", 0.5, secret_bits=2e7)]
+    def test_a_cell_whose_control_delivered_nothing_has_no_coupling_ratio(self):
+        # There is no exchange rate to compare against when the control
+        # banked no key, so the corroborating figure is absent -- but the
+        # starvation still says what the buffer was doing, so the cell is
+        # still labelled rather than dropped.
+        rows = [row("always-pm", 0.0, secret_bits=0.0, starved=1.0),
+                row("always-ent", 0.4, secret_bits=1e7, starved=0.99),
+                row("always-pm-relaxed", 0.0, secret_bits=0.0, starved=1.0),
+                row("oracle", 0.5, secret_bits=2e7, starved=0.98)]
         cell = self.summary(rows=rows)
         self.assertIsNone(cell["coupling_spread"])
-        self.assertEqual(cell["regime"], "unknown")
+        self.assertEqual(cell["regime"], "supply")
+
+    def test_a_control_with_no_starvation_figure_is_left_unlabelled(self):
+        # A mislabelled cell is worse than an unlabelled one: this column is
+        # what a reader uses to decide whether the scheduling half of the
+        # model did anything at all.
+        rows = [{"policy": "always-pm", "eta": 0.6, "secret_bits": 4e7},
+                {"policy": "oracle", "eta": 0.7, "secret_bits": 5e7}]
+        self.assertEqual(self.summary(rows=rows)["regime"], "unknown")
 
     def test_a_dead_cell_is_flagged_rather_than_reported_as_a_win(self):
         rows = [row("always-pm", 0.0), row("always-ent", 0.0),

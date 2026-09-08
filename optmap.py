@@ -40,14 +40,29 @@ in-sample number -- the same caveat the study's own tables carry.
 
 REGIME IS MEASURED, NOT ASSUMED
 -------------------------------
-A cell is "supply"-limited when eta is (to within SUPPLY_SPREAD) a linear
-function of the total key distilled, i.e. when the ratio
-(eta / eta_pm) / (key / key_pm) is the same for every policy. That is the
-measured diagnostic, not a guess from the block fill time: at n_X = 1e5 the
-spread across six policies is 0.0007, and by n_X = 1e6 it is 0.098. In a
-supply-limited cell no scheduling decision can matter and the problem
-degenerates to "maximise total key". The fill times are reported alongside,
-because they are what EXPLAINS the label.
+Three regimes, read off the control row's STARVATION -- the fraction of slots
+whose buffer held less than one message's worth of key:
+
+  supply     the buffer is empty essentially always. eta is then a linear
+             function of the total key distilled and no scheduling decision
+             can matter; the problem degenerates to "maximise total key".
+  timing     key comes and goes, so WHEN a block lands against the deadline
+             decides. This is the only regime in which the queue and the
+             deadline of eq (2)-(4) do any work at all.
+  saturated  key is nearly always in hand and eta is at its ceiling; more key
+             buys almost nothing.
+
+`coupling_spread` -- the spread of (eta/eta_pm)/(key/key_pm) across policies
+-- is reported beside it as the corroborating evidence, and in supply cells it
+comes out at 0.0001-0.0007. It is NOT what decides the label, and an earlier
+version of this module that used it alone mislabelled every saturated cell as
+"timing": a saturated cell spreads too, because eta is pinned at its ceiling
+while the key keeps growing. Starvation is the mechanism, the spread is the
+symptom, and the symptom has two causes.
+
+The block fill times are reported as well, because they are what EXPLAINS the
+starvation -- but deciding from them would be a guess: n_X = 1e6 fills in 14.4
+slots against a T0 of 20 and is already timing-limited.
 
 Usage:
     python3 optmap.py --seeds 4                       # the default grid
@@ -82,6 +97,25 @@ CONTROL_NAME = AlwaysPM.name
 # 0.0007 at n_X = 1e5, 0.0485 at 3e5, 0.098 at 1e6. The threshold sits in the
 # gap between the first two rather than at a round number chosen in advance.
 SUPPLY_SPREAD = 0.01
+
+# The regime is read off the CONTROL row's starvation -- the fraction of slots
+# whose buffer held less than one message's worth of key. That is the
+# MECHANISM; the coupling spread above is its symptom, and the symptom has a
+# second cause: a SATURATED cell also spreads, because eta is pinned at its
+# ceiling while the key keeps growing. Measured over the 24 cells of the
+# d = 20..100 km map, the three clusters are well separated and these two
+# cut-offs sit in the gaps between them:
+#
+#   starved 0.95 - 1.00  supply    -- the buffer is empty essentially always,
+#                                     so only the TOTAL key matters
+#                                     (coupling spread 0.0001 - 0.0007)
+#   starved 0.27 - 0.88  timing    -- key comes and goes, so WHEN it lands
+#                                     decides (spread 0.055 - 0.19)
+#   starved 0.07 - 0.20  saturated -- key is nearly always in hand; more of it
+#                                     buys almost nothing (spread 0.06 - 0.12,
+#                                     for the wrong reason)
+SUPPLY_STARVED = 0.90
+SATURATED_STARVED = 0.25
 
 # The default axes.
 #
@@ -157,6 +191,26 @@ def coupling_spread(rows, control=CONTROL_NAME):
     return max(ratios) - min(ratios)
 
 
+def _regime(eta_best, starved):
+    """Which of the three regimes a cell is in, from the control's starvation.
+
+    "unknown" when the control carries no starvation figure at all, rather
+    than a guess: a mislabelled cell is worse than an unlabelled one, and
+    this is the column a reader uses to decide whether the scheduling half of
+    the model did anything.
+    """
+    if eta_best <= 0.0:
+        return "dead"
+    if starved is None:
+        return "unknown"
+    starved = float(starved)
+    if starved >= SUPPLY_STARVED:
+        return "supply"
+    if starved <= SATURATED_STARVED:
+        return "saturated"
+    return "timing"
+
+
 def summarise_cell(d_km, n_x, rows, fill, t0_deadline=None):
     """One cell of the map: the winner, the margins, and what explains them.
 
@@ -182,6 +236,7 @@ def summarise_cell(d_km, n_x, rows, fill, t0_deadline=None):
     headroom = (eta_oracle - eta_pm) if eta_oracle is not None else None
     margin = float(best["eta"]) - eta_pm
     spread = coupling_spread(rows)
+    starved = by[CONTROL_NAME].get("starved")
     return {
         "d_km": float(d_km),
         "n_x": int(n_x),
@@ -207,9 +262,8 @@ def summarise_cell(d_km, n_x, rows, fill, t0_deadline=None):
         "fill_ent": float(fill[1]),
         "t0_deadline": t0_deadline,
         "coupling_spread": spread,
-        "regime": ("dead" if float(best["eta"]) <= 0.0
-                   else "unknown" if spread is None
-                   else "supply" if spread <= SUPPLY_SPREAD else "timing"),
+        "starved": None if starved is None else float(starved),
+        "regime": _regime(float(best["eta"]), starved),
         "dead": float(best["eta"]) <= 0.0,
     }
 
@@ -289,7 +343,7 @@ def format_map(cells):
         _grid_table(cells, "MARGIN over always-pm",
                     lambda c: "%+.4f" % c["margin"], width=12),
         "",
-        _grid_table(cells, "REGIME (measured: eta linear in total key?)",
+        _grid_table(cells, "REGIME (measured: how often was the buffer empty?)",
                     lambda c: c["regime"], width=12),
         "",
         _grid_table(cells, "HEADROOM TAKEN (margin / (oracle - always-pm))",
