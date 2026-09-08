@@ -178,6 +178,27 @@ class TestSummarisingOneCell(unittest.TestCase):
         self.assertIn("d=170.0", str(ctx.exception))
 
 
+class TestTheRangeGridIsTrimmedForAFixedLink(unittest.TestCase):
+    """With mobility off every RangeThreshold degenerates to always-pm or
+    always-ent, so eval_hybrid's 9-point distance grid -- and its 27-point
+    product with the thresholds -- is over half the cost of a cell and buys
+    two distinct behaviours. Two points, one either side of the link, cover
+    both."""
+
+    def test_it_offers_one_point_either_side_of_the_link(self):
+        lo, hi = optmap.map_switches(170.0)
+        self.assertLess(lo, 170.0)
+        self.assertGreater(hi, 170.0)
+
+    def test_it_is_exactly_two_points(self):
+        self.assertEqual(len(optmap.map_switches(55.0)), 2)
+
+    def test_it_scales_with_the_link_so_a_short_link_is_not_straddled_wrongly(self):
+        near = optmap.map_switches(20.0)
+        far = optmap.map_switches(200.0)
+        self.assertLess(near[1], far[0])
+
+
 class TestTheGridIsVisitedInFull(unittest.TestCase):
     def test_every_point_of_the_product_grid_becomes_a_cell(self):
         seen = []

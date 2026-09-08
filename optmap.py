@@ -68,7 +68,8 @@ from policies import AlwaysPM, Oracle, RelaxedAlwaysPM
 
 __all__ = ["BOUND_NAMES", "CONTROL_NAME", "SUPPLY_SPREAD", "D_GRID",
            "N_X_GRID", "MAP_THRESHOLDS", "MAP_RESERVES", "MAP_SHAPES",
-           "quiet_eve", "coupling_spread", "summarise_cell", "run_cell",
+           "map_switches", "quiet_eve", "coupling_spread", "summarise_cell",
+           "run_cell",
            "sweep_map", "format_map", "write_rows_csv", "main"]
 
 # Rows that are bounds rather than policies. Taken from the classes, not
@@ -102,6 +103,20 @@ N_X_GRID = (100_000, 300_000, 1_000_000, 3_000_000)
 MAP_THRESHOLDS = (0.02, 0.04, 0.06)
 MAP_RESERVES = (0.0, 0.25)
 MAP_SHAPES = ((0.0, 0), (0.010, 0), (0.010, 20))
+
+
+def map_switches(d_km):
+    """Switch distances for the range policies at a FIXED link of `d_km`.
+
+    eval_hybrid builds this grid from the patrol band, which is right when a
+    vessel is moving: a switch distance only means something relative to where
+    it actually goes. The map runs a fixed link, where every RangeThreshold
+    collapses to always-pm (switch beyond the link) or always-ent (switch at
+    or before it) -- two behaviours, whatever the grid size. Nine points, and
+    their twenty-seven-point product with the thresholds, would be over half
+    the cost of a cell for nothing.
+    """
+    return (0.5 * float(d_km), 1.5 * float(d_km))
 
 
 def quiet_eve(eve=None):
@@ -200,7 +215,7 @@ def summarise_cell(d_km, n_x, rows, fill, t0_deadline=None):
 
 
 def run_cell(d_km, n_x, seeds, params=None, eve=None, thresholds=None,
-             reserves=None, horizons=None, shapes=None):
+             reserves=None, horizons=None, shapes=None, switches=None):
     """Score every policy at one (d_km, n_X) and summarise the result.
 
     Goes through eval_hybrid.compare() rather than scoring here, so the map
@@ -217,6 +232,8 @@ def run_cell(d_km, n_x, seeds, params=None, eve=None, thresholds=None,
     fill = (params.n_x / ns_pm if ns_pm else float("inf"),
             params.n_x / ns_ent if ns_ent else float("inf"))
     rows = compare(seeds=seeds, params=params, eve_params=eve, dqn_config={},
+                   switches=(map_switches(params.d_km) if switches is None
+                             else switches),
                    thresholds=MAP_THRESHOLDS if thresholds is None
                    else thresholds,
                    reserves=MAP_RESERVES if reserves is None else reserves,
