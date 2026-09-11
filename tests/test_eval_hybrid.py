@@ -674,6 +674,44 @@ class TestTheSwitchingValueDecomposition(unittest.TestCase):
         self.assertIn("total headroom    +0.150000", text)
 
 
+class TestTheDecoySweep(unittest.TestCase):
+    """The only policy family that can see a PNS attack gets the same
+    treatment as every other baseline: its own full grid."""
+
+    def test_the_grid_is_the_full_product(self):
+        from eval_hybrid import sweep_decoy
+
+        _, table = sweep_decoy(nondegenerate_factory(horizon=120),
+                               decoy_thresholds=(0.1, 0.3),
+                               probes=(0, 60), qber_thresholds=(1.0,),
+                               seeds=(1,))
+        self.assertEqual(set(table), {(0.1, 0, 1.0), (0.1, 60, 1.0),
+                                      (0.3, 0, 1.0), (0.3, 60, 1.0)})
+
+    def test_the_default_grid_contains_the_no_probe_point(self):
+        # probe_every = 0 is what measures the cost of the decoy ratio going
+        # stale on ENT, so the grid has to contain it.
+        from eval_hybrid import PROBE_INTERVALS
+
+        self.assertIn(0, PROBE_INTERVALS)
+
+    def test_the_default_grid_contains_a_qber_blind_point(self):
+        # qber_threshold = 1.0 never fires, which isolates what seeing the
+        # decoy ratio buys from what the QBER adds on top.
+        from eval_hybrid import DECOY_QBER_THRESHOLDS
+
+        self.assertIn(1.0, DECOY_QBER_THRESHOLDS)
+
+    def test_compare_reports_a_decoy_row(self):
+        from eval_hybrid import compare, label_rows
+
+        rows = compare(seeds=(99_000_000,),
+                       params=HybridParams(horizon=120, **NONDEGENERATE),
+                       dqn_config={}, thresholds=(0.05,),
+                       decoy_thresholds=(0.2,), probes=(60,))
+        self.assertTrue(any(k.startswith("decoy-") for k in label_rows(rows)))
+
+
 class TestBlockAwareSweep(unittest.TestCase):
     """The derived rule gets its best planning horizon, like every other
     baseline: a policy denied its operating point proves nothing."""

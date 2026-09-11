@@ -14,15 +14,16 @@ import hybridenv
 from evemarkov import EveParams
 from hybridenv import (DIST_REF_KM, ENT, I_BUFFER, I_DIST, I_QBER, PM,
                        HybridEnv, HybridParams)
+from evemarkov import EveParams
 from policies import (AlwaysENT, AlwaysPM, BlockAwareGreedy,
-                      BufferAwareThreshold, GreedyThreshold,
+                      BufferAwareThreshold, DecoyWatch, GreedyThreshold,
                       HysteresisThreshold, Oracle, Policy, RangeOrQber,
                       RangeThreshold, RelaxationBound, RelaxedAlwaysPM,
                       observed_distance_km, run_episode, run_relaxed_episode)
 
 
 def obs_with(qber=0.0, mode=PM, block=0.0, buffer=0.0, queue=0.0, age=0.0,
-             d_km=0.0):
+             d_km=0.0, decoy=0.0):
     """Build an observation by NAME, using the layout hybridenv owns.
 
     Positional literals would keep passing if the index constants ever drifted
@@ -40,6 +41,7 @@ def obs_with(qber=0.0, mode=PM, block=0.0, buffer=0.0, queue=0.0, age=0.0,
     v[hybridenv.I_QUEUE] = queue
     v[hybridenv.I_AGE] = age
     v[hybridenv.I_DIST] = d_km / DIST_REF_KM
+    v[hybridenv.I_DECOY] = decoy
     return v
 
 
@@ -1055,3 +1057,173 @@ class TestHysteresisThreshold(unittest.TestCase):
         env = HybridEnv(HybridParams(horizon=40))
         result = run_episode(env, HysteresisThreshold(0.05, 0.03), seed=3)
         self.assertGreaterEqual(result["eta"], 0.0)
+
+
+class TestDecoyWatch(unittest.TestCase):
+    """The controller that can actually see a photon-number-splitting attack.
+
+    Every other policy here reacts to the QBER, and a PNS attacker moves the
+    QBER by nothing at all: measured, greedy / hysteresis / block-aware all
+    become bit-for-bit always-pm under one. The observable that does move is
+    the decoy gain ratio, and this is the policy that watches it.
+
+    The hard part is not the threshold, it is that the observable DISAPPEARS
+    on ENT: while ENT runs, the decoy hardware is not transmitting, so
+    obs[I_DECOY] holds its last PM reading for ever. A controller that
+    switches away on an alarm and never looks again can never come back --
+    which is why probing is a parameter and not an afterthought.
+    """
+
+    def watch(self, **kw):
+        kw.setdefault("decoy_threshold", 0.20)
+        policy = DecoyWatch(**kw)
+        policy.bind(_RateModel((1.0, 1.0), w_window=3))
+        policy.reset()
+        return policy
+
+    # ---------------- detection ----------------
+
+    def test_it_stays_on_pm_while_the_decoy_ratio_looks_honest(self):
+        policy = self.watch()
+        self.assertEqual(policy.act(obs_with(mode=PM, decoy=0.0)), PM)
+        self.assertEqual(policy.act(obs_with(mode=PM, decoy=0.19)), PM)
+
+    def test_it_switches_on_the_decoy_excess_with_the_qber_at_zero(self):
+        # THE point of the policy: an alarm from an observable that the rest
+        # of the study does not look at, while the one they do look at is
+        # flat.
+        policy = self.watch()
+        self.assertEqual(policy.act(obs_with(mode=PM, decoy=0.20, qber=0.0)),
+                         ENT)
+
+    def test_the_threshold_itself_counts_as_crossed(self):
+        # Same convention as GreedyThreshold, for the same reason.
+        self.assertEqual(self.watch(decoy_threshold=0.2).act(
+            obs_with(mode=PM, decoy=0.2)), ENT)
+
+    def test_by_default_it_ignores_the_qber_entirely(self):
+        # Deliberate: paired with a qber threshold it separates "what does
+        # seeing the decoy ratio buy" from "what does the QBER add on top".
+        policy = self.watch()
+        self.assertEqual(policy.act(obs_with(mode=PM, qber=0.49, decoy=0.0)),
+                         PM)
+
+    def test_given_a_qber_threshold_it_reacts_to_jamming_too(self):
+        # An adversary with two weapons needs a controller with two
+        # observables; either alarm alone is enough, because either can
+        # already have killed PM.
+        policy = self.watch(qber_threshold=0.045)
+        self.assertEqual(policy.act(obs_with(mode=PM, qber=0.05, decoy=0.0)),
+                         ENT)
+
+    # ---------------- the stale observable ----------------
+
+    def test_without_probing_it_never_returns_to_pm(self):
+        # Not a bug to be fixed silently -- it is the cost of the attack
+        # being invisible from ENT, and it is what the probe parameter buys.
+        policy = self.watch(probe_every=0)
+        self.assertEqual(policy.act(obs_with(mode=PM, decoy=0.5)), ENT)
+        for _ in range(200):
+            # The feature is frozen at its last PM reading, alarm and all.
+            self.assertEqual(policy.act(obs_with(mode=ENT, decoy=0.5)), ENT)
+
+    def test_probing_goes_back_to_look_after_the_interval(self):
+        policy = self.watch(probe_every=5)
+        self.assertEqual(policy.act(obs_with(mode=PM, decoy=0.5)), ENT)
+        for _ in range(5):
+            self.assertEqual(policy.act(obs_with(mode=ENT, decoy=0.5)), ENT)
+        self.assertEqual(policy.act(obs_with(mode=ENT, decoy=0.5)), PM)
+
+    def test_a_probe_holds_pm_until_the_decoy_window_has_flushed(self):
+        # The window still holds the readings from before the probe, so the
+        # first slots back on PM say whatever the attack used to be doing.
+        # Exactly the contamination BlockAwareGreedy's settle exists for.
+        policy = self.watch(probe_every=2, settle=3)
+        policy.act(obs_with(mode=PM, decoy=0.5))          # -> ENT
+        for _ in range(3):
+            policy.act(obs_with(mode=ENT, decoy=0.5))     # ... -> PM
+        # Now on PM with a stale alarm still in the window: it must NOT
+        # bounce straight back to ENT.
+        for _ in range(3):
+            self.assertEqual(policy.act(obs_with(mode=PM, decoy=0.5)), PM)
+        self.assertEqual(policy.act(obs_with(mode=PM, decoy=0.5)), ENT)
+
+    def test_a_probe_that_finds_the_attack_gone_stays_on_pm(self):
+        policy = self.watch(probe_every=2, settle=1)
+        self.assertEqual(policy.act(obs_with(mode=PM, decoy=0.5)), ENT)
+        self.assertEqual(policy.act(obs_with(mode=ENT, decoy=0.5)), ENT)
+        self.assertEqual(policy.act(obs_with(mode=ENT, decoy=0.5)), ENT)
+        self.assertEqual(policy.act(obs_with(mode=ENT, decoy=0.5)), PM)
+        policy.act(obs_with(mode=PM, decoy=0.0))          # window flushing
+        for _ in range(5):
+            self.assertEqual(policy.act(obs_with(mode=PM, decoy=0.0)), PM)
+
+    def test_the_default_settle_is_the_observation_window(self):
+        # The controller's own averaging window: a reading taken before it
+        # has flushed is a reading of the previous mode.
+        policy = DecoyWatch(decoy_threshold=0.2)
+        policy.bind(_RateModel((1.0, 1.0), w_window=9))
+        self.assertEqual(policy.settling_slots(), 9)
+
+    def test_it_works_unbound_so_it_stays_a_model_FREE_comparand(self):
+        # The contrast with BlockAwareGreedy is the whole point: this one
+        # needs no kappa, no error floors and no sifted rates. Only its own
+        # thresholds.
+        policy = DecoyWatch(decoy_threshold=0.2, settle=0)
+        policy.reset()
+        self.assertEqual(policy.act(obs_with(mode=PM, decoy=0.5)), ENT)
+
+    # ---------------- bookkeeping ----------------
+
+    def test_reset_clears_the_probe_clock(self):
+        policy = self.watch(probe_every=3)
+        policy.act(obs_with(mode=PM, decoy=0.5))
+        policy.act(obs_with(mode=ENT, decoy=0.5))
+        policy.act(obs_with(mode=ENT, decoy=0.5))
+        policy.reset()
+        # A fresh episode must not inherit two thirds of a probe interval.
+        for _ in range(3):
+            self.assertEqual(policy.act(obs_with(mode=ENT, decoy=0.5)), ENT)
+        self.assertEqual(policy.act(obs_with(mode=ENT, decoy=0.5)), PM)
+
+    def test_every_parameter_is_in_the_name(self):
+        names = {DecoyWatch(0.2).name, DecoyWatch(0.3).name,
+                 DecoyWatch(0.2, qber_threshold=0.05).name,
+                 DecoyWatch(0.2, probe_every=50).name}
+        self.assertEqual(len(names), 4)
+
+    def test_it_refuses_a_negative_probe_interval(self):
+        with self.assertRaises(ValueError):
+            DecoyWatch(0.2, probe_every=-1)
+
+    def test_it_runs_a_real_episode_and_reads_the_real_feature(self):
+        # Catches a policy wired to the wrong observation index, which the
+        # hand-built observations above cannot.
+        env = HybridEnv(HybridParams(horizon=60),
+                        EveParams(f_levels=(0.0, 0.0, 0.0),
+                                  s_levels=(0.0, 0.0, 0.6), seed=3))
+        result = run_episode(env, DecoyWatch(0.2, probe_every=20), seed=3)
+        self.assertGreaterEqual(result["eta"], 0.0)
+
+
+class TestTheDecoyWatchSeesWhatTheQberPoliciesCannot(unittest.TestCase):
+    """The measured claim, as a test: under a stealthy adversary the
+    QBER-threshold baselines do not switch at all and this one does."""
+
+    ENV = dict(horizon=1200, lam=2.5, b_max=1_000_000,
+               ent_preset="ent_advanced")
+    EVE = dict(f_levels=(0.0, 0.0, 0.0), s_levels=(0.0, 0.0, 0.6), seed=3)
+
+    def run_one(self, policy):
+        env = HybridEnv(HybridParams(**self.ENV), EveParams(**self.EVE))
+        return run_episode(env, policy, seed=5)
+
+    def test_the_qber_baseline_never_fires(self):
+        self.assertEqual(self.run_one(GreedyThreshold(0.045))["switches"], 0)
+
+    def test_the_decoy_watch_does_fire(self):
+        self.assertGreater(self.run_one(DecoyWatch(0.2))["switches"], 0)
+
+    def test_and_it_delivers_more(self):
+        self.assertGreater(self.run_one(DecoyWatch(0.2, probe_every=40))["eta"],
+                           self.run_one(GreedyThreshold(0.045))["eta"])

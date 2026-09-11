@@ -52,13 +52,14 @@ from evemarkov import EveParams
 from hybridenv import HybridEnv, HybridParams
 from mobility import MobilityParams
 from policies import (AlwaysENT, AlwaysPM, BlockAwareGreedy,
-                      BufferAwareThreshold, GreedyThreshold,
+                      BufferAwareThreshold, DecoyWatch, GreedyThreshold,
                       HysteresisThreshold, Oracle, RangeOrQber,
                       RangeThreshold, RelaxedAlwaysPM, run_episode,
                       run_relaxed_episode)
 
 __all__ = ["THRESHOLDS", "RESERVES", "RANGE_POINTS", "BLOCK_HORIZONS",
-           "HYSTERESIS_SHAPES", "EVAL_SEED_BASE",
+           "HYSTERESIS_SHAPES", "DECOY_THRESHOLDS", "PROBE_INTERVALS",
+           "DECOY_QBER_THRESHOLDS", "sweep_decoy", "EVAL_SEED_BASE",
            "BOUNDS", "evaluation_seeds", "assert_seeds_disjoint", "label_rows",
            "range_switches", "sweep_threshold", "sweep_buffer_aware",
            "sweep_range", "sweep_range_qber", "sweep_block_aware",
@@ -108,6 +109,19 @@ BLOCK_HORIZONS = (5, 20, 80, 320)
 # grid always contains the policy it generalises and the hysteresis row can
 # never score below the greedy row because of the search.
 HYSTERESIS_SHAPES = ((0.0, 0), (0.010, 0), (0.020, 0), (0.010, 20))
+
+# DecoyWatch's grid. The feature it fires on is the EXCESS of the observed
+# decoy gain ratio over its unattacked value, so these are scale-free and the
+# same grid means the same thing at every distance: measured, a PNS attack
+# strong enough to certify PM's key to zero shows an excess of 0.43.
+DECOY_THRESHOLDS = (0.10, 0.20, 0.40)
+# How often the policy goes back to PM to LOOK. 0 never does, which is the
+# grid point that measures what the observable's staleness on ENT costs -- the
+# decoy ratio simply does not exist while ENT is running.
+PROBE_INTERVALS = (0, 60, 150)
+# 1.0 never fires on the QBER at all, which isolates the value of seeing the
+# decoy ratio from the value of the QBER every other baseline already uses.
+DECOY_QBER_THRESHOLDS = (1.0, 0.025)
 
 # Evaluation seeds live in a block no plausible training run reaches:
 # dqn.SEED_STRIDE is 100_000, so this is config seed 990's block, and
@@ -372,6 +386,25 @@ def sweep_hysteresis(env_factory=None, thresholds=THRESHOLDS,
                          for t in thresholds for band, dwell in shapes))
 
 
+def sweep_decoy(env_factory=None, decoy_thresholds=DECOY_THRESHOLDS,
+                probes=PROBE_INTERVALS,
+                qber_thresholds=DECOY_QBER_THRESHOLDS, seeds=(1, 2, 3),
+                envs=None):
+    """(best (decoy threshold, probe interval, qber threshold), {key: eta}).
+
+    The FULL product grid. The three axes interact strongly -- a policy that
+    never probes wants a low threshold, one that probes often can afford a
+    high one -- so a coordinate descent would settle where none of the three
+    is right and understate the only policy family that can see the attack.
+    """
+    envs = _resolve_envs(env_factory, envs, seeds)
+    return _sweep(envs, seeds,
+                  _keyed(((float(d), int(pe), float(q)),
+                          DecoyWatch(d, qber_threshold=q, probe_every=pe))
+                         for d in decoy_thresholds for pe in probes
+                         for q in qber_thresholds))
+
+
 def _mean_row(label, results):
     """One summary row. Each field averages ITS OWN key across episodes."""
     def mean(key):
@@ -400,7 +433,9 @@ def _dqn_configs(dqn_config):
 def compare(seeds, params=None, eve_params=None, dqn_config=None,
             thresholds=THRESHOLDS, reserves=RESERVES, sweeps=None,
             switches=None, horizons=BLOCK_HORIZONS,
-            shapes=HYSTERESIS_SHAPES):
+            shapes=HYSTERESIS_SHAPES, decoy_thresholds=DECOY_THRESHOLDS,
+            probes=PROBE_INTERVALS,
+            decoy_qber_thresholds=DECOY_QBER_THRESHOLDS):
     """Run every policy over `seeds`; return one summary row each.
 
     `seeds` must lie outside the training range of every config in
@@ -447,6 +482,10 @@ def compare(seeds, params=None, eve_params=None, dqn_config=None,
                                          envs=envs)
     best_hy, hy_table = sweep_hysteresis(thresholds=thresholds, shapes=shapes,
                                          seeds=seeds, envs=envs)
+    best_dc, dc_table = sweep_decoy(decoy_thresholds=decoy_thresholds,
+                                    probes=probes,
+                                    qber_thresholds=decoy_qber_thresholds,
+                                    seeds=seeds, envs=envs)
     if sweeps is not None:
         sweeps["threshold"] = th_table
         sweeps["buffer_aware"] = ba_table
@@ -454,6 +493,7 @@ def compare(seeds, params=None, eve_params=None, dqn_config=None,
         sweeps["range_qber"] = rq_table
         sweeps["block_aware"] = bh_table
         sweeps["hysteresis"] = hy_table
+        sweeps["decoy"] = dc_table
 
     hy_th, hy_band, hy_dwell = best_hy
     candidates = [AlwaysPM(), AlwaysENT(), GreedyThreshold(best_th),
@@ -461,7 +501,9 @@ def compare(seeds, params=None, eve_params=None, dqn_config=None,
                   RangeOrQber(*best_rq),
                   HysteresisThreshold(hy_th, max(0.0, hy_th - hy_band),
                                       hy_dwell),
-                  BlockAwareGreedy(horizon=best_h)]
+                  BlockAwareGreedy(horizon=best_h),
+                  DecoyWatch(best_dc[0], qber_threshold=best_dc[2],
+                             probe_every=best_dc[1])]
     rows = [_mean_row(p.name, _score(envs, p, seeds)) for p in candidates]
 
     for label, cfg in configs.items():
@@ -670,6 +712,10 @@ def main(argv=None):
         for key in sorted(sweeps["hysteresis"]):
             print("  %.4f %.4f %3d  eta=%.4f"
                   % (key[0], key[1], key[2], sweeps["hysteresis"][key]))
+        print("decoy-watch grid (decoy excess, probe slots, qber):")
+        for key in sorted(sweeps["decoy"]):
+            print("  %.3f %5d %.4f  eta=%.4f"
+                  % (key[0], key[1], key[2], sweeps["decoy"][key]))
     print()
     print(format_rows(rows))
 

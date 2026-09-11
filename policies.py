@@ -32,7 +32,7 @@ from hybridenv import (DIST_REF_KM, ENT, I_AGE, I_BLOCK, I_BUFFER, I_DECOY,
 __all__ = ["ENT", "PM", "I_QBER", "I_MODE", "I_BLOCK", "I_BUFFER", "I_QUEUE",
            "I_AGE", "I_DIST", "I_DECOY", "DIST_REF_KM", "Policy", "AlwaysPM",
            "AlwaysENT", "GreedyThreshold", "BufferAwareThreshold",
-           "HysteresisThreshold", "BlockAwareGreedy",
+           "HysteresisThreshold", "BlockAwareGreedy", "DecoyWatch",
            "RangeThreshold", "RangeOrQber", "RelaxationBound", "Oracle",
            "RelaxedAlwaysPM", "run_episode", "run_relaxed_episode",
            "observed_distance_km"]
@@ -279,6 +279,104 @@ class HysteresisThreshold(_ModeDwell, Policy):
         if want != mode and dwell < self.min_dwell:
             return mode
         return want
+
+
+class DecoyWatch(_ModeDwell, Policy):
+    """Switch on the DECOY GAIN RATIO, the one observable a PNS attack moves.
+
+    Every other policy in this module reacts to the QBER, and a
+    photon-number-splitting attacker moves the QBER by nothing whatsoever:
+    she introduces no errors, holds the signal intensity's count rate, and
+    still certifies PM's key down to zero. Measured over 8 seeds against an
+    adversary that splits photons in one state, greedy, hysteresis AND
+    block-aware all come out bit-for-bit identical to always-pm with zero
+    switches. block-aware is blind despite carrying a hardware model: it
+    infers the attack by inverting E_eff(f) on the QBER, which reads f = 0.
+    Being model-based is not the issue -- watching the wrong observable is.
+
+    `decoy_threshold` fires on obs[I_DECOY], the excess of the observed
+    Q_mu1/Q_mu2 over its unattacked value. That feature is scale-free by
+    construction, so one threshold works at every distance and every
+    intensity pair.
+
+    `qber_threshold` adds the OTHER alarm, for an adversary holding both
+    weapons. Either alone is enough, for GreedyThreshold's reason: either can
+    already have killed PM, and waiting for both is waiting for PM to be dead
+    twice over. It defaults to 1.0, i.e. never -- deliberately, so that
+    pairing the two thresholds separates "what does seeing the decoy ratio
+    buy" from "what does the QBER add on top".
+
+    THE HARD PART IS NOT THE THRESHOLD. The decoy ratio DISAPPEARS on ENT:
+    while ENT runs the decoy hardware is not transmitting, so obs[I_DECOY]
+    holds its last PM reading for ever. A controller that switches away on an
+    alarm and never looks again can never come back, and pays ENT's lower
+    rate for the whole episode however briefly the attack lasted. So:
+
+      * `probe_every` slots on ENT, it returns to PM to LOOK. 0 disables
+        probing, which is a legal sweep point and the one that measures what
+        the staleness costs.
+      * a probe holds PM for `settle` slots before trusting what it sees,
+        because the window still holds the readings from before the probe --
+        the same contamination BlockAwareGreedy's settle exists for. None
+        means the observation window itself, which is the exact
+        contamination length.
+
+    Unlike BlockAwareGreedy this policy is MODEL-FREE: no kappa, no error
+    floors, no sifted rates. That is what makes the pair a fair comparison
+    between "watch the right thing" and "carry a model".
+    """
+
+    # Fallback when the policy is never bound to an environment. Matches
+    # HybridParams.w_window's default; a bound policy uses the real one.
+    DEFAULT_SETTLE = 5
+
+    def __init__(self, decoy_threshold, qber_threshold=1.0, probe_every=0,
+                 settle=None):
+        if int(probe_every) < 0:
+            raise ValueError("probe_every is a number of slots, got %r"
+                             % (probe_every,))
+        self.decoy_threshold = float(decoy_threshold)
+        self.qber_threshold = float(qber_threshold)
+        self.probe_every = int(probe_every)
+        self.settle = None if settle is None else int(settle)
+        self.name = ("decoy-%.3f-%.3f-%d"
+                     % (self.decoy_threshold, self.qber_threshold,
+                        self.probe_every))
+        self.model = None
+        self.reset()
+
+    def bind(self, model):
+        # Only ever read for its observation window -- which is the
+        # CONTROLLER's own averaging length, not a fact about the hardware.
+        self.model = model
+
+    def reset(self):
+        self._dwell_reset()
+
+    def settling_slots(self):
+        """Slots to hold PM after a probe before believing the reading."""
+        if self.settle is not None:
+            return self.settle
+        if self.model is None:
+            return self.DEFAULT_SETTLE
+        return int(self.model.params.w_window)
+
+    def act(self, obs):
+        mode = ENT if int(obs[I_MODE]) == ENT else PM
+        settle = self.settling_slots()
+        # Entering PM starts the flush clock at zero; entering ENT starts the
+        # PROBE clock at zero. Slot 0 of an episode is on PM by construction
+        # and its window is empty, so it is trusted immediately.
+        dwell = self._dwell_tick(mode, settle if mode == PM else 0)
+        alarm = (obs[I_DECOY] >= self.decoy_threshold
+                 or obs[I_QBER] >= self.qber_threshold)
+        if mode == PM:
+            if dwell < settle:
+                return PM       # the window still holds the old mode
+            return ENT if alarm else PM
+        if self.probe_every <= 0:
+            return ENT          # never looks again; the feature is stale
+        return PM if dwell >= self.probe_every else ENT
 
 
 class BlockAwareGreedy(_ModeDwell, Policy):

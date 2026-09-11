@@ -86,7 +86,7 @@ from eval_hybrid import evaluation_seeds
 from evemarkov import EveParams
 from hybridenv import ENT, PM, HybridEnv, HybridParams
 from policies import (AlwaysENT, AlwaysPM, BlockAwareGreedy,
-                      BufferAwareThreshold, GreedyThreshold,
+                      BufferAwareThreshold, DecoyWatch, GreedyThreshold,
                       HysteresisThreshold, Oracle, Policy, RelaxationBound,
                       RelaxedAlwaysPM)
 
@@ -506,6 +506,7 @@ _GREEDY_RE = re.compile(r"^greedy-([0-9.]+)$")
 _BUFFER_RE = re.compile(r"^buffer-aware-([0-9.]+)-([0-9.]+)$")
 _BLOCK_RE = re.compile(r"^block-aware(?:-([0-9]+))?$")
 _HYST_RE = re.compile(r"^hysteresis-([0-9.]+)-([0-9.]+)-([0-9]+)$")
+_DECOY_RE = re.compile(r"^decoy-([0-9.]+)-([0-9.]+)-([0-9]+)$")
 
 
 def parse_spec(spec, dqn_policy=None):
@@ -515,7 +516,8 @@ def parse_spec(spec, dqn_policy=None):
     of `eval_hybrid.format_rows` can be pasted straight in:
     `always-pm`, `always-ent`, `greedy-<theta>`,
     `buffer-aware-<theta>-<reserve>`, `block-aware`, `block-aware-<H>`,
-    `hysteresis-<up>-<down>-<dwell>`, `dqn`, `oracle`, `always-pm-relaxed`.
+    `hysteresis-<up>-<down>-<dwell>`, `decoy-<excess>-<qber>-<probe>`,
+    `dqn`, `oracle`, `always-pm-relaxed`.
 
     `block-aware` with no horizon is the documented default -- the planning
     horizon is then the message deadline T0, which is a PROPERTY OF THE
@@ -553,6 +555,10 @@ def parse_spec(spec, dqn_policy=None):
     if m:
         return HysteresisThreshold(float(m.group(1)), float(m.group(2)),
                                    int(m.group(3)))
+    m = _DECOY_RE.match(spec)
+    if m:
+        return DecoyWatch(float(m.group(1)), qber_threshold=float(m.group(2)),
+                          probe_every=int(m.group(3)))
     raise ValueError("unknown policy spec %r" % (spec,))
 
 
