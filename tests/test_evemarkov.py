@@ -1,7 +1,7 @@
 """Eve's jamming process: a 3-state Markov chain the agent cannot observe."""
 import unittest
 
-from evemarkov import EveChain, EveParams
+from evemarkov import QUIET, EveChain, EveParams
 
 
 class TestEveChain(unittest.TestCase):
@@ -138,6 +138,76 @@ class TestTheMechanismAndNotJustItsSymptoms(unittest.TestCase):
             returned = chain.step()
             self.assertEqual(returned, params.f_levels[chain.state])
             self.assertEqual(chain.f, params.f_levels[chain.state])
+
+
+class TestTheSecondAttackChannel(unittest.TestCase):
+    """Eve now has two levers on the same chain: jamming, which raises the
+    QBER and hurts BOTH modes, and PNS, which certifies PM's key away while
+    leaving the QBER and ENT untouched.
+
+    They ride ONE chain deliberately. Eve commits her hardware to a posture
+    per slot; giving PNS its own chain would also double the unobservable
+    state the policy has to infer, for no modelled reason.
+    """
+
+    def test_the_default_adversary_does_no_pns(self):
+        # Every result the study has published was measured without it, so
+        # the default has to leave them alone.
+        params = EveParams()
+        self.assertEqual(set(params.s_levels), {0.0})
+        self.assertEqual(len(params.s_levels), len(params.f_levels))
+        self.assertEqual(EveChain(params).pns, 0.0)
+
+    def test_both_levers_are_read_from_the_same_state(self):
+        params = EveParams(f_levels=(0.0, 0.03, 0.0),
+                           s_levels=(0.0, 0.0, 0.6))
+        chain = EveChain(params)
+        for _ in range(400):
+            chain.step()
+            self.assertEqual(chain.f, params.f_levels[chain.state])
+            self.assertEqual(chain.pns, params.s_levels[chain.state])
+
+    def test_a_state_can_carry_pns_without_any_jamming(self):
+        # The interesting adversary: invisible to the QBER by construction.
+        params = EveParams(f_levels=(0.0, 0.0, 0.0),
+                           s_levels=(0.0, 0.0, 0.6))
+        chain = EveChain(params)
+        seen = set()
+        for _ in range(2000):
+            chain.step()
+            self.assertEqual(chain.f, 0.0)
+            seen.add(chain.pns)
+        self.assertEqual(seen, {0.0, 0.6})
+
+    def test_adding_pns_levels_does_not_disturb_the_jamming_trajectory(self):
+        # THE regression guard. The chain must consume the same random draws
+        # either way, or every episode in the study replays differently the
+        # moment a PNS level is configured.
+        plain = EveChain(EveParams(seed=7))
+        armed = EveChain(EveParams(seed=7, s_levels=(0.0, 0.3, 0.6)))
+        self.assertEqual([plain.step() for _ in range(500)],
+                         [armed.step() for _ in range(500)])
+
+    def test_reset_returns_both_levers_to_the_quiet_state(self):
+        params = EveParams(s_levels=(0.0, 0.3, 0.6))
+        chain = EveChain(params)
+        for _ in range(300):
+            chain.step()
+        chain.reset()
+        self.assertEqual(chain.f, params.f_levels[QUIET])
+        self.assertEqual(chain.pns, params.s_levels[QUIET])
+
+    def test_a_level_list_of_the_wrong_length_is_refused(self):
+        # Silently padding would give the last states a PNS strength nobody
+        # configured, which is the sort of thing that shows up as a number
+        # that will not reproduce.
+        with self.assertRaises(ValueError):
+            EveChain(EveParams(s_levels=(0.0, 0.5)))
+
+    def test_a_pns_level_outside_the_unit_interval_is_refused(self):
+        for bad in ((-0.1, 0.0, 0.0), (0.0, 0.0, 1.5)):
+            with self.assertRaises(ValueError):
+                EveChain(EveParams(s_levels=bad))
 
 
 if __name__ == "__main__":

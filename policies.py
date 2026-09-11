@@ -22,15 +22,15 @@ away instead of paying it.
 
 import math
 
-from hybridenv import (DIST_REF_KM, ENT, I_AGE, I_BLOCK, I_BUFFER, I_DIST,
-                       I_MODE, I_QBER, I_QUEUE, PM)
+from hybridenv import (DIST_REF_KM, ENT, I_AGE, I_BLOCK, I_BUFFER, I_DECOY,
+                       I_DIST, I_MODE, I_QBER, I_QUEUE, PM)
 
 # The observation layout is defined once, in hybridenv, next to the _observe()
 # that fixes the order. It is re-exported here only so a policy never has to
 # index the state vector with a bare integer -- keeping a second definition
 # would let the two drift apart silently.
 __all__ = ["ENT", "PM", "I_QBER", "I_MODE", "I_BLOCK", "I_BUFFER", "I_QUEUE",
-           "I_AGE", "I_DIST", "DIST_REF_KM", "Policy", "AlwaysPM",
+           "I_AGE", "I_DIST", "I_DECOY", "DIST_REF_KM", "Policy", "AlwaysPM",
            "AlwaysENT", "GreedyThreshold", "BufferAwareThreshold",
            "HysteresisThreshold", "BlockAwareGreedy",
            "RangeThreshold", "RangeOrQber", "RelaxationBound", "Oracle",

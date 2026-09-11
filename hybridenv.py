@@ -25,11 +25,12 @@ from mobility import MobilityParams, VesselTrack
 
 PM, ENT = 0, 1
 
-OBS_DIM = 7
+OBS_DIM = 8
 # Layout of the observation vector (eq 16). Defined here because _observe()
 # is what fixes the order; policies.py re-exports these so no policy ever
 # indexes the state with a bare integer.
-I_QBER, I_MODE, I_BLOCK, I_BUFFER, I_QUEUE, I_AGE, I_DIST = range(OBS_DIM)
+(I_QBER, I_MODE, I_BLOCK, I_BUFFER, I_QUEUE, I_AGE, I_DIST,
+ I_DECOY) = range(OBS_DIM)
 
 # Divisor for the distance feature. A fixed constant, not the mobility band:
 # the band is a sweep parameter, and normalising by it would make the same
@@ -298,6 +299,10 @@ class HybridEnv:
         # handful of grid points, so the finite-key routine runs a few dozen
         # times per episode instead of 3,600.
         self._kappa_cache = {}
+        # PM under a PNS attack, memoised on (distance grid point, strength).
+        # The strength takes one of EveParams.s_levels' handful of values, so
+        # this stays as small as the physics cache it sits beside.
+        self._attack_cache = {}
         self._physics_key = None
         self._distance = None
         # The track's start is d_km CLAMPED into the patrol band, so ask the
@@ -350,6 +355,50 @@ class HybridEnv:
             self._physics_cache[key] = cached
         return key, cached
 
+    def _pm_under_attack(self, pns):
+        """(sifted bits per slot, KeyParams) for PM at PNS strength `pns`.
+
+        A photon-number-splitting adversary blocks a fraction of the
+        single-photon pulses -- the only ones the decoy bound certifies key
+        from -- and forwards extra multi-photon pulses to hold the signal
+        intensity's count rate. Two things follow, and both belong here rather
+        than in the finite-key call:
+
+          * the observed click rate falls slightly (keyrate's click_factor),
+            so the slot harvests fewer sifted bits;
+          * the two intensities' gains move apart, which is what the decoy
+            bound picks up and what certifies the key away.
+
+        ENT has no weak-coherent-state photon-number channel for any of this
+        to touch, so it is absent from this method entirely -- that absence IS
+        the asymmetry the hybrid controller exists to exploit.
+
+        pns = 0 returns the honest values UNCHANGED, by identity rather than
+        by recomputation, so every episode measured before the attack existed
+        replays bit for bit.
+        """
+        pns = float(pns)
+        if pns <= 0.0:
+            return self._sifted[PM], self._key_params
+        key = (self._physics_key, round(pns, 9))
+        cached = self._attack_cache.get(key)
+        if cached is None:
+            attacked = keyrate.KeyParams(
+                mu1=self._key_params.mu1, mu2=self._key_params.mu2,
+                p1=self._key_params.p1, eta=self._key_params.eta,
+                pdc=self._key_params.pdc, pns=pns)
+            cached = (int(self._sifted[PM] * attacked.click_factor()),
+                      attacked)
+            self._attack_cache[key] = cached
+        return cached
+
+    def sifted_under_attack(self, pns):
+        """(PM, ENT) sifted bits per slot at PNS strength `pns`.
+
+        ENT's entry is the unattacked one, always: the attack cannot reach it.
+        """
+        return (self._pm_under_attack(pns)[0], self._sifted[ENT])
+
     def _set_distance(self, d_km):
         """Install the physics for `d_km`.
 
@@ -395,9 +444,13 @@ class HybridEnv:
         # generate_state(n) is a prefix-stable expansion, so widening this
         # from 3 to 4 leaves the error, arrival and jamming streams bit-for-
         # bit what they were before the vessel existed: every trajectory the
-        # earlier study recorded still replays exactly.
+        # earlier study recorded still replays exactly. Widening it again to 5
+        # for the decoy-statistics estimator is the same trick for the same
+        # reason -- and it MUST be a separate stream: drawing the decoy split
+        # from self._rng would shift every later error draw and move every
+        # number the study has published.
         streams = np.random.SeedSequence(
-            p.seed if seed is None else int(seed)).generate_state(4)
+            p.seed if seed is None else int(seed)).generate_state(5)
         self._rng = np.random.RandomState(streams[0])
         self._arrivals_rng = np.random.RandomState(streams[1])
         if seed is None:
@@ -417,7 +470,50 @@ class HybridEnv:
         self._arrived_total = 0
         self._last_mode = PM
         self._qber_hist = deque(maxlen=max(1, p.w_window))
+        self._decoy_rng = np.random.RandomState(streams[4])
+        # Updated ONLY on PM slots -- see _record_decoy.
+        self._decoy_hist = deque(maxlen=max(1, p.w_window))
         return self._observe()
+
+    def _record_decoy(self, mode, sifted, key_params):
+        """Bob's estimate of the decoy gain ratio, from THIS slot's counts.
+
+        The ratio Q_mu1 / Q_mu2 is the one observable a PNS attack disturbs:
+        it introduces no errors, so the QBER says nothing, and it holds the
+        signal intensity's count rate, so the raw rate says almost nothing.
+        Measured at 55 km, s = 0.5: the QBER moves 0.0000 and this ratio moves
+        43%, which one n_X = 1e5 block resolves at 37 standard deviations.
+
+        Recorded as the EXCESS over the unattacked ratio, so an idle channel
+        sits at 0 whatever mu1, mu2 and the distance are and one threshold
+        works across the whole map.
+
+        The noise is the real finite-sample kind: the slot's own sifted bits
+        are split binomially between the two intensities and the ratio is
+        rebuilt from that draw, exactly as the QBER comes from a binomial
+        error draw. Nothing here is an invented observation noise.
+
+        ONLY CALLED ON PM SLOTS. While ENT runs there are no decoy statistics
+        to have -- the decoy hardware is not transmitting -- so the window
+        holds its last PM reading and goes stale. That is a real observability
+        asymmetry, not a shortcut: a controller sitting on ENT cannot tell
+        whether the attack is still running, and has to go back and look.
+        """
+        if mode != PM or sifted <= 0:
+            return
+        share = key_params.intensity_fraction()
+        if not 0.0 < share < 1.0:
+            return
+        drawn = int(self._decoy_rng.binomial(sifted, share)) / sifted
+        if not 0.0 < drawn < 1.0:
+            return
+        p1 = key_params.p1
+        if not 0.0 < p1 < 1.0:
+            return
+        ratio = ((1.0 - p1) / p1) * drawn / (1.0 - drawn)
+        honest = self._key_params.gain_ratio()
+        if honest > 0:
+            self._decoy_hist.append(ratio / honest - 1.0)
 
     def _observe(self):
         """s_t of eq (16) -- nothing here may depend on slot t or later.
@@ -443,14 +539,21 @@ class HybridEnv:
             min(self._queue.length / q_ref, 2.0),     # queue pressure
             self._queue.head_age / age_ref,           # urgency
             self._distance / DIST_REF_KM,             # d_t / 250 km
+            (sum(self._decoy_hist) / len(self._decoy_hist)
+             if self._decoy_hist else 0.0),           # decoy ratio excess
         ], dtype=float)
 
-    def _key_length(self, mode, n, errors):
-        """Secret bits from one finished block -- eq (8) for PM, (9) for ENT."""
+    def _key_length(self, mode, n, errors, key_params=None):
+        """Secret bits from one finished block -- eq (8) for PM, (9) for ENT.
+
+        `key_params` is PM's operating point for THIS block, which under a PNS
+        attack is not the honest one; None means the honest channel.
+        """
         qber = errors / n if n else 0.0
         if mode == ENT:
             return keyrate_ent.secret_key_length_ent(n, qber) or 0
-        return keyrate.secret_key_length(n, qber, self._key_params) or 0
+        return keyrate.secret_key_length(
+            n, qber, key_params if key_params is not None else self._key_params) or 0
 
     def _classical_slot(self):
         """eq (2)-(4) for one slot: arrivals, service, expiry.
@@ -490,19 +593,25 @@ class HybridEnv:
         if self._track is not None:
             self._set_distance(self._track.step())
         f = self.eve.step()
+        pns = self.eve.pns
         e_eff = self._e_floor[mode] * (1.0 - f) + 0.5 * f
-        sifted = self._sifted[mode]
+        # A PNS attack costs PM a few per cent of its clicks and certifies its
+        # key away; ENT it cannot touch at all.
+        pm_sifted, pm_key = self._pm_under_attack(pns)
+        sifted = pm_sifted if mode == PM else self._sifted[ENT]
+        key_params = pm_key if mode == PM else None
         # Errors are a binomial draw, so the QBER estimate is noisy exactly in
         # proportion to the sample size -- no invented observation noise.
         errors = int(self._rng.binomial(sifted, min(e_eff, 1.0)))
         self._qber_hist.append(errors / sifted if sifted else 0.0)
+        self._record_decoy(mode, sifted, pm_key)
 
         # A rich slot can pay for several blocks at once, so add() returns
         # every block it retired (empty list when none did).
         deposited = 0
         blocks = self._block.add(mode, sifted, errors)
         for n_block, block_errors in blocks:
-            bits = self._key_length(mode, n_block, block_errors)
+            bits = self._key_length(mode, n_block, block_errors, key_params)
             deposited += bits
             self._buffer.deposit(bits)
 
@@ -512,8 +621,8 @@ class HybridEnv:
         self._last_mode = mode
         self._slot += 1
         done = self._slot >= p.horizon
-        info = {"f": f, "eve_state": self.eve.state, "arrivals": arrivals,
-                "served": served, "expired": expired,
+        info = {"f": f, "pns": pns, "eve_state": self.eve.state,
+                "arrivals": arrivals, "served": served, "expired": expired,
                 "buffer": self._buffer.level, "deposited": deposited,
                 "blocks": len(blocks), "mode": mode,
                 "qber": self._qber_hist[-1], "d_km": self._distance}
@@ -536,7 +645,7 @@ class HybridEnv:
     # The classical side is NOT relaxed: same _classical_slot(), same arrival
     # stream, same B_max clamp.
 
-    def kappa(self, mode, f):
+    def kappa(self, mode, f, pns=0.0):
         """eq (12): mean secret bits per slot for `mode` at jamming `f`.
 
         ns_m * l_m(E_m(f)) / n_x -- one block's key spread over the slots
@@ -562,13 +671,21 @@ class HybridEnv:
         # mobile SSV the same jamming level buys a different number of bits at
         # 40 km and at 200 km, and a two-part key would hand the bound the
         # physics of the first distance the episode happened to visit.
-        key = (int(mode), float(f), self._physics_key)
+        # The PNS strength joins the key for the same reason the distance
+        # did: the same jamming level buys a different number of bits when the
+        # adversary is also splitting photons. ENT ignores it, but keying on
+        # it anyway costs one dictionary slot and removes a way to be wrong.
+        key = (int(mode), float(f), self._physics_key, round(float(pns), 9))
         if key not in self._kappa_cache:
             n = self.params.n_x
             e_eff = self._e_floor[mode] * (1.0 - f) + 0.5 * f
             errors = int(round(min(e_eff, 1.0) * n))
-            bits = self._key_length(mode, n, errors)
-            self._kappa_cache[key] = self._sifted[mode] * bits / n
+            if mode == PM:
+                sifted, key_params = self._pm_under_attack(pns)
+            else:
+                sifted, key_params = self._sifted[ENT], None
+            bits = self._key_length(mode, n, errors, key_params)
+            self._kappa_cache[key] = sifted * bits / n
         return self._kappa_cache[key]
 
     def step_relaxed(self, chooser):
@@ -594,13 +711,16 @@ class HybridEnv:
         # make the bound weaker than the policies it has to sit above.
         obs = self._observe()
         f = self.eve.step()
-        rates = (self.kappa(PM, f), self.kappa(ENT, f))
+        pns = self.eve.pns
+        rates = (self.kappa(PM, f, pns), self.kappa(ENT, f, pns))
         mode = ENT if int(chooser(f, rates, obs)) == ENT else PM
 
-        sifted = self._sifted[mode]
+        pm_sifted, pm_key = self._pm_under_attack(pns)
+        sifted = pm_sifted if mode == PM else self._sifted[ENT]
         e_eff = self._e_floor[mode] * (1.0 - f) + 0.5 * f
         errors = int(self._rng.binomial(sifted, min(e_eff, 1.0)))
         self._qber_hist.append(errors / sifted if sifted else 0.0)
+        self._record_decoy(mode, sifted, pm_key)
 
         # Relaxations 2 and 3 together: no BlockAccumulator at all, so a
         # switch costs nothing and this slot's key is banked in this slot.
@@ -612,8 +732,8 @@ class HybridEnv:
         self._last_mode = mode
         self._slot += 1
         done = self._slot >= p.horizon
-        info = {"f": f, "eve_state": self.eve.state, "arrivals": arrivals,
-                "served": served, "expired": expired,
+        info = {"f": f, "pns": pns, "eve_state": self.eve.state,
+                "arrivals": arrivals, "served": served, "expired": expired,
                 "buffer": self._buffer.level, "deposited": deposited,
                 "blocks": 0, "mode": mode, "qber": self._qber_hist[-1],
                 "rates": rates, "d_km": self._distance}

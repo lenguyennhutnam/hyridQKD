@@ -370,8 +370,12 @@ class TestTheDistanceIsObservable(unittest.TestCase):
         self.assertGreater(len(levels), 1)
 
     def test_obs_dim_and_the_index_agree(self):
-        self.assertEqual(hybridenv.OBS_DIM, 7)
-        self.assertEqual(I_DIST, hybridenv.OBS_DIM - 1)
+        # The distance used to be the last entry; the decoy-ratio feature now
+        # sits after it. What has to hold is that the index is INSIDE the
+        # vector and that the vector is the length the layout declares --
+        # pinning the distance to the end again would just have to be undone
+        # by the next feature.
+        self.assertLess(I_DIST, hybridenv.OBS_DIM)
         self.assertEqual(len(HybridEnv(HybridParams(horizon=2)).reset()),
                          hybridenv.OBS_DIM)
 
