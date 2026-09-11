@@ -66,8 +66,9 @@ slots against a T0 of 20 and is already timing-limited.
 
 Usage:
     python3 optmap.py --seeds 4                       # the default grid
-    python3 optmap.py --quiet-eve                     # the no-jamming contrast
-    python3 optmap.py --d-grid 55,170 --n-x-grid 1e5,1e6 --csv figs/map.csv
+    python3 optmap.py --adversary pns --lam 5         # the stealthy attacker
+    python3 optmap.py --adversary none                # the contrast case
+    python3 optmap.py --d-grid 55,85 --n-x-grid 1e5,1e6 --csv figs/map.csv
 """
 
 import argparse
@@ -83,8 +84,8 @@ from policies import AlwaysPM, Oracle, RelaxedAlwaysPM
 
 __all__ = ["BOUND_NAMES", "CONTROL_NAME", "SUPPLY_SPREAD", "D_GRID",
            "N_X_GRID", "MAP_THRESHOLDS", "MAP_RESERVES", "MAP_SHAPES",
-           "map_switches", "quiet_eve", "coupling_spread", "summarise_cell",
-           "run_cell",
+           "ADVERSARIES", "adversary", "map_switches", "quiet_eve",
+           "coupling_spread", "summarise_cell", "run_cell",
            "sweep_map", "format_map", "write_rows_csv", "main"]
 
 # Rows that are bounds rather than policies. Taken from the classes, not
@@ -119,11 +120,17 @@ SATURATED_STARVED = 0.25
 
 # The default axes.
 #
-# d_km spans PM's death distance: at ent_advanced with both modes on the same
-# detector PM stops distilling at 199.8 km and ENT at 247.3 km, so the grid has
-# to have points on both sides of 200 or the ENT-only band -- the one place
-# where mode choice is forced rather than optimised -- never appears.
-D_GRID = (55.0, 120.0, 170.0, 195.0, 220.0)
+# d_km spans the range the LINK IS USABLE OVER, which is set by the traffic and
+# not by either protocol's death distance. Measured: neither mode stops
+# distilling before 150 km (they cross at ~125 km, kappa 566 vs 627), but
+# demand is lam * l0 = 20,480 bits a slot at the reported operating point and
+# the link supplies less than that beyond ~85 km. Below ~40 km it supplies more
+# than enough and every policy saturates at eta = 1.
+#
+# An earlier version of this grid ran 55..220 km, taken from a death distance
+# that belongs to a DIFFERENT PM preset (aurea_snspd, eta_bob = 0.90). Twelve
+# of its twenty cells came back at eta < 0.05 and said nothing at all.
+D_GRID = (20.0, 40.0, 55.0, 70.0, 85.0, 100.0)
 # n_X spans the two regimes: 1e5 is where the study's published numbers live
 # and eta is proportional to the key; by 1e6 the block fill time is comparable
 # with T0 and the ranking changes.
@@ -151,6 +158,38 @@ def map_switches(d_km):
     the cost of a cell for nothing.
     """
     return (0.5 * float(d_km), 1.5 * float(d_km))
+
+
+# The adversaries worth naming, as (f level, PNS level) per chain state. They
+# share one transition matrix on purpose: a posture is a choice of weapon, and
+# changing the dwell structure at the same time would leave two maps differing
+# in two things.
+#
+#   jam   the historical adversary: raises the QBER of whichever mode is
+#         running, so it hurts BOTH and every QBER-threshold policy can see it.
+#   pns   photon-number splitting only. Certifies PM's key to zero, touches ENT
+#         not at all, and moves the QBER by NOTHING -- so a map run against it
+#         measures whether a controller is watching the right observable.
+#   both  one state per weapon. The controller needs two alarms.
+#   none  the contrast case.
+ADVERSARIES = {
+    "jam": ((0.0, 0.03, 0.08), (0.0, 0.0, 0.0)),
+    "pns": ((0.0, 0.0, 0.0), (0.0, 0.0, 0.6)),
+    "both": ((0.0, 0.03, 0.0), (0.0, 0.0, 0.6)),
+    "none": ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+}
+
+
+def adversary(name, eve=None):
+    """`EveParams` for a named posture, keeping the chain it is built on.
+
+    Raises KeyError on an unknown name rather than falling back to a default:
+    a map silently run against the wrong adversary is a map whose every cell
+    is mislabelled.
+    """
+    f_levels, s_levels = ADVERSARIES[name]
+    return dataclasses.replace(eve or EveParams(), f_levels=f_levels,
+                               s_levels=s_levels)
 
 
 def quiet_eve(eve=None):
@@ -423,9 +462,12 @@ def main(argv=None):
                     help="comma-separated link lengths [km]")
     ap.add_argument("--n-x-grid", default=None,
                     help="comma-separated block sizes, e.g. 1e5,1e6")
-    ap.add_argument("--quiet-eve", action="store_true",
-                    help="run the contrast case with every jamming level at "
-                         "zero; the chain itself is unchanged")
+    ap.add_argument("--adversary", default="jam", choices=sorted(ADVERSARIES),
+                    help="which attack posture to map against. 'jam' is the "
+                         "historical one and the default; 'pns' is the "
+                         "stealthy photon-number-splitting attacker that no "
+                         "QBER-threshold policy can see; 'both' arms one "
+                         "state with each; 'none' is the contrast case.")
     ap.add_argument("--csv", default=None,
                     help="write every policy row of every cell here")
     args = ap.parse_args(argv)
@@ -437,7 +479,7 @@ def main(argv=None):
     if args.pm_preset is not None:
         overrides["pm_preset"] = args.pm_preset
     params = HybridParams(**overrides)
-    eve = quiet_eve() if args.quiet_eve else EveParams()
+    eve = adversary(args.adversary)
     seeds = evaluation_seeds(args.seeds)
 
     d_grid = D_GRID if args.d_grid is None else _floats(args.d_grid)
@@ -447,8 +489,8 @@ def main(argv=None):
     print("presets: pm=%s ent=%s | lam=%.3f B_max=%.3g T0=%d horizon=%d"
           % (params.pm_preset, params.ent_preset, params.lam, params.b_max,
              params.t0_deadline, params.horizon))
-    print("jamming: %s" % ("OFF (contrast case)" if args.quiet_eve
-                           else "f_levels=%s" % (eve.f_levels,)))
+    print("adversary: %s | f_levels=%s s_levels=%s"
+          % (args.adversary, eve.f_levels, eve.s_levels))
     print("grid: %d distances x %d block sizes = %d cells, %d seeds each"
           % (len(d_grid), len(n_x_grid), len(d_grid) * len(n_x_grid),
              len(seeds)))

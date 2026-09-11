@@ -334,6 +334,69 @@ class TestRunningARealCell(unittest.TestCase):
                                places=6)
 
 
+class TestTheNamedAdversaries(unittest.TestCase):
+    """The map is only meaningful against a declared adversary, and the study
+    now has four worth naming. Each is a POSTURE per chain state, not a new
+    chain: the dwell structure stays fixed so two maps differ in the weapon
+    and nothing else."""
+
+    def test_every_name_builds_a_usable_chain(self):
+        from evemarkov import EveChain
+
+        for name in optmap.ADVERSARIES:
+            eve = optmap.adversary(name)
+            self.assertEqual(len(eve.s_levels), len(eve.f_levels))
+            EveChain(eve)        # refuses a mismatched or out-of-range level
+
+    def test_jam_is_the_historical_adversary(self):
+        # Every number published before the PNS attack existed was measured
+        # against exactly this, so it has to stay bit-for-bit the default.
+        eve = optmap.adversary("jam")
+        self.assertEqual(eve.f_levels, EveParams().f_levels)
+        self.assertEqual(set(eve.s_levels), {0.0})
+
+    def test_pns_moves_no_qber_at_all(self):
+        # The stealthy one: if any f level were nonzero the map could not
+        # separate "the controller saw the decoy ratio" from "it saw the
+        # QBER like every other baseline".
+        eve = optmap.adversary("pns")
+        self.assertEqual(set(eve.f_levels), {0.0})
+        self.assertGreater(max(eve.s_levels), 0.0)
+
+    def test_both_gives_each_weapon_its_own_state(self):
+        eve = optmap.adversary("both")
+        armed = [(f, p) for f, p in zip(eve.f_levels, eve.s_levels)
+                 if f > 0 or p > 0]
+        self.assertEqual(len(armed), 2)
+        # One state jams and does not split; the other splits and does not jam.
+        self.assertEqual(sorted((f > 0, p > 0) for f, p in armed),
+                         [(False, True), (True, False)])
+
+    def test_none_is_the_quiet_chain(self):
+        self.assertEqual(optmap.adversary("none"), optmap.quiet_eve())
+
+    def test_an_unknown_name_is_refused(self):
+        with self.assertRaises(KeyError):
+            optmap.adversary("nuclear")
+
+
+class TestTheDefaultDistanceGrid(unittest.TestCase):
+    def test_it_stays_inside_the_range_the_link_is_usable_over(self):
+        # THE GRID BUG THIS GUARDS. The first version ran 55..220 km, chosen
+        # from a death distance that belongs to a DIFFERENT PM preset
+        # (aurea_snspd, eta_bob = 0.90). On the preset the map actually runs,
+        # demand is lam*l0 = 20,480 bits a slot and the link supplies less
+        # than that beyond ~85 km, so 12 of the 20 cells came back at
+        # eta < 0.05 and said nothing. The operating range is set by the
+        # TRAFFIC, not by the protocol's death distance.
+        self.assertLessEqual(max(optmap.D_GRID), 110.0)
+
+    def test_it_reaches_the_saturated_end_as_well(self):
+        # A map that only showed starved cells could not show the winner
+        # changing, which is the whole point.
+        self.assertLessEqual(min(optmap.D_GRID), 40.0)
+
+
 class TestJammingCanBeTurnedOff(unittest.TestCase):
     def test_the_quiet_adversary_has_every_level_at_zero(self):
         # The title is "under a jamming attack", so the map's contrast case
