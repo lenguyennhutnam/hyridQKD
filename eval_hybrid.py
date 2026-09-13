@@ -121,7 +121,21 @@ DECOY_THRESHOLDS = (0.10, 0.20, 0.40)
 PROBE_INTERVALS = (0, 60, 150)
 # 1.0 never fires on the QBER at all, which isolates the value of seeing the
 # decoy ratio from the value of the QBER every other baseline already uses.
-DECOY_QBER_THRESHOLDS = (1.0, 0.025)
+#
+# The second point must SEPARATE the unjammed QBER from the jammed one, and an
+# earlier value of 0.025 did not: at 55 km PM's floor is 1.02% and jamming at
+# f = 0.03 lifts it to 2.49%, so 0.025 sat on the jammed MEAN and fired on
+# roughly half the windows -- a coin flip, not an alarm. 0.018 sits between
+# the two at every distance of the map (floor 1.02-1.15%, jammed 2.49-2.62%
+# over 55-100 km).
+#
+# Measured with it, paired over 16 seeds: the QBER alarm HELPS at n_X = 1e5
+# (+0.0027, t = 3.0 at 10% duty) and HURTS from 3e5 up (-0.0046, t = -5.9;
+# -0.0152, t = -8.6 at 1e6). Jamming at f = 0.03 only DEGRADES PM, and less
+# so at larger blocks (it keeps 33% / 48% / 55% of its rate at 1e5 / 3e5 /
+# 1e6), while a switch destroys a bigger block the bigger n_X is. So the grid
+# needs both points: which one wins is a property of the block length.
+DECOY_QBER_THRESHOLDS = (1.0, 0.018)
 
 # Evaluation seeds live in a block no plausible training run reaches:
 # dqn.SEED_STRIDE is 100_000, so this is config seed 990's block, and
