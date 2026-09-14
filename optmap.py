@@ -77,7 +77,7 @@ import dataclasses
 import os
 import sys
 
-from evemarkov import EveParams
+from evemarkov import ADVERSARIES, EveParams, adversary
 from eval_hybrid import (BLOCK_HORIZONS, compare, evaluation_seeds)
 from hybridenv import HybridEnv, HybridParams
 from policies import AlwaysPM, Oracle, RelaxedAlwaysPM
@@ -158,38 +158,6 @@ def map_switches(d_km):
     the cost of a cell for nothing.
     """
     return (0.5 * float(d_km), 1.5 * float(d_km))
-
-
-# The adversaries worth naming, as (f level, PNS level) per chain state. They
-# share one transition matrix on purpose: a posture is a choice of weapon, and
-# changing the dwell structure at the same time would leave two maps differing
-# in two things.
-#
-#   jam   the historical adversary: raises the QBER of whichever mode is
-#         running, so it hurts BOTH and every QBER-threshold policy can see it.
-#   pns   photon-number splitting only. Certifies PM's key to zero, touches ENT
-#         not at all, and moves the QBER by NOTHING -- so a map run against it
-#         measures whether a controller is watching the right observable.
-#   both  one state per weapon. The controller needs two alarms.
-#   none  the contrast case.
-ADVERSARIES = {
-    "jam": ((0.0, 0.03, 0.08), (0.0, 0.0, 0.0)),
-    "pns": ((0.0, 0.0, 0.0), (0.0, 0.0, 0.6)),
-    "both": ((0.0, 0.03, 0.0), (0.0, 0.0, 0.6)),
-    "none": ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
-}
-
-
-def adversary(name, eve=None):
-    """`EveParams` for a named posture, keeping the chain it is built on.
-
-    Raises KeyError on an unknown name rather than falling back to a default:
-    a map silently run against the wrong adversary is a map whose every cell
-    is mislabelled.
-    """
-    f_levels, s_levels = ADVERSARIES[name]
-    return dataclasses.replace(eve or EveParams(), f_levels=f_levels,
-                               s_levels=s_levels)
 
 
 def quiet_eve(eve=None):

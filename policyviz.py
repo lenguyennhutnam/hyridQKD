@@ -3,7 +3,17 @@
 
     python3 policyviz.py                      # the window
     python3 policyviz.py --no-gui             # the scoreboard, as text
-    python3 policyviz.py --ent-preset chapman_lowmu --lam 2.5 --b-max 1e6
+    python3 policyviz.py --adversary jam --lam 2.5 --b-max 1e6
+
+THE DEFAULTS ARE THE FINDING
+----------------------------
+Open the window and press Apply without touching a box, and the episode on
+screen is the study's central result: a photon-number-splitting adversary
+(`--adversary pns`) certifies PM's key away while moving the QBER by nothing,
+so greedy and block-aware sit bit-for-bit on always-pm, and the decoy-ratio
+controller beats BOTH static choices. Measured on the defaults (seed index 0):
+always-pm 0.5836, always-ent 0.6383, greedy 0.5836, block-aware 0.5836,
+decoy 0.6807, oracle 0.7060. tests/test_policyviz.py pins it.
 
 THE SAVED CONFIGURATION
 -----------------------
@@ -49,11 +59,14 @@ TWO THINGS THE PICTURE MUST NOT LIE ABOUT
    in the scoreboard. `policies.RelaxationBound` deliberately has no `act()`
    so that `run_episode` fails on it; `PolicyRun` dispatches on the type
    instead of working around that.
-2. A DQN has to be TRAINED before it can be shown, and an agent trained in the
-   seconds a UI can wait is not the agent in the study (200 episodes). Its
-   label always carries the episode count it actually trained with -- "dqn
-   (20 ep)" -- so no screenshot can pass a 20-episode agent off as the
-   studied one.
+2. Under PNS the QBER DOES NOT MOVE. A figure that showed only the QBER would
+   show nothing happening while PM's key went to zero, and a reader would
+   conclude the policies diverged for no reason. The attack periods are
+   therefore drawn in their own right -- red for photon splitting, amber for
+   jamming -- across the mode lanes and the QBER panel both.
+
+The DQN was taken out of this window. It is still in dqn.py and eval_hybrid
+for the study's own tables; it is not offered here.
 
 LAYOUT
 ------
@@ -68,22 +81,17 @@ Spec of the underlying study: docs/superpowers/specs/2026-08-17-hybrid-policy-de
 
 import argparse
 import dataclasses
-import hashlib
-import json
 import os
-import pickle
 import re
 from dataclasses import dataclass
 
 import channel
-import dqn as dqn_module
 import panelstate
 import plots
 import presets
 import vizstate
-from dqn import DQNConfig, training_seed_range
 from eval_hybrid import evaluation_seeds
-from evemarkov import EveParams
+from evemarkov import ADVERSARIES, adversary
 from hybridenv import ENT, PM, HybridEnv, HybridParams
 from policies import (AlwaysENT, AlwaysPM, BlockAwareGreedy,
                       BufferAwareThreshold, DecoyWatch, GreedyThreshold,
@@ -98,11 +106,10 @@ __all__ = ["BANNER", "SPEC_CHOICES", "TRACK_COLORS",
            "strip_channel", "is_modified", "operating_point_label",
            "preset_table", "validate_preset_name", "resolve_envs",
            "VizConfig", "PolicyRun", "VizSession", "parse_spec",
-           "death_thresholds", "train_dqn", "dqn_label", "draw_panels",
+           "death_thresholds", "attack_spans", "draw_panels",
            "format_scoreboard", "main"]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DQN_CACHE_DIR = os.path.join(HERE, "logs", "dqn_cache")
 
 BANNER = ("NUMERIC MODEL (HybridEnv, eq 1-24) — this window does NOT drive "
           "the qline hardware. No hw_sim process is started here; use "
@@ -112,7 +119,13 @@ BANNER = ("NUMERIC MODEL (HybridEnv, eq 1-24) — this window does NOT drive "
 # their parameters filled in from the spinboxes, so the strings here are only
 # the stems.
 SPEC_CHOICES = ("always-pm", "always-ent", "greedy", "buffer-aware",
-                "block-aware", "dqn", "oracle", "always-pm-relaxed")
+                "block-aware", "decoy", "oracle", "always-pm-relaxed")
+
+# Shading for the attack periods: photon splitting in the red the rest of the
+# study uses for Eve, jamming in amber so the two weapons can be told apart on
+# a single figure.
+ATTACK_SHADE = {"pns": plots.EVE_SHADE, "jam": plots.AMBER}
+ATTACK_ALPHA = 0.13
 
 # One colour per track, from the DecoyState palette plots.py already owns, so
 # a screenshot of this window sits next to the analytic figures without a
@@ -389,9 +402,8 @@ def resolve_envs(config):
     """(pm_env, ent_env) ACTUALLY in force for `config`, fibre included.
 
     One place resolves "edited env, else named preset", and one place imposes
-    the shared fibre, so the death-threshold lines, the DQN cache key and
-    `HybridEnv._setup_modes` cannot end up describing three slightly different
-    experiments.
+    the shared fibre, so the death-threshold lines and `HybridEnv._setup_modes`
+    cannot end up describing two slightly different experiments.
     """
     pm_env = (config.pm_env if config.pm_env is not None
               else preset_table("pm")[config.pm_preset])
@@ -412,16 +424,25 @@ class VizConfig:
     """Everything the window can change without restarting the process.
 
     `seed_index` is an EPISODE INDEX, not a raw seed: it is mapped through
-    `eval_hybrid.evaluation_seeds`, which parks the trajectory in a seed block
-    no DQN training run reaches. Typing a small number here therefore cannot
-    accidentally score the agent on an episode it trained on -- the failure
-    the study's whole seeding scheme exists to prevent.
+    `eval_hybrid.evaluation_seeds`, the study's own evaluation block, so the
+    window and the study's tables draw their episodes from the same place.
+
+    THE DEFAULTS ARE CHOSEN TO SHOW THE RESULT (see the module docstring).
+    Two of them are load-bearing and easy to undo by accident:
+
+      * `adversary = "pns"`. The historical jammer ("jam") hurts both modes
+        and is visible in the QBER; on it the decoy controller has nothing to
+        add.
+      * `lam = 4.0`. At the older 2.5 ENT alone supplies enough key that eta
+        pins at 1.0 for every policy and the figure shows nothing -- the
+        SATURATED regime CLAUDE.md section 15 describes.
     """
 
-    specs: tuple = ("always-pm", "always-ent", "greedy-0.045", "oracle")
+    specs: tuple = ("always-pm", "always-ent", "greedy-0.045", "block-aware",
+                    "decoy-0.100-1.000-60", "oracle")
     pm_preset: str = "aurea"
     ent_preset: str = "ent_advanced"
-    lam: float = 2.5
+    lam: float = 4.0
     b_max: int = 1_000_000
     horizon: int = 3600
     n_x: int = 100_000
@@ -432,7 +453,9 @@ class VizConfig:
     l0: int = 8192              # key bits to encrypt one message (OTP)
     w_window: int = 5           # slots the observed QBER averages over
     seed_index: int = 0
-    dqn_episodes: int = 20
+    # Which attacker Eve is: a key of evemarkov.ADVERSARIES. An unknown name
+    # raises when the session is built rather than falling back to one.
+    adversary: str = "pns"
     # EDITED OPERATING POINTS. None = "run the named preset as it ships".
     #
     # The preset NAME is kept even when an env is present: it is what the
@@ -442,20 +465,14 @@ class VizConfig:
     # These are `channel.EnvParams` / `channel.EntEnvParams`, i.e. MUTABLE
     # dataclasses on a value object. Nothing here ever mutates them in place
     # -- the dialog builds a fresh one on OK -- because a VizConfig is
-    # compared, replaced and hashed into the DQN cache key.
+    # compared and replaced as a value.
     pm_env: object = None
     ent_env: object = None
 
-    def dqn_config(self):
-        """The DQNConfig a "dqn" track would train with, or None if unused."""
-        if "dqn" not in self.specs:
-            return None
-        return DQNConfig(episodes=int(self.dqn_episodes))
-
     def env_seed(self):
-        """The trajectory seed, guaranteed clear of the DQN training block."""
+        """The trajectory seed: the study's `seed_index`-th evaluation seed."""
         idx = max(0, int(self.seed_index))
-        return evaluation_seeds(idx + 1, self.dqn_config())[idx]
+        return evaluation_seeds(idx + 1)[idx]
 
     def hybrid_params(self, seed=None):
         """`HybridParams` for this configuration at `seed`."""
@@ -509,7 +526,7 @@ _HYST_RE = re.compile(r"^hysteresis-([0-9.]+)-([0-9.]+)-([0-9]+)$")
 _DECOY_RE = re.compile(r"^decoy-([0-9.]+)-([0-9.]+)-([0-9]+)$")
 
 
-def parse_spec(spec, dqn_policy=None):
+def parse_spec(spec):
     """Turn a policy spec string into an agent.
 
     Accepts exactly the labels the study's own tables use, so a row copied out
@@ -517,15 +534,15 @@ def parse_spec(spec, dqn_policy=None):
     `always-pm`, `always-ent`, `greedy-<theta>`,
     `buffer-aware-<theta>-<reserve>`, `block-aware`, `block-aware-<H>`,
     `hysteresis-<up>-<down>-<dwell>`, `decoy-<excess>-<qber>-<probe>`,
-    `dqn`, `oracle`, `always-pm-relaxed`.
+    `oracle`, `always-pm-relaxed`.
 
     `block-aware` with no horizon is the documented default -- the planning
     horizon is then the message deadline T0, which is a PROPERTY OF THE
     CONFIGURATION and so cannot be baked into the label.
 
-    `dqn` needs a trained agent handed in -- there is nothing sensible to
-    return for it otherwise, and returning an untrained network would put a
-    random-looking curve on the figure with no sign that it was never trained.
+    `dqn` is NOT accepted: the DQN was taken out of this window, and a saved
+    configuration still naming it is refused rather than drawn as something
+    else.
     """
     spec = str(spec).strip()
     if spec == "always-pm":
@@ -536,11 +553,6 @@ def parse_spec(spec, dqn_policy=None):
         return Oracle()
     if spec == "always-pm-relaxed":
         return RelaxedAlwaysPM()
-    if spec == "dqn":
-        if dqn_policy is None:
-            raise ValueError("spec 'dqn' needs a trained policy; call "
-                             "train_dqn() first")
-        return dqn_policy
     m = _GREEDY_RE.match(spec)
     if m:
         return GreedyThreshold(float(m.group(1)))
@@ -560,16 +572,6 @@ def parse_spec(spec, dqn_policy=None):
         return DecoyWatch(float(m.group(1)), qber_threshold=float(m.group(2)),
                           probe_every=int(m.group(3)))
     raise ValueError("unknown policy spec %r" % (spec,))
-
-
-def dqn_label(episodes):
-    """The label a DQN track carries. The episode count is NOT decoration.
-
-    The study trained 200 episodes; a UI that trains 20 while the user waits
-    produces a different agent, and a screenshot with a bare "dqn" row invites
-    the reader to compare it against the published number.
-    """
-    return "dqn (%d ep)" % int(episodes)
 
 
 # --------------------------------------------------------------------------
@@ -641,6 +643,10 @@ class PolicyRun:
         self.buffer = []
         self.eta_trace = []
         self.f = []
+        # PNS strength per slot. Recorded because under that attack the QBER
+        # is flat and f is zero, so without it the figure has nothing to draw
+        # the attack from.
+        self.pns = []
         self.slot = 0
         self.switches = 0
         self.ent_slots = 0
@@ -670,6 +676,7 @@ class PolicyRun:
         self.buffer.append(info["buffer"])
         self.eta_trace.append(self.env.eta)
         self.f.append(info["f"])
+        self.pns.append(info.get("pns", 0.0))
         self.ent_slots += 1 if mode == ENT else 0
         self.expired += info["expired"]
         self.served += info["served"]
@@ -707,24 +714,24 @@ class VizSession:
     session only when a parameter actually changes.
     """
 
-    def __init__(self, config=None, dqn_policy=None, dqn_episodes=None):
+    def __init__(self, config=None):
         self.config = config or VizConfig()
         self.seed = self.config.env_seed()
         self.params = self.config.hybrid_params(self.seed)
-        # ONE EveParams seed for every run. Each HybridEnv builds its own
-        # EveChain from it -- sharing a chain object would have them take
-        # turns drawing from it and see different jamming, which is the exact
-        # failure this class exists to prevent.
-        self.eve_params = EveParams(seed=self.seed)
+        # ONE EveParams for every run, built from the configured posture. Each
+        # HybridEnv builds its own EveChain from it -- sharing a chain object
+        # would have them take turns drawing from it and see different
+        # attacks, which is the exact failure this class exists to prevent.
+        # adversary() raises on an unknown name: a window silently drawing
+        # the wrong attacker would mislabel everything on screen.
+        self.eve_params = dataclasses.replace(
+            adversary(self.config.adversary), seed=self.seed)
         self.runs = []
         for i, spec in enumerate(self.config.specs):
-            agent = parse_spec(spec, dqn_policy)
-            label = (dqn_label(dqn_episodes if dqn_episodes is not None
-                               else self.config.dqn_episodes)
-                     if spec == "dqn" else agent.name)
+            agent = parse_spec(spec)
             self.runs.append(PolicyRun(
                 agent, HybridEnv(self.params, self.eve_params), self.seed,
-                label=label, color=TRACK_COLORS[i % len(TRACK_COLORS)]))
+                label=agent.name, color=TRACK_COLORS[i % len(TRACK_COLORS)]))
         self._assert_shared_weather()
         # Resolved ONCE, at construction, from the same `resolve_envs` the
         # environment and the cache key use -- so the label on screen cannot
@@ -742,9 +749,9 @@ class VizSession:
         # instead.
         #
         # It lives on the session and not on `VizConfig` because VizConfig is
-        # a value object describing the EPISODE: it is compared, replaced and
-        # hashed into the DQN cache key, and two configurations that differ
-        # only in which curve is on screen are not two different experiments.
+        # a value object describing the EPISODE: it is compared and replaced,
+        # and two configurations that differ only in which curve is on screen
+        # are not two different experiments.
         # The session is also the only object `draw_panels` is handed.
         self.hidden_traces = set()
         # {artist: policy name} for this frame's clickable legend entries.
@@ -832,88 +839,6 @@ class VizSession:
 
 
 # --------------------------------------------------------------------------
-# the DQN, and being honest about it
-# --------------------------------------------------------------------------
-
-def _cache_key(config, cfg):
-    """Identity of a trained agent: the training config AND the environment.
-
-    An agent trained at `chapman_lowmu` is a different agent from one trained
-    at `ent_advanced` -- those two presets give the study opposite answers --
-    so the operating point has to be in the key or flipping the chooser would
-    silently reuse the wrong weights.
-
-    THE KEY IS BUILT FROM VALUES, NOT FROM PRESET NAMES. Once the parameters
-    are editable a name no longer identifies an operating point: two runs can
-    both say "ent_advanced" and differ in mu, and a cache keyed on the name
-    would hand back an agent trained on the other physics -- with a perfectly
-    plausible-looking curve and nothing on screen to say so. `resolve_envs`
-    returns exactly what `HybridEnv._setup_modes` will build from, shared
-    fibre included, so the key covers every number the environment can see.
-    """
-    pm_env, ent_env = resolve_envs(config)
-    payload = {
-        "episodes": int(cfg.episodes), "seed": int(cfg.seed),
-        "hidden": int(cfg.hidden), "lr": float(cfg.lr),
-        "gamma": float(cfg.gamma), "batch": int(cfg.batch_size),
-        "pm_env": dataclasses.asdict(pm_env),
-        "ent_env": dataclasses.asdict(ent_env),
-        "lam": float(config.lam), "b_max": int(config.b_max),
-        "horizon": int(config.horizon), "n_x": int(config.n_x),
-        "d_km": float(config.d_km), "alpha": float(config.alpha),
-        "odr": float(config.odr_losses), "t0": int(config.t0_deadline),
-        "l0": int(config.l0), "w_window": int(config.w_window),
-        # dqn.py is under active development in a parallel session (an
-        # observation normaliser). A pickle from before that change would
-        # unpickle into the new class without __init__ ever running, leaving
-        # an agent missing the attribute its act() needs -- so the module's
-        # public surface goes into the key and the cache invalidates itself.
-        "dqn_api": sorted(dqn_module.__all__),
-    }
-    blob = json.dumps(payload, sort_keys=True).encode()
-    return hashlib.sha1(blob).hexdigest()[:16]
-
-
-def train_dqn(config, progress=None, cache_dir=DQN_CACHE_DIR, use_cache=True):
-    """Train (or load) the agent for `config`; return (policy, from_cache).
-
-    `progress(episode, eta, eps)` is `dqn.train`'s own callback, forwarded so
-    the window can show "training… (episode k of N)" instead of freezing with
-    no explanation.
-
-    The training environment is built from a seed in the config's OWN training
-    block, never from the trajectory seed the session displays: `train` resets
-    per episode, so the construction seed never reaches a trajectory, but
-    keeping the two blocks visibly separate is what makes "evaluated on an
-    episode it never trained on" checkable rather than asserted.
-    """
-    cfg = config.dqn_config()
-    if cfg is None:
-        cfg = DQNConfig(episodes=int(config.dqn_episodes))
-    key = _cache_key(config, cfg)
-    path = os.path.join(cache_dir, "dqn_%s.pkl" % key)
-    if use_cache and os.path.exists(path):
-        try:
-            with open(path, "rb") as fh:
-                return pickle.load(fh), True
-        except Exception:
-            # A stale or truncated cache must cost a retrain, never a crash.
-            pass
-    train_seed = training_seed_range(cfg).start
-    env = HybridEnv(config.hybrid_params(train_seed),
-                    EveParams(seed=train_seed))
-    policy = dqn_module.train(env, cfg, progress=progress)
-    if use_cache:
-        try:
-            os.makedirs(cache_dir, exist_ok=True)
-            with open(path, "wb") as fh:
-                pickle.dump(policy, fh)
-        except Exception:
-            pass
-    return policy, False
-
-
-# --------------------------------------------------------------------------
 # drawing -- no Tk here either, so a Figure can be rendered headless
 # --------------------------------------------------------------------------
 
@@ -931,6 +856,42 @@ def _mode_spans(run):
             current = mode
     spans[current].append((run.t[start], run.t[-1] - run.t[start] + 1))
     return spans
+
+
+def _level_spans(t, levels):
+    """[(start slot, width), ...] over the runs of consecutive slots whose
+    level is above zero -- the same (start, width) convention broken_barh and
+    `_mode_spans` use."""
+    spans = []
+    start = None
+    for i, level in enumerate(levels):
+        if level > 0.0 and start is None:
+            start = i
+        elif level <= 0.0 and start is not None:
+            spans.append((t[start], t[i - 1] - t[start] + 1))
+            start = None
+    if start is not None:
+        spans.append((t[start], t[len(levels) - 1] - t[start] + 1))
+    return spans
+
+
+def attack_spans(run):
+    """{"jam": spans, "pns": spans} -- when each weapon was in use.
+
+    Read off ONE run: `VizSession._assert_shared_weather` guarantees every run
+    faced the identical attack, so any run's record is every run's record.
+    """
+    return {"jam": _level_spans(run.t, run.f),
+            "pns": _level_spans(run.t, run.pns)}
+
+
+def _shade_attacks(ax, spans):
+    """Translucent vertical bands behind everything else on `ax`."""
+    for weapon in ("jam", "pns"):
+        for start, width in spans[weapon]:
+            ax.axvspan(start - 0.5, start + width - 0.5,
+                       color=ATTACK_SHADE[weapon], alpha=ATTACK_ALPHA,
+                       lw=0, zorder=0)
 
 
 def _wire_qber_legend(legend, session, names):
@@ -994,8 +955,13 @@ def draw_panels(fig, session, title=None):
         ax.set_facecolor("white")
     runs = session.runs
     horizon = session.params.horizon
+    # Named `attacks`, not `spans`: the mode-lane loop below rebinds `spans`
+    # per run, and reusing the name handed panel 2 a mode dict instead.
+    attacks = (attack_spans(runs[0]) if runs
+               else {"jam": [], "pns": []})
 
     # --- panel 1: which mode each policy is in ---------------------------
+    _shade_attacks(ax_mode, attacks)
     for i, run in enumerate(runs):
         spans = _mode_spans(run)
         for mode, name in ((PM, "pm"), (ENT, "ent")):
@@ -1007,7 +973,8 @@ def draw_panels(fig, session, title=None):
     ax_mode.set_yticklabels([r.display_name for r in runs], fontsize=7)
     ax_mode.set_ylim(-0.6, len(runs) - 0.4)
     plots.style_axis(ax_mode, title="mode per policy  (light blue = PM, "
-                                    "light green = ENT)")
+                                    "light green = ENT;  red band = PNS attack,"
+                                    " amber = jamming)")
     # A bound's lane must not read as a schedule anyone could run. The tag
     # goes at the LEFT edge: pinned to the right it sits exactly where the
     # last slot is drawn and reads as a terminus -- a real reader took it to
@@ -1026,6 +993,9 @@ def draw_panels(fig, session, title=None):
     # with the policy it belongs to. `None` marks an entry that is a
     # reference line rather than a policy.
     handles, labels, names = [], [], []
+    # The same bands again: under PNS this is the panel that shows the QBER
+    # staying flat THROUGH the attack, which is the whole point.
+    _shade_attacks(ax_qber, attacks)
     for run in runs:
         line, = ax_qber.plot([t for t in run.t], [100.0 * q for q in run.qber],
                              color=run.color, lw=1.0, ls=run.linestyle,
@@ -1104,11 +1074,12 @@ def draw_panels(fig, session, title=None):
     # The operating-point labels, not the bare preset names: an edited
     # configuration that printed "ent=ent_advanced" would put a figure in a
     # thesis under the name of physics it was not run with.
-    head = title or ("%s   %s  %s  λ=%.2f  B_max=%.3g  n_X=%.0e  seed=%d"
-                     % (BANNER.split("—")[0].strip(), session.pm_label,
-                        session.ent_label, session.params.lam,
-                        session.params.b_max, session.params.n_x,
-                        session.seed))
+    head = title or ("%s   adversary=%s   %s  %s  λ=%.2f  B_max=%.3g  "
+                     "n_X=%.0e  seed=%d"
+                     % (BANNER.split("—")[0].strip(), session.config.adversary,
+                        session.pm_label, session.ent_label,
+                        session.params.lam, session.params.b_max,
+                        session.params.n_x, session.seed))
     fig.suptitle(head, fontsize=8, color=plots.NAVY, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.965))
     return fig
@@ -1149,7 +1120,7 @@ def _build_app(config, saved=None):
 # silently swallowing an explicit "--lam 3.0".
 _CLI_FIELDS = (("pm_preset", str), ("ent_preset", str), ("lam", float),
                ("b_max", int), ("horizon", int), ("seed_index", int),
-               ("dqn_episodes", int))
+               ("adversary", str))
 
 
 def main(argv=None):
@@ -1160,7 +1131,8 @@ def main(argv=None):
     ap.add_argument("--b-max", type=float, default=None)
     ap.add_argument("--horizon", type=int, default=None)
     ap.add_argument("--seed-index", type=int, default=None)
-    ap.add_argument("--dqn-episodes", type=int, default=None)
+    ap.add_argument("--adversary", default=None, choices=sorted(ADVERSARIES),
+                    help="which attacker Eve is (default: pns)")
     ap.add_argument("--policies", default=None,
                     help="comma-separated policy specs, e.g. "
                          "'always-pm,greedy-0.045,oracle'")
@@ -1189,15 +1161,11 @@ def main(argv=None):
     # arguments and the presets, not on what happens to be in one machine's
     # policyviz_default.json.
 
-    trained = None
-    if "dqn" in config.specs:
-        print("training dqn (%d episodes)..." % config.dqn_episodes)
-        trained, cached = train_dqn(config)
-        print("  %s" % ("loaded from cache" if cached else "trained"))
-    session = VizSession(config, dqn_policy=trained)
+    session = VizSession(config)
     session.step(config.horizon)
     print(BANNER)
-    print("seed %d (episode index %d)" % (session.seed, config.seed_index))
+    print("seed %d (episode index %d)   adversary=%s"
+          % (session.seed, config.seed_index, config.adversary))
     print()
     print(format_scoreboard(session))
     if args.figure:

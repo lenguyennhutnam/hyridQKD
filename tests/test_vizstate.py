@@ -200,6 +200,43 @@ class TestLoadNeverRaises(_TempFile):
         self.assertNotIn("theta", loaded)
 
 
+class TestTheAttackerAndTheDecoyBoxes(_TempFile):
+    """The window can now choose Eve's posture and run the decoy controller;
+    both have to survive a Save, and neither may be able to stop it opening."""
+
+    def test_the_adversary_round_trips(self):
+        vizstate.save_state(_state(adversary="pns"), self.path)
+        self.assertEqual(vizstate.load_state(self.path)["adversary"], "pns")
+
+    def test_an_unknown_adversary_is_dropped_not_restored(self):
+        # A name no session can be built from would make the very first Apply
+        # fail. Absent means "keep the form's own choice".
+        self._write(dict(_state(pm_env=None, ent_env=None), adversary="warp"))
+        self.assertNotIn("adversary", vizstate.load_state(self.path))
+
+    def test_a_non_string_adversary_is_dropped(self):
+        self._write(dict(_state(pm_env=None, ent_env=None), adversary=3))
+        self.assertNotIn("adversary", vizstate.load_state(self.path))
+
+    def test_the_decoy_boxes_round_trip_as_numbers(self):
+        vizstate.save_state(_state(dc_theta=0.2, dc_qber=1.0, dc_probe=60.0),
+                            self.path)
+        loaded = vizstate.load_state(self.path)
+        self.assertEqual((loaded["dc_theta"], loaded["dc_qber"],
+                          loaded["dc_probe"]), (0.2, 1.0, 60.0))
+
+    def test_a_non_numeric_decoy_box_is_dropped(self):
+        self._write(dict(_state(pm_env=None, ent_env=None), dc_probe="often"))
+        self.assertNotIn("dc_probe", vizstate.load_state(self.path))
+
+    def test_a_file_from_before_the_dqn_was_removed_still_loads(self):
+        self._write({"fields": {"lam": 2.5, "dqn_episodes": 20},
+                     "policies": ["always-pm", "dqn"]})
+        loaded = vizstate.load_state(self.path)
+        self.assertEqual(loaded["fields"]["lam"], 2.5)
+        self.assertIn("always-pm", loaded["policies"])
+
+
 class TestForwardCompat(_TempFile):
     """A file written by an older (or newer) version still loads."""
 

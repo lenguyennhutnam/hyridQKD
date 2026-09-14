@@ -32,6 +32,7 @@ QUIET and LIGHT are regimes where PM wins, HEAVY is the regime where PM
 produces zero key and ENT still produces some.
 """
 
+import dataclasses
 from dataclasses import dataclass
 
 import numpy as np
@@ -56,6 +57,48 @@ class EveParams:
     # published result was measured at.
     s_levels: tuple = (0.0, 0.0, 0.0)
     seed: int = 0
+
+
+# The adversaries worth naming, as (f level, PNS level) per chain state. They
+# share one transition matrix on purpose: a posture is a choice of WEAPON, and
+# changing the dwell structure at the same time would leave two runs differing
+# in two things.
+#
+#   jam   the historical adversary, and exactly EveParams(): raises the QBER of
+#         whichever mode is running, so it hurts BOTH and every QBER-threshold
+#         policy can see it.
+#   pns   photon-number splitting only. Certifies PM's key to zero, touches ENT
+#         not at all, and moves the QBER by NOTHING -- so it measures whether a
+#         controller is watching the right observable. On the default chain the
+#         splitting state holds 22% of the slots, close enough to the measured
+#         PM/ENT crossover (~10%) that switching beats both static choices.
+#   both  one state per weapon. The controller needs two alarms. On the DEFAULT
+#         chain the adversary is active 53% of the time, far past the
+#         crossover, and static always-ENT wins -- measured, a map run on it
+#         shows every realisable policy tied with a switch-once latch.
+#   none  the contrast case.
+#
+# Defined here, beside the chain they configure, rather than in optmap: the
+# visualiser offers them too, and it should not have to import the study driver
+# (and through it the DQN) to do so.
+ADVERSARIES = {
+    "jam": ((0.0, 0.03, 0.08), (0.0, 0.0, 0.0)),
+    "pns": ((0.0, 0.0, 0.0), (0.0, 0.0, 0.6)),
+    "both": ((0.0, 0.03, 0.0), (0.0, 0.0, 0.6)),
+    "none": ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+}
+
+
+def adversary(name, eve=None):
+    """`EveParams` for a named posture, keeping the chain it is built on.
+
+    Raises KeyError on an unknown name rather than falling back to a default:
+    a run silently made against the wrong adversary is a run whose every label
+    is wrong, with no visible symptom.
+    """
+    f_levels, s_levels = ADVERSARIES[name]
+    return dataclasses.replace(eve or EveParams(), f_levels=f_levels,
+                               s_levels=s_levels)
 
 
 class EveChain:

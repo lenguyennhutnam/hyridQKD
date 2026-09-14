@@ -6,16 +6,13 @@ reads the form, rebuilds a `policyviz.VizSession`, drives a timer and calls
 `policyviz.draw_panels`. If a behaviour is being written here that a test
 would want to make an assertion about, it belongs in `policyviz` instead.
 
-Two states this window owes the viewer an explanation for:
+One state this window owes the viewer an explanation for:
 
-* **training** -- a DQN track cannot be shown before it is trained, and even a
-  short run takes seconds. Training therefore happens on a worker thread with
-  the episode counter on screen, rather than blocking the mainloop with a
-  frozen window. (`gui.py` blocks deliberately during Apply; that is a
-  different trade-off, made because there the user is waiting on real
-  hardware and there is nothing to animate.)
 * **bound** -- the Oracle row is dashed and labelled, in the figure and in the
   scoreboard both. See policyviz's module docstring.
+
+The DQN was taken out of this window: there is no checkbox for it, no episode
+count and no training thread. It is still in dqn.py for the study's tables.
 
 THE SAVED CONFIGURATION
 -----------------------
@@ -47,7 +44,6 @@ minutes on exactly that.
 
 import dataclasses
 import os
-import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
@@ -60,10 +56,11 @@ from matplotlib.figure import Figure  # noqa: E402
 import presets as preset_store  # noqa: E402
 import policyviz  # noqa: E402
 import vizstate  # noqa: E402
-from policies import BufferAwareThreshold, GreedyThreshold  # noqa: E402
+from evemarkov import ADVERSARIES  # noqa: E402
+from policies import (BufferAwareThreshold, DecoyWatch,  # noqa: E402
+                      GreedyThreshold)
 
 TICK_MS = 80            # timer period; `speed` sets slots advanced per tick
-TRAIN_POLL_MS = 200
 # Redrawing is throttled SEPARATELY from stepping. A full 3,600-slot figure
 # with six tracks costs ~0.33 s to render, so redrawing on every 80 ms tick
 # would leave the mainloop doing nothing but paint -- the buttons would go
@@ -72,7 +69,7 @@ TRAIN_POLL_MS = 200
 # often. Step and Reset force a redraw regardless, because there the whole
 # point is to see the single slot that just happened.
 REDRAW_MS = 400
-STATUS_COLORS = {"idle": "#9e9e9e", "training": "#f0ad4e",
+STATUS_COLORS = {"idle": "#9e9e9e",
                  "running": "#5cb85c", "paused": "#31708f",
                  "finished": "#2E75B6", "error": "#d9534f"}
 
@@ -95,7 +92,6 @@ FIELDS = [
     ("n_x", "n_X block [bits]", 10),
     ("w_window", "QBER window [slots]", 8),
     ("seed_index", "seed (episode #)", 8),
-    ("dqn_episodes", "DQN episodes", 8),
 ]
 
 # Everything else is read as an int. Getting this wrong turns 0.2 dB/km into
@@ -119,10 +115,40 @@ THRESHOLD_FIELDS = (("theta", "theta", "greedy θ"),
                     ("ba_theta", "ba_theta", "buffer-aware θ"),
                     ("ba_reserve", "ba_reserve", "buffer-aware reserve"))
 
+# The decoy controller's three boxes, same shape. Kept apart from
+# THRESHOLD_FIELDS so `_parameters_from` keeps its three-value contract.
+# The QBER alarm defaults to 1.0 -- never fires -- because against the default
+# adversary (PNS) the QBER does not move, and measured, reacting to light
+# jamming only pays at small blocks (it HURTS from n_X = 3e5 up).
+DECOY_FIELDS = (("dc_theta", "dc_theta", "decoy excess threshold"),
+                ("dc_qber", "dc_qber", "decoy QBER alarm (1 = off)"),
+                ("dc_probe", "dc_probe", "decoy probe every [slots]"))
+
+# One line per adversary for the dropdown, so the choice explains itself.
+ADVERSARY_HINTS = {
+    "pns": "PNS: kills PM's key, QBER does NOT move",
+    "jam": "jamming: raises QBER, hurts both modes",
+    "both": "both weapons (on 53% of slots: ENT wins)",
+    "none": "no attack (contrast)",
+}
+
 # The speed slider's range. A saved value is clamped into it: a file holding
 # 10000 would leave the slider pinned off its own scale, showing a number the
 # widget cannot represent.
 SPEED_MIN, SPEED_MAX = 1, 400
+
+
+def _parse_or_none(spec):
+    """The policy for `spec`, or None if this version cannot build it.
+
+    A saved configuration may name a policy that no longer exists -- "dqn",
+    from before the DQN was taken out of the window. Reading parameters out of
+    the spec list must skip it rather than stop the window from opening.
+    """
+    try:
+        return policyviz.parse_spec(spec)
+    except ValueError:
+        return None
 
 
 def format_field(name, value):
@@ -380,10 +406,7 @@ class PolicyVizApp(tk.Tk):
                          "ent": self.config_obj.ent_env}
         self.session = None
         self._running = False
-        self._trainer = None
         self._last_draw = 0.0
-        self._train_state = {"episode": 0, "total": 0, "policy": None,
-                             "error": None, "cached": False}
         # Traces to switch off in the session that has not been built yet.
         # A restored `hidden_traces` cannot be written to `self.session`
         # (there is none during startup), so it waits here and
@@ -472,12 +495,43 @@ class PolicyVizApp(tk.Tk):
         self.theta = tk.StringVar(value=theta)
         self.ba_theta = tk.StringVar(value=ba_theta)
         self.ba_reserve = tk.StringVar(value=ba_reserve)
-        for _key, attr, label in THRESHOLD_FIELDS:
+        dc_theta, dc_qber, dc_probe = self._decoy_parameters_from(
+            self.config_obj.specs)
+        self.dc_theta = tk.StringVar(value=dc_theta)
+        self.dc_qber = tk.StringVar(value=dc_qber)
+        self.dc_probe = tk.StringVar(value=dc_probe)
+        for _key, attr, label in THRESHOLD_FIELDS + DECOY_FIELDS:
             var = getattr(self, attr)
             ttk.Label(left, text=label).grid(row=row, column=0, sticky="w")
             ttk.Entry(left, textvariable=var, width=8).grid(row=row, column=1,
                                                             sticky="w")
             row += 1
+
+        ttk.Separator(left, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
+        # THE ATTACKER. Chosen here rather than hard-wired: the window used to
+        # build Eve as the jammer unconditionally, so the attack the study
+        # turns on could not be shown at all.
+        ttk.Label(left, text="adversary",
+                  font=("TkDefaultFont", 9, "bold")
+                  ).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        self.adversary_choices = sorted(ADVERSARIES)
+        self.adversary_var = tk.StringVar(value=self.config_obj.adversary)
+        combo = ttk.Combobox(left, textvariable=self.adversary_var,
+                             values=self.adversary_choices, state="readonly",
+                             width=8)
+        combo.grid(row=row, column=0, sticky="w")
+        self.adversary_hint = ttk.Label(left, font=("TkDefaultFont", 7),
+                                        foreground="#666666", wraplength=170,
+                                        justify="left")
+        self.adversary_hint.grid(row=row, column=1, sticky="w")
+        self.adversary_var.trace_add(
+            "write", lambda *_: self._refresh_adversary_hint())
+        self._refresh_adversary_hint()
+        row += 1
 
         ttk.Separator(left, orient="horizontal").grid(
             row=row, column=0, columnspan=2, sticky="ew", pady=6)
@@ -644,7 +698,7 @@ class PolicyVizApp(tk.Tk):
         selection does not blank the other boxes.
         """
         for spec in specs:
-            policy = None if spec == "dqn" else policyviz.parse_spec(spec)
+            policy = _parse_or_none(spec)
             if isinstance(policy, GreedyThreshold):
                 theta = "%g" % policy.threshold
             elif isinstance(policy, BufferAwareThreshold):
@@ -653,12 +707,34 @@ class PolicyVizApp(tk.Tk):
         return theta, ba_theta, ba_reserve
 
     @staticmethod
+    def _decoy_parameters_from(specs, dc_theta="0.1", dc_qber="1",
+                               dc_probe="60"):
+        """(excess threshold, QBER alarm, probe interval) out of `specs`.
+
+        The defaults are the operating point measured to beat both static
+        choices under the default adversary.
+        """
+        for spec in specs:
+            policy = _parse_or_none(spec)
+            if isinstance(policy, DecoyWatch):
+                dc_theta = "%g" % policy.decoy_threshold
+                dc_qber = "%g" % policy.qber_threshold
+                dc_probe = "%g" % policy.probe_every
+        return dc_theta, dc_qber, dc_probe
+
+    def _refresh_adversary_hint(self):
+        self.adversary_hint.config(
+            text=ADVERSARY_HINTS.get(self.adversary_var.get(), ""))
+
+    @staticmethod
     def _stems(specs):
         """Map full specs back to the checkbox stems they came from."""
         out = []
         for spec in specs:
             if spec.startswith("buffer-aware"):
                 out.append("buffer-aware")
+            elif spec.startswith("decoy-"):
+                out.append("decoy")
             elif spec.startswith("block-aware"):
                 # "block-aware-80" from the command line still ticks the
                 # plain checkbox; the horizon comes from the configuration.
@@ -766,6 +842,17 @@ class PolicyVizApp(tk.Tk):
                 specs.append(BufferAwareThreshold(
                     float(self.ba_theta.get()),
                     float(self.ba_reserve.get())).name)
+            elif stem == "decoy":
+                try:
+                    specs.append(DecoyWatch(
+                        float(self.dc_theta.get()),
+                        qber_threshold=float(self.dc_qber.get()),
+                        probe_every=int(float(self.dc_probe.get()))).name)
+                except ValueError:
+                    raise ValueError("decoy: every box needs a number, got "
+                                     "%r / %r / %r"
+                                     % (self.dc_theta.get(), self.dc_qber.get(),
+                                        self.dc_probe.get()))
             else:
                 specs.append(stem)
         if not specs:
@@ -784,7 +871,7 @@ class PolicyVizApp(tk.Tk):
             specs=tuple(specs), pm_preset=self.preset_var["pm"].get(),
             ent_preset=self.preset_var["ent"].get(),
             pm_env=self.mode_env.get("pm"), ent_env=self.mode_env.get("ent"),
-            **values)
+            adversary=self.adversary_var.get(), **values)
 
     # ------------------------------------------------------------------
     # the saved configuration
@@ -821,8 +908,9 @@ class PolicyVizApp(tk.Tk):
             # Same refusal as Apply: a saved state with nothing ticked would
             # restore a form that cannot be run.
             raise ValueError("select at least one policy")
-        state = {"fields": fields, "policies": policies}
-        for key, attr, label in THRESHOLD_FIELDS:
+        state = {"fields": fields, "policies": policies,
+                 "adversary": self.adversary_var.get()}
+        for key, attr, label in THRESHOLD_FIELDS + DECOY_FIELDS:
             text = getattr(self, attr).get().strip()
             try:
                 state[key] = float(text)
@@ -858,9 +946,11 @@ class PolicyVizApp(tk.Tk):
             chosen = set(policies)
             for stem, var in self.checks.items():
                 var.set(stem in chosen)
-        for key, attr, _label in THRESHOLD_FIELDS:
+        for key, attr, _label in THRESHOLD_FIELDS + DECOY_FIELDS:
             if key in state:
                 getattr(self, attr).set("%g" % state[key])
+        if state.get("adversary") in ADVERSARIES:
+            self.adversary_var.set(state["adversary"])
         for protocol in ("pm", "ent"):
             name_key, env_key = "%s_preset" % protocol, "%s_env" % protocol
             name = state.get(name_key, self.preset_var[protocol].get())
@@ -891,8 +981,7 @@ class PolicyVizApp(tk.Tk):
         """The Save button: RECORD THE FORM. It does not Apply.
 
         Apply rebuilds the session, which throws away the episode running on
-        screen and, with "dqn" ticked, starts a training thread the user then
-        waits on. Making Save do that as a side effect would mean a user who
+        screen. Making Save do that as a side effect would mean a user who
         wanted to keep a number lost the run they were watching. The reverse
         coupling is just as bad: an Apply that saved would overwrite the saved
         configuration every time someone nudged a parameter to try something.
@@ -936,7 +1025,7 @@ class PolicyVizApp(tk.Tk):
         self.status.config(text=text, fg=STATUS_COLORS.get(kind, "#000000"))
 
     def _apply(self):
-        """Rebuild the session from the form. Trains first if a DQN is on."""
+        """Rebuild the session from the form."""
         self._running = False
         self.start_btn.config(text="Start")
         try:
@@ -946,53 +1035,7 @@ class PolicyVizApp(tk.Tk):
             messagebox.showerror("policy visualiser", str(exc))
             return
         self.config_obj = config
-        if "dqn" in config.specs:
-            self._start_training(config)
-            return
-        self._build_session(config, None)
-
-    def _start_training(self, config):
-        """Train on a worker thread; the mainloop keeps redrawing meanwhile.
-
-        A frozen window with no explanation is the failure mode this avoids:
-        even 20 episodes is several seconds, and the user has no way to tell
-        that from a hang.
-        """
-        state = {"episode": 0, "total": int(config.dqn_episodes),
-                 "policy": None, "error": None, "cached": False}
-        self._train_state = state
-
-        def progress(episode, eta, eps):
-            state["episode"] = episode + 1
-
-        def work():
-            try:
-                policy, cached = policyviz.train_dqn(config, progress=progress)
-                state["policy"] = policy
-                state["cached"] = cached
-            except Exception as exc:          # surfaced, never swallowed
-                state["error"] = exc
-
-        self._trainer = threading.Thread(target=work, daemon=True)
-        self._trainer.start()
-        self._set_status("training… (0 / %d episodes)" % state["total"],
-                         "training")
-        self.after(TRAIN_POLL_MS, self._poll_training, config)
-
-    def _poll_training(self, config):
-        state = self._train_state
-        if self._trainer is not None and self._trainer.is_alive():
-            self._set_status("training… (%d / %d episodes)"
-                             % (state["episode"], state["total"]), "training")
-            self.after(TRAIN_POLL_MS, self._poll_training, config)
-            return
-        self._trainer = None
-        if state["error"] is not None:
-            self._set_status("training failed: %s" % state["error"], "error")
-            messagebox.showerror("policy visualiser",
-                                 "DQN training failed:\n%s" % state["error"])
-            return
-        self._build_session(config, state["policy"])
+        self._build_session(config)
 
     def _on_pick(self, event):
         """Click a QBER legend entry: hide or show that policy's trace.
@@ -1080,7 +1123,7 @@ class PolicyVizApp(tk.Tk):
         self._sync_trace_checks()
         self._redraw(force=True)
 
-    def _build_session(self, config, dqn_policy):
+    def _build_session(self, config):
         # Which QBER traces are switched off is a VIEW choice, not part of
         # the episode, so it rides across an Apply: otherwise nudging lambda
         # would silently un-hide everything the reader had just cleared away,
@@ -1101,9 +1144,7 @@ class PolicyVizApp(tk.Tk):
         if self.session is not None:
             carried |= set(self.session.hidden_traces)
         try:
-            self.session = policyviz.VizSession(
-                config, dqn_policy=dqn_policy,
-                dqn_episodes=config.dqn_episodes)
+            self.session = policyviz.VizSession(config)
         except Exception as exc:
             self.session = None
             self._rebuild_trace_checks()

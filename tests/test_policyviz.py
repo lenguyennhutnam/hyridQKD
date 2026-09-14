@@ -29,16 +29,15 @@ import channel  # noqa: E402
 import policyviz  # noqa: E402
 import presets  # noqa: E402
 import vizstate  # noqa: E402
-from dqn import DQNConfig, training_seed_range  # noqa: E402
 import plots  # noqa: E402
 from evemarkov import EveParams  # noqa: E402
 from hybridenv import ENT, PM, HybridEnv  # noqa: E402
 from policies import (AlwaysENT, AlwaysPM, BlockAwareGreedy,  # noqa: E402
-                      BufferAwareThreshold, GreedyThreshold,
+                      BufferAwareThreshold, DecoyWatch, GreedyThreshold,
                       HysteresisThreshold, Oracle, RelaxedAlwaysPM,
                       run_episode)
 from policyviz import (PolicyRun, VizConfig, VizSession, death_thresholds,
-                       dqn_label, draw_panels, format_scoreboard,
+                       attack_spans, draw_panels, format_scoreboard,
                        parse_spec)  # noqa: E402
 
 class _RecordingMessagebox:
@@ -86,9 +85,15 @@ SLOTS = 300
 
 
 def small_config(**kw):
-    """A four-track session that runs in well under a second."""
+    """A four-track session that runs in well under a second.
+
+    Pinned to the JAMMING adversary: every test below that was written before
+    the window could choose its attacker asserts behaviour -- greedy switching,
+    policies diverging under Eve -- that only the jammer produces. The window's
+    own default is now the stealthy one; those tests say so explicitly.
+    """
     base = dict(specs=("always-pm", "always-ent", "greedy-0.045", "oracle"),
-                horizon=SLOTS, lam=2.5, b_max=1_000_000)
+                horizon=SLOTS, lam=2.5, b_max=1_000_000, adversary="jam")
     base.update(kw)
     return VizConfig(**base)
 
@@ -482,9 +487,10 @@ class TestSpecParsing(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_spec("greedy")
 
-    def test_dqn_without_a_trained_agent_is_refused(self):
-        # Returning an untrained network would put a random curve on the
-        # figure with nothing to show it was never trained.
+    def test_dqn_is_no_longer_a_spec_the_window_accepts(self):
+        # The DQN was taken out of the visualiser; a saved configuration or a
+        # command line still naming it must be refused rather than quietly
+        # drawn as something else.
         with self.assertRaises(ValueError):
             parse_spec("dqn")
 
@@ -517,112 +523,166 @@ class TestTheBlockAwarePolicyIsReachableFromTheWindow(unittest.TestCase):
             self.assertGreaterEqual(row["eta"], 0.0)
 
 
-class TestTheDQNIsLabelledWithItsEpisodeCount(unittest.TestCase):
-    """Honesty requirement 2: a 20-episode agent must not read as the
-    200-episode agent of the study."""
+class TestTheAdversaryIsChosenNotHardwired(unittest.TestCase):
+    """The window used to build EveParams() unconditionally -- the jammer --
+    so the attack the study now turns on could not be shown at all, whatever
+    the form or the saved configuration said."""
 
-    def test_the_label_states_the_episode_count(self):
-        self.assertIn("20", dqn_label(20))
-        self.assertIn("ep", dqn_label(20))
-        self.assertNotEqual(dqn_label(20), dqn_label(200))
+    def test_the_session_faces_the_adversary_it_was_configured_with(self):
+        session = VizSession(small_config(adversary="pns",
+                                          specs=("always-pm",)))
+        eve = session.runs[0].env.eve.params
+        self.assertEqual(set(eve.f_levels), {0.0})
+        self.assertGreater(max(eve.s_levels), 0.0)
 
-    def test_a_session_labels_its_dqn_track_with_the_count_it_used(self):
-        class _Stub(AlwaysPM):
-            name = "dqn"
-        config = small_config(specs=("dqn",), dqn_episodes=7)
-        session = VizSession(config, dqn_policy=_Stub(), dqn_episodes=7)
-        self.assertEqual(session.runs[0].display_name, "dqn (7 ep)")
+    def test_jam_is_exactly_the_weather_the_window_always_used(self):
+        session = VizSession(small_config(adversary="jam",
+                                          specs=("always-pm",)))
+        self.assertEqual(session.runs[0].env.eve.params,
+                         EveParams(seed=session.seed))
 
-    def test_the_displayed_count_follows_the_run_not_the_default(self):
-        class _Stub(AlwaysPM):
-            name = "dqn"
-        config = small_config(specs=("dqn",), dqn_episodes=200)
-        session = VizSession(config, dqn_policy=_Stub(), dqn_episodes=3)
-        self.assertIn("3 ep", session.runs[0].display_name)
+    def test_an_unknown_adversary_is_refused_not_defaulted(self):
+        with self.assertRaises(KeyError):
+            VizSession(small_config(adversary="stealthy",
+                                    specs=("always-pm",)))
 
+    def test_every_run_still_faces_one_and_the_same_adversary(self):
+        session = VizSession(small_config(adversary="pns"))
+        first = session.runs[0].env.eve.params
+        for run in session.runs[1:]:
+            self.assertEqual(run.env.eve.params, first)
 
-class TestTrainingTheDQN(unittest.TestCase):
-    """Tiny episodes -- this checks the wiring, not the learning."""
-
-    def setUp(self):
-        self.cache = tempfile.mkdtemp()
-        self.config = small_config(specs=("dqn",), horizon=60,
-                                   dqn_episodes=2)
-
-    def tearDown(self):
-        shutil.rmtree(self.cache, ignore_errors=True)
-
-    def test_it_returns_a_usable_policy_and_reports_it_trained(self):
-        policy, cached = policyviz.train_dqn(self.config, cache_dir=self.cache)
-        self.assertFalse(cached)
-        session = VizSession(self.config, dqn_policy=policy, dqn_episodes=2)
-        session.step(60)
-        self.assertEqual(session.runs[0].slot, 60)
-
-    def test_progress_is_reported_once_per_episode(self):
-        # The window shows this counter instead of freezing silently; a
-        # callback that never fires would leave "training… (0 / N)" on screen
-        # for the whole run.
-        seen = []
-        policyviz.train_dqn(self.config, cache_dir=self.cache,
-                            progress=lambda ep, eta, eps: seen.append(ep))
-        self.assertEqual(len(seen), self.config.dqn_episodes)
-
-    def test_the_second_call_comes_from_the_cache(self):
-        policyviz.train_dqn(self.config, cache_dir=self.cache)
-        _, cached = policyviz.train_dqn(self.config, cache_dir=self.cache)
-        self.assertTrue(cached)
-
-    def test_a_different_ent_preset_is_a_different_agent(self):
-        # The two presets give the study OPPOSITE answers, so reusing weights
-        # across them would show an agent trained for the other conclusion.
-        policyviz.train_dqn(self.config, cache_dir=self.cache)
-        other = dataclasses.replace(self.config, ent_preset="chapman_lowmu")
-        _, cached = policyviz.train_dqn(other, cache_dir=self.cache)
-        self.assertFalse(cached)
-
-    def test_a_different_episode_count_is_a_different_agent(self):
-        policyviz.train_dqn(self.config, cache_dir=self.cache)
-        other = dataclasses.replace(self.config, dqn_episodes=3)
-        _, cached = policyviz.train_dqn(other, cache_dir=self.cache)
-        self.assertFalse(cached)
-
-    def test_a_corrupt_cache_costs_a_retrain_not_a_crash(self):
-        policyviz.train_dqn(self.config, cache_dir=self.cache)
-        for name in os.listdir(self.cache):
-            with open(os.path.join(self.cache, name), "wb") as fh:
-                fh.write(b"not a pickle")
-        policy, cached = policyviz.train_dqn(self.config, cache_dir=self.cache)
-        self.assertFalse(cached)
-        self.assertIsNotNone(policy)
-
-    def test_training_never_touches_the_displayed_trajectory_seed(self):
-        trained = training_seed_range(self.config.dqn_config())
-        self.assertNotIn(self.config.env_seed(), trained)
+    def test_each_slot_records_the_attack_strength(self):
+        # Without it the figure has nothing to draw the attack FROM: under PNS
+        # the QBER is flat and f is zero on every slot.
+        session = VizSession(small_config(adversary="pns",
+                                          specs=("always-pm",), horizon=1200))
+        session.step(1200)
+        run = session.runs[0]
+        self.assertEqual(len(run.pns), run.slot)
+        self.assertTrue(any(level > 0 for level in run.pns))
 
 
-class TestSeedsStayOutOfTheTrainingBlock(unittest.TestCase):
-    def test_the_trajectory_seed_is_never_one_the_dqn_trained_on(self):
-        config = small_config(specs=("always-pm", "dqn"), dqn_episodes=50)
-        trained = training_seed_range(config.dqn_config())
-        self.assertNotIn(config.env_seed(), trained)
+class TestTheAttackIsDrawnWhereItHappens(unittest.TestCase):
+    """Under PNS the QBER does not move, so a figure that only showed the QBER
+    would show NOTHING happening while PM's key went to zero. The attack
+    periods have to be drawn in their own right."""
 
-    def test_a_large_seed_index_still_clears_the_training_block(self):
-        config = small_config(specs=("dqn",), dqn_episodes=200,
-                              seed_index=25)
-        self.assertNotIn(config.env_seed(),
-                         training_seed_range(config.dqn_config()))
+    class _Run:
+        t = [1, 2, 3, 4, 5, 6]
+        f = [0.0, 0.0, 0.03, 0.03, 0.0, 0.0]
+        pns = [0.0, 0.6, 0.6, 0.0, 0.0, 0.6]
 
-    def test_no_dqn_means_no_training_config(self):
-        self.assertIsNone(small_config(specs=("always-pm",)).dqn_config())
+    def test_pns_spans_cover_exactly_the_slots_it_ran(self):
+        self.assertEqual(attack_spans(self._Run())["pns"], [(2, 2), (6, 1)])
 
-    def test_the_dqn_config_uses_the_requested_episode_count(self):
-        config = small_config(specs=("dqn",), dqn_episodes=11)
-        self.assertEqual(config.dqn_config().episodes, 11)
+    def test_jamming_spans_are_kept_apart_from_pns(self):
+        self.assertEqual(attack_spans(self._Run())["jam"], [(3, 2)])
 
-    def test_a_training_config_from_the_ui_is_a_real_dqn_config(self):
-        self.assertIsInstance(small_config(specs=("dqn",)).dqn_config(),
-                              DQNConfig)
+    def test_an_empty_run_has_no_spans(self):
+        class _Empty:
+            t, f, pns = [], [], []
+        self.assertEqual(attack_spans(_Empty()), {"jam": [], "pns": []})
+
+    def test_the_header_names_the_adversary(self):
+        fig = Figure(figsize=(8, 7))
+        FigureCanvasAgg(fig)
+        session = VizSession(small_config(adversary="pns",
+                                          specs=("always-pm",), horizon=20))
+        session.step(20)
+        draw_panels(fig, session)
+        self.assertIn("pns", fig._suptitle.get_text())
+
+    def test_the_figure_still_has_four_panels(self):
+        fig = Figure(figsize=(8, 7))
+        FigureCanvasAgg(fig)
+        session = VizSession(small_config(adversary="pns",
+                                          specs=("always-pm",), horizon=1200))
+        session.step(1200)
+        draw_panels(fig, session)
+        self.assertEqual(len(fig.axes), 4)
+
+
+class TestTheDecoyPolicyIsOffered(unittest.TestCase):
+    def test_decoy_is_a_checkbox_and_dqn_is_not(self):
+        self.assertIn("decoy", policyviz.SPEC_CHOICES)
+        self.assertNotIn("dqn", policyviz.SPEC_CHOICES)
+
+    def test_a_decoy_spec_ticks_the_decoy_checkbox(self):
+        from policyviz_ui import PolicyVizApp
+
+        self.assertEqual(PolicyVizApp._stems(("decoy-0.100-1.000-60",)),
+                         ["decoy"])
+
+    def test_the_decoy_boxes_are_seeded_from_an_incoming_spec(self):
+        from policyviz_ui import PolicyVizApp
+
+        self.assertEqual(
+            PolicyVizApp._decoy_parameters_from(("decoy-0.250-0.018-90",)),
+            ("0.25", "0.018", "90"))
+
+    def test_absent_a_decoy_spec_the_boxes_keep_their_defaults(self):
+        from policyviz_ui import PolicyVizApp
+
+        self.assertEqual(PolicyVizApp._decoy_parameters_from(("always-pm",)),
+                         ("0.1", "1", "60"))
+
+
+class TestTheConfigHasNoDqnKnobs(unittest.TestCase):
+    def test_there_is_no_episode_count_to_set(self):
+        self.assertFalse(hasattr(VizConfig(), "dqn_episodes"))
+
+    def test_episode_index_zero_is_the_first_evaluation_seed(self):
+        # With no training block to steer around, the index maps straight onto
+        # the study's evaluation seeds -- still well clear of any seed a
+        # training run would draw.
+        from eval_hybrid import evaluation_seeds
+
+        self.assertEqual(VizConfig().env_seed(), evaluation_seeds(1)[0])
+
+
+class TestTheDefaultsShowTheResultOnTheFirstApply(unittest.TestCase):
+    """The request, as a test: open the window, press Apply without touching a
+    box, and the episode on screen shows the finding.
+
+    Measured on this exact default (seed index 0, 3600 slots):
+        always-pm 0.5836   always-ent 0.6383   greedy 0.5836
+        block-aware 0.5836   decoy 0.6807   oracle 0.7060
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.config = VizConfig()
+        cls.session = VizSession(cls.config)
+        cls.session.step(cls.session.params.horizon)
+        cls.eta = {run.agent.name: run.env.eta for run in cls.session.runs}
+
+    def test_the_defaults_are_the_stealthy_scenario(self):
+        self.assertEqual(self.config.adversary, "pns")
+        self.assertEqual(self.config.ent_preset, "ent_advanced")
+        self.assertAlmostEqual(self.config.lam, 4.0)
+
+    def test_the_default_policies_include_the_one_that_can_see_it(self):
+        names = set(self.eta)
+        self.assertTrue(any(n.startswith("decoy-") for n in names))
+        self.assertIn("always-pm", names)
+        self.assertIn("always-ent", names)
+        self.assertIn("oracle", names)
+
+    def test_decoy_beats_both_static_choices(self):
+        decoy = max(v for k, v in self.eta.items() if k.startswith("decoy-"))
+        self.assertGreater(decoy,
+                           max(self.eta["always-pm"], self.eta["always-ent"]))
+
+    def test_the_qber_policies_are_exactly_always_pm(self):
+        # Blind, not merely worse: they never see anything to react to.
+        for name, value in self.eta.items():
+            if name.startswith("greedy-") or name.startswith("block-aware"):
+                self.assertEqual(value, self.eta["always-pm"], name)
+
+    def test_the_oracle_still_sits_above_everything_realisable(self):
+        realisable = [v for k, v in self.eta.items() if k != "oracle"]
+        self.assertGreater(self.eta["oracle"], max(realisable))
 
 
 class TestDeathThresholds(unittest.TestCase):
@@ -1257,6 +1317,71 @@ class TestTheWindowConstructsAndRenders(unittest.TestCase):
         self.assertEqual(config.horizon, SLOTS)
         self.assertIn("always-pm", config.specs)
 
+    # ---- the attacker, the decoy policy, and no DQN ----------------------
+
+    def test_the_form_starts_on_the_configured_adversary(self):
+        # small_config pins the jammer; the form must not quietly show the
+        # window's own default instead.
+        self.assertEqual(self.app.adversary_var.get(), "jam")
+
+    def test_the_adversary_on_the_form_reaches_the_configuration(self):
+        self.app.adversary_var.set("pns")
+        self.assertEqual(self.app._read_config().adversary, "pns")
+
+    def test_every_named_adversary_is_offered(self):
+        from evemarkov import ADVERSARIES
+
+        self.assertEqual(set(self.app.adversary_choices), set(ADVERSARIES))
+
+    def test_the_decoy_checkbox_builds_the_policys_own_label(self):
+        self.app.checks["decoy"].set(True)
+        self.app.dc_theta.set("0.25")
+        self.app.dc_qber.set("0.018")
+        self.app.dc_probe.set("90")
+        config = self.app._read_config()
+        spec = [s for s in config.specs if s.startswith("decoy-")][0]
+        self.assertEqual(spec, DecoyWatch(0.25, qber_threshold=0.018,
+                                          probe_every=90).name)
+        self.assertEqual(parse_spec(spec).name, spec)
+
+    def test_a_bad_decoy_number_is_refused(self):
+        self.app.checks["decoy"].set(True)
+        self.app.dc_probe.set("often")
+        with self.assertRaises(ValueError):
+            self.app._read_config()
+
+    def test_there_is_no_dqn_anywhere_on_the_form(self):
+        self.assertNotIn("dqn", self.app.checks)
+        self.assertNotIn("dqn_episodes", self.app.entries)
+
+    def test_save_captures_the_adversary_and_the_decoy_boxes(self):
+        self.app.adversary_var.set("both")
+        self.app.dc_theta.set("0.3")
+        state = self.app._collect_state()
+        self.assertEqual(state["adversary"], "both")
+        self.assertAlmostEqual(state["dc_theta"], 0.3)
+        self.assertIn("dc_probe", state)
+
+    def test_restore_puts_the_adversary_and_the_decoy_boxes_back(self):
+        self.app._apply_state({"fields": {}, "adversary": "none",
+                               "dc_probe": 150.0})
+        self.assertEqual(self.app.adversary_var.get(), "none")
+        self.assertEqual(float(self.app.dc_probe.get()), 150.0)
+
+    def test_a_saved_file_from_before_the_dqn_was_removed_still_restores(self):
+        # It carries dqn_episodes and a "dqn" policy stem. Neither may stop
+        # the window, and neither may come back.
+        self.app._apply_state({"fields": {"dqn_episodes": 20, "lam": 3.0},
+                               "policies": ["always-pm", "dqn"]})
+        self.assertEqual(float(self.app.entries["lam"].get()), 3.0)
+        self.assertNotIn("dqn", self.app._read_config().specs)
+
+    def test_apply_builds_a_session_without_training_anything(self):
+        self.app._apply()
+        self.assertIsNotNone(self.app.session)
+        self.assertEqual(self.app.session.config.adversary,
+                         self.app.adversary_var.get())
+
     def test_a_bad_number_in_the_form_is_reported_not_raised(self):
         self.app.entries["lam"].set("not a number")
         with self.assertRaises(ValueError):
@@ -1798,60 +1923,6 @@ class TestTheSharedFibreIsNeverPerMode(unittest.TestCase):
             self.assertEqual(shared, set(policyviz.SHARED_CHANNEL_FIELDS))
 
 
-class TestTheDqnCacheFollowsTheValues(unittest.TestCase):
-    """Trap (a). A preset name no longer identifies an operating point.
-
-    Two runs can both say "ent_advanced" and differ in mu; a cache keyed on
-    the name hands back an agent trained on the other physics, and the curve
-    it draws looks entirely plausible.
-    """
-
-    def setUp(self):
-        self.cache = tempfile.mkdtemp()
-        self.config = small_config(specs=("dqn",), horizon=60, dqn_episodes=2)
-
-    def tearDown(self):
-        shutil.rmtree(self.cache, ignore_errors=True)
-
-    def test_editing_a_parameter_under_the_same_name_is_a_different_agent(self):
-        policyviz.train_dqn(self.config, cache_dir=self.cache)
-        edited = dataclasses.replace(self.config, ent_env=_ent_env(mu=0.015))
-        self.assertEqual(edited.ent_preset, self.config.ent_preset)
-        _, cached = policyviz.train_dqn(edited, cache_dir=self.cache)
-        self.assertFalse(cached, "an edited operating point reused the agent "
-                                 "trained on the preset's own parameters")
-
-    def test_editing_a_pm_parameter_is_a_different_agent_too(self):
-        policyviz.train_dqn(self.config, cache_dir=self.cache)
-        edited = dataclasses.replace(self.config, pm_env=_pm_env(eta_bob=0.1))
-        _, cached = policyviz.train_dqn(edited, cache_dir=self.cache)
-        self.assertFalse(cached)
-
-    def test_the_same_values_are_the_same_agent_however_they_arrived(self):
-        # The other half of "keyed on values": an env that merely restates
-        # the preset must NOT force a retrain, or every OK on an untouched
-        # dialog would cost the user a training run.
-        policyviz.train_dqn(self.config, cache_dir=self.cache)
-        restated = dataclasses.replace(self.config, pm_env=_pm_env(),
-                                       ent_env=_ent_env())
-        _, cached = policyviz.train_dqn(restated, cache_dir=self.cache)
-        self.assertTrue(cached)
-
-    def test_the_key_covers_every_editable_field(self):
-        # A whitelist of "interesting" fields would rot the moment a field is
-        # added to EnvParams. Every one of them must move the key.
-        cfg = self.config.dqn_config()
-        base = policyviz._cache_key(self.config, cfg)
-        for name, _label, is_shared in policyviz.param_fields("ent"):
-            if is_shared:
-                continue
-            value = getattr(_ent_env(), name)
-            bumped = dataclasses.replace(self.config,
-                                         ent_env=_ent_env(**{name: value * 2}))
-            self.assertNotEqual(policyviz._cache_key(bumped, cfg), base,
-                                "%s does not reach the cache key" % name)
-
-
 class TestParsingTheParameterFields(unittest.TestCase):
     """Bad input must produce a message, never a traceback and never a
     half-applied configuration."""
@@ -2019,28 +2090,6 @@ class TestTheTrafficAndFibreFieldsReachTheEnvironment(unittest.TestCase):
             self.app._read_config()
         self.assertIn("bits per message", str(ctx.exception))
         self.assertIn("nonsense", str(ctx.exception))
-
-
-class TestTheCacheKeyCoversTheTrafficModel(unittest.TestCase):
-    """An agent trained where one message costs 8192 bits is not the agent for
-    a link where it costs 4096. Keying the cache without those numbers would
-    hand back the wrong agent and the result would look entirely plausible."""
-
-    def _key(self, **kw):
-        cfg = policyviz.VizConfig()
-        for k, v in kw.items():
-            setattr(cfg, k, v)
-        return policyviz._cache_key(cfg, DQNConfig(episodes=5))
-
-    def test_l0_changes_the_key(self):
-        self.assertNotEqual(self._key(l0=8192), self._key(l0=4096))
-
-    def test_the_qber_window_changes_the_key(self):
-        self.assertNotEqual(self._key(w_window=5), self._key(w_window=9))
-
-    def test_the_deadline_changes_the_key(self):
-        self.assertNotEqual(self._key(t0_deadline=20),
-                            self._key(t0_deadline=7))
 
 
 class TestCustomIsAReservedPresetName(unittest.TestCase):

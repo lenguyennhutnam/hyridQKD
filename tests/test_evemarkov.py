@@ -210,5 +210,51 @@ class TestTheSecondAttackChannel(unittest.TestCase):
                 EveChain(EveParams(s_levels=bad))
 
 
+class TestNamedPostures(unittest.TestCase):
+    """The named adversaries live here, beside the chain they configure, so
+    the visualiser can offer them without importing the whole study driver."""
+
+    def test_the_four_postures_are_named(self):
+        from evemarkov import ADVERSARIES
+
+        self.assertEqual(set(ADVERSARIES), {"jam", "pns", "both", "none"})
+
+    def test_pns_splits_photons_and_jams_nothing(self):
+        from evemarkov import adversary
+
+        eve = adversary("pns")
+        self.assertEqual(set(eve.f_levels), {0.0})
+        self.assertGreater(max(eve.s_levels), 0.0)
+
+    def test_jam_is_the_historical_default_exactly(self):
+        # Every number measured before PNS existed ran on this.
+        from evemarkov import adversary
+
+        self.assertEqual(adversary("jam"), EveParams())
+
+    def test_a_posture_keeps_the_chain_it_is_given(self):
+        from evemarkov import adversary
+
+        base = EveParams(transition=((0.9, 0.1, 0.0), (0.1, 0.8, 0.1),
+                                     (0.0, 0.2, 0.8)), seed=11)
+        eve = adversary("pns", base)
+        self.assertEqual(eve.transition, base.transition)
+        self.assertEqual(eve.seed, 11)
+
+    def test_an_unknown_posture_is_refused_not_defaulted(self):
+        from evemarkov import adversary
+
+        with self.assertRaises(KeyError):
+            adversary("stealthy")
+
+    def test_the_map_still_offers_the_same_postures(self):
+        # optmap re-exports rather than redefining, so the two cannot drift.
+        import evemarkov
+        import optmap
+
+        self.assertIs(optmap.ADVERSARIES, evemarkov.ADVERSARIES)
+        self.assertIs(optmap.adversary, evemarkov.adversary)
+
+
 if __name__ == "__main__":
     unittest.main()

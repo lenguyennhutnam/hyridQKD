@@ -60,6 +60,7 @@ import math
 import os
 
 import channel
+from evemarkov import ADVERSARIES
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 # NOT panel_default.json: that name belongs to gui.py's panel (panelstate.py)
@@ -71,10 +72,12 @@ _CLASSES = {"pm": channel.EnvParams, "ent": channel.EntEnvParams}
 # saved key -> which mode's dataclass it must deserialise as.
 ENV_KEYS = {"pm_env": "pm", "ent_env": "ent"}
 _PRESET_KEYS = ("pm_preset", "ent_preset")
-# The three policy-parameter spinboxes, saved as numbers rather than as the
-# text in the box: a saved file holding "0.o45" would restore a form that
-# cannot be applied.
-_NUMBER_KEYS = ("theta", "ba_theta", "ba_reserve")
+# The policy-parameter boxes, saved as numbers rather than as the text in the
+# box: a saved file holding "0.o45" would restore a form that cannot be
+# applied. dc_* are the decoy controller's three: its excess threshold, its
+# QBER alarm (1.0 = off) and its probe interval in slots.
+_NUMBER_KEYS = ("theta", "ba_theta", "ba_reserve",
+                "dc_theta", "dc_qber", "dc_probe")
 
 
 def _is_number(value):
@@ -215,6 +218,13 @@ def load_state(path=None):
         value = raw.get(key)
         if isinstance(value, str) and value.strip():
             out[key] = value.strip()
+
+    # Only a posture evemarkov can actually build. An unknown name would make
+    # the very first Apply fail, so it is dropped and the form keeps its own
+    # choice -- the same "absent means leave it alone" rule as everywhere else.
+    attacker = raw.get("adversary")
+    if isinstance(attacker, str) and attacker.strip() in ADVERSARIES:
+        out["adversary"] = attacker.strip()
 
     for key, protocol in ENV_KEYS.items():
         if key not in raw:
