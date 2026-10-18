@@ -111,9 +111,7 @@ __all__ = ["BANNER", "SPEC_CHOICES", "TRACK_COLORS",
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-BANNER = ("NUMERIC MODEL (HybridEnv, eq 1-24) — this window does NOT drive "
-          "the qline hardware. No hw_sim process is started here; use "
-          "gui.py for the real stack.")
+BANNER = "NUMERIC MODEL"
 
 # What the policy chooser offers. `greedy` and `buffer-aware` are shown with
 # their parameters filled in from the spinboxes, so the strings here are only
@@ -757,6 +755,15 @@ class VizSession:
         # {artist: policy name} for this frame's clickable legend entries.
         # Refreshed by every `draw_panels`; it is a lookup table, not state.
         self.legend_picks = {}
+        # Sieve untuk panel buffer: bila True, buffer hanya digambar untuk slot
+        # yang f > 0 (jamming) atau pns > 0 -- slot tanpa serangan buffernya
+        # dipotong dari plot agar panel tidak penuh garis saat jamming ringan.
+        # VIEW state, bukan VizConfig: episode tidak berubah, hanya penampilannya.
+        self.buffer_sieve_attacks_only = False
+        # VIEW-only, same category as the sieve: hide the whole buffer PANEL.
+        # `run.buffer` is still recorded every slot and still feeds eq (2)-(24),
+        # the B_max cut and eta; only the figure stops drawing that axes.
+        self.buffer_hidden = False
 
     def _assert_shared_weather(self):
         """Refuse a session whose runs would face different jamming.
@@ -798,15 +805,14 @@ class VizSession:
         return max((r.slot for r in self.runs), default=0)
 
     def trace_visible(self, name):
-        """Is this policy's line switched on in the QBER and eta panels?"""
+        """Is this policy's line switched on in the QBER, buffer and eta panels?"""
         return name not in self.hidden_traces
 
     def toggle_trace(self, name):
-        """Flip one policy's QBER trace. Returns its new visibility.
+        """Flip one policy's trace in the QBER, buffer and eta panels.
 
-        Only panel 2 consults this. The mode lanes, the buffer panel, the
-        cumulative-eta panel and the scoreboard all ignore it, deliberately:
-        a policy the reader has cleared off the QBER panel is still running,
+        The mode lanes and the scoreboard all ignore it, deliberately:
+        a policy the reader has cleared off a line panel is still running,
         and a figure that let a click erase it everywhere would let someone
         conclude a policy was never selected.
         """
@@ -933,8 +939,61 @@ def _wire_qber_legend(legend, session, names):
     return picks
 
 
+def _draw_buffer_panel(ax_buf, session):
+    """Fill the key-buffer axes: traces, the B_max rule, and the axis style.
+
+    Pulled out of `draw_panels` so the "hide the buffer panel" view bit can
+    skip one block of drawing instead of an indented copy of it. Nothing here
+    reads episode state beyond what `run.buffer` already recorded -- hiding the
+    panel never touches the buffer arithmetic.
+    """
+    runs = session.runs
+    show_sieve = bool(getattr(session, "buffer_sieve_attacks_only", False))
+    for run in runs:
+        if not show_sieve:
+            line, = ax_buf.plot(run.t, run.buffer, color=run.color, lw=1.0,
+                                ls=run.linestyle)
+        else:
+            # One continuous artist, with NaN leaving a hole where the link
+            # was unattacked. Splitting into per-attack segments was
+            # considered: it did not break the line any better, but every
+            # segment became its own legend entry.
+            y = [b if (f > 0.0 or p > 0.0) else float("nan")
+                 for b, f, p in zip(run.buffer, run.f, run.pns)]
+            line, = ax_buf.plot(run.t, y, color=run.color, lw=1.0,
+                                ls=run.linestyle)
+        line.set_visible(session.trace_visible(run.display_name))
+    # HIDDEN TRACES STILL SET THE LIMIT, same rule as panel 2: rescaling to
+    # whatever is left on screen would change the shape and apparent height
+    # of the remaining curves on every click, so two screenshots of the same
+    # episode would carry two different vertical scales.
+    # The B_max line is drawn only once the pool climbs near it. At the
+    # operating point the study reports (lam = 2.5) demand outruns supply and
+    # the buffer never leaves the floor; pinning the axis to B_max there
+    # flattens every trace onto zero and the panel shows nothing at all.
+    # gui.py hides its death-QBER line on the same rule and for the same
+    # reason, so the two panels behave alike.
+    peak_buffer = max([b for run in runs for b in run.buffer] or [0])
+    b_max = float(session.params.b_max)
+    if peak_buffer >= REFERENCE_LINE_SHOW_FRAC * b_max:
+        ax_buf.axhline(b_max, color=plots.RED, lw=1.0, ls=":",
+                       label="B_max = %.3g" % b_max)
+        plots.style_axis(ax_buf, title="key buffer", ylabel="bits")
+        ax_buf.legend(fontsize=6, loc="upper left", framealpha=0.9)
+    else:
+        plots.style_axis(
+            ax_buf, ylabel="bits",
+            title="key buffer  (B_max = %.3g, off scale: peak %.3g)"
+                  % (b_max, peak_buffer))
+
+
 def draw_panels(fig, session, title=None):
     """Render the four panels of `session` into `fig`.
+
+    Three of them when `session.buffer_hidden` is set: that is a VIEW bit the
+    viewer toggles in the window, and it only asks for fewer subplots. The
+    buffer is still recorded on every run and still drives eq (2)-(24); nothing
+    about the episode, the scoreboard or η changes with it.
 
     Takes a bare `matplotlib.figure.Figure`, so the window and a headless
     Agg render go through exactly one drawing implementation -- a separate
@@ -947,9 +1006,19 @@ def draw_panels(fig, session, title=None):
     clicked legend entry through.
     """
     fig.clear()
-    axes = fig.subplots(4, 1, sharex=True,
-                        gridspec_kw={"height_ratios": [1.1, 1, 1, 1]})
-    ax_mode, ax_qber, ax_buf, ax_eta = axes
+    # buffer_hidden (session view bit): the whole buffer axes is left out of
+    # the figure, so the remaining three stretch. Run data is untouched --
+    # this only asks for fewer subplots.
+    hide_buf = bool(getattr(session, "buffer_hidden", False))
+    if hide_buf:
+        axes = fig.subplots(3, 1, sharex=True,
+                            gridspec_kw={"height_ratios": [1.1, 1, 1]})
+        ax_mode, ax_qber, ax_eta = axes
+        ax_buf = None
+    else:
+        axes = fig.subplots(4, 1, sharex=True,
+                            gridspec_kw={"height_ratios": [1.1, 1, 1, 1]})
+        ax_mode, ax_qber, ax_buf, ax_eta = axes
     fig.patch.set_facecolor(plots.FACE)
     for ax in axes:
         ax.set_facecolor("white")
@@ -1015,7 +1084,8 @@ def draw_panels(fig, session, title=None):
         names.append(None)
     plots.style_axis(ax_qber,
                      title="observed QBER (windowed)  —  click a policy in "
-                           "the legend to hide/show it here and in η",
+                           "the legend to hide/show it here, in the buffer "
+                           "and in η",
                      ylabel="QBER [%]")
     # Headroom for the legend, which would otherwise sit on top of the first
     # few hundred slots -- the stretch where the policies first diverge.
@@ -1034,27 +1104,15 @@ def draw_panels(fig, session, title=None):
     session.legend_picks = _wire_qber_legend(legend, session, names)
 
     # --- panel 3: the key buffer ----------------------------------------
-    for run in runs:
-        ax_buf.plot(run.t, run.buffer, color=run.color, lw=1.0,
-                    ls=run.linestyle)
-    # The B_max line is drawn only once the pool climbs near it. At the
-    # operating point the study reports (lam = 2.5) demand outruns supply and
-    # the buffer never leaves the floor; pinning the axis to B_max there
-    # flattens every trace onto zero and the panel shows nothing at all.
-    # gui.py hides its death-QBER line on the same rule and for the same
-    # reason, so the two panels behave alike.
-    peak_buffer = max([b for run in runs for b in run.buffer] or [0])
-    b_max = float(session.params.b_max)
-    if peak_buffer >= REFERENCE_LINE_SHOW_FRAC * b_max:
-        ax_buf.axhline(b_max, color=plots.RED, lw=1.0, ls=":",
-                       label="B_max = %.3g" % b_max)
-        plots.style_axis(ax_buf, title="key buffer", ylabel="bits")
-        ax_buf.legend(fontsize=6, loc="upper left", framealpha=0.9)
-    else:
-        plots.style_axis(
-            ax_buf, ylabel="bits",
-            title="key buffer  (B_max = %.3g, off scale: peak %.3g)"
-                  % (b_max, peak_buffer))
+    # Same visibility set as panels 2 and 4: hiding a trace only in the QBER
+    # and eta panels while leaving its buffer line on screen made the buffer
+    # overlap unreadable with six tracks on it. The sieve, when enabled by
+    # the viewer, leaves gaps in each trace outside attacks (f==0 and pns==0)
+    # so the "good-weather" buffer mean does not hide the attack-period drops.
+    # Both effects compose, so a policy hidden by hidden_traces stays hidden
+    # regardless of the sieve.
+    if not hide_buf:
+        _draw_buffer_panel(ax_buf, session)
 
     # --- panel 4: cumulative eta ----------------------------------------
     # Same visibility set as panel 2: with six tracks the eta curves bunch as

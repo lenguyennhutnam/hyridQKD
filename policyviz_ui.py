@@ -661,6 +661,30 @@ class PolicyVizApp(tk.Tk):
         row += 1
         self.trace_checks = {}   # display name -> tk.BooleanVar
 
+        # Sieve untuk panel buffer: hanya gambar buffer saat salah satu senjata
+        # aktif (jamming atau PNS). Muatan visual panel buffer yang padat biasanya
+        # berasal dari rentang "cuaca baik" saat buffer berayun penuh; memotong
+        # rentang itu menjadikan periode serangan lebih mudah dibaca. Tanda cek
+        # ini murni tampilan -- session menjalankan episode yang sama dan
+        # scoreboard tidak boleh berubah.
+        self.buffer_sieve_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            left, text="sieve buffer: attack slots only",
+            variable=self.buffer_sieve_var,
+            command=self._on_buffer_sieve
+        ).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        # Ẩn TOÀN BỘ panel buffer khỏi figure. Chỉ là view: session không chạy
+        # lại, `run.buffer` vẫn ghi mỗi slot và vẫn đi vào công thức
+        # eq (2)-(24) lẫn η -- figure chỉ bớt một panel.
+        self.buffer_hide_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            left, text="hide buffer panel",
+            variable=self.buffer_hide_var,
+            command=self._on_buffer_hide
+        ).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+
         self.board = tk.Text(left, height=12, width=52, font=("TkFixedFont", 8),
                              state="disabled", wrap="none")
         self.board.grid(row=row, column=0, columnspan=2, sticky="nsew")
@@ -1123,6 +1147,32 @@ class PolicyVizApp(tk.Tk):
         self._sync_trace_checks()
         self._redraw(force=True)
 
+    def _on_buffer_sieve(self):
+        """The "sieve buffer" checkbox was clicked: update the view and redraw.
+
+        This is strictly a view bit: the episode does not change and no
+        policy is reselected, so there is no need to rebuild the session.
+        The bool lives on VizSession only because draw_panels is handed just
+        that object.
+        """
+        if self.session is None:
+            self._redraw(force=True)
+            return
+        self.session.buffer_sieve_attacks_only = bool(self.buffer_sieve_var.get())
+        self._redraw(force=True)
+
+    def _on_buffer_hide(self):
+        """The "hide buffer panel" checkbox was clicked: redraw, episode unchanged.
+
+        Like the sieve, strictly a view bit -- the buffer is still accumulated
+        and still enters eq (2)-(24); only the figure stops drawing that panel.
+        """
+        if self.session is None:
+            self._redraw(force=True)
+            return
+        self.session.buffer_hidden = bool(self.buffer_hide_var.get())
+        self._redraw(force=True)
+
     def _build_session(self, config):
         # Which QBER traces are switched off is a VIEW choice, not part of
         # the episode, so it rides across an Apply: otherwise nudging lambda
@@ -1152,6 +1202,10 @@ class PolicyVizApp(tk.Tk):
             messagebox.showerror("policy visualiser", str(exc))
             return
         self.session.hidden_traces.update(carried)
+        if hasattr(self, "buffer_sieve_var"):
+            self.session.buffer_sieve_attacks_only = bool(self.buffer_sieve_var.get())
+        if hasattr(self, "buffer_hide_var"):
+            self.session.buffer_hidden = bool(self.buffer_hide_var.get())
         # Rebuilt AFTER the carried toggles land in hidden_traces, and not
         # before: a policy that survived Apply must show the visibility it
         # already had, which _rebuild_trace_checks can only read correctly

@@ -987,12 +987,30 @@ class TestHidingAQberTrace(unittest.TestCase):
                 lows.add(round(path.get_extents().y0, 2))
         self.assertIn(round(hidden_lane - 0.38, 2), lows)
 
-    def test_hiding_a_trace_leaves_the_buffer_panel_alone(self):
+    def test_hiding_a_trace_hides_its_buffer_line(self):
+        # This test used to assert the opposite -- that the buffer panel was
+        # untouched. The trace toggle was deliberately widened to cover it,
+        # because unticking a policy left every buffer line on screen and
+        # the panel overlapped unreadably with six tracks on it. What must
+        # NOT widen is the mode lanes and the scoreboard: those are the
+        # evidence a policy is running at all.
+        self._draw()
+        hidden = [ln for ln in self.fig.axes[2].get_lines()
+                  if ln.get_visible()]
+        self.assertEqual(len(hidden), len(self.session.runs))
         self.session.hidden_traces.add(self.name)
         self._draw()
         drawn = [ln for ln in self.fig.axes[2].get_lines()
                  if ln.get_visible()]
-        self.assertEqual(len(drawn), len(self.session.runs))
+        self.assertEqual(len(drawn), len(self.session.runs) - 1)
+        runs = self.session.runs
+        hidden_index = [i for i, r in enumerate(runs)
+                        if r.display_name == self.name][0]
+        for i, ln in enumerate(self.fig.axes[2].get_lines()):
+            expected = i != hidden_index
+            self.assertEqual(ln.get_visible(), expected,
+                             "run #%d (%s) visible=%s"
+                             % (i, runs[i].display_name, ln.get_visible()))
 
     def test_hiding_a_trace_hides_exactly_one_eta_curve(self):
         # This test used to assert the opposite -- that the eta panel was

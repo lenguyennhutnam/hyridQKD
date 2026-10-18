@@ -1,0 +1,108 @@
+# SLIDE NOTES — cách tái hiện 3 slide kết quả trong `policyviz.py`
+# (mở bằng cửa sổ Tk: `python3 policyviz.py`, mọi thao tác dưới đây đều dùng GUI)
+#
+# Panel dùng chung mọi slide: adversary=`pns`, pm_preset=`demo_pm`,
+# ent_preset=`demo_ent_advanced`.
+# Quy ước "Apply" = bấm nút Apply để build session mới (thay đổi ô nhập chỉ
+# có hiệu lực sau khi Apply). "Start" = bắt đầu chạy episode. Skorboard là
+# bảng text hiển thị ngay trong cửa sổ, yanında panel đồ thị.
+# Mặc định VizConfig: lam=4.0, b_max=1e6, horizon=3600, n_x=1e5, d=55km,
+# alpha=0.2, odr=0dB, seed_index=0.
+#
+# LƯU Ý TRUNG THỰC (đọc trước khi chiếu):
+# - policyviz chạy MỘT episode (seed_index=0). Số trên slide là TRUNG BÌNH 8
+#   seed (eval_hybrid.py). GUI chỉ cho thấy xu hướng: "decoy > static",
+#   "block-aware > static" — chữ số sau dấu phẩy sẽ LỆCH khỏi slide.
+# - Số liệu chính xác trong slide lấy từ Table 4.4 / 4.7 / 4.5 của thesis,
+#   xem `docs/ThesisReport_LeNguyenNhutNam.docx` Chương 4.
+
+[SLIDE 1 — Results under Jamming]
+# Các con số hiển thị trong GUI:
+#   always-pm ~0.6284 | always-ent ~0.6616 | greedy-0.045 (best threshold)
+#   ~0.6628 | block-aware ~0.7035 | oracle ~0.7228 (upper bound, nét đứt)
+#   → vs AlwaysPM: (0.7035/0.6284 − 1) = +11.9%
+#   → vs AlwaysENT: (0.7035/0.6616 − 1) = +6.3%
+#   → headroom: (0.7035−0.6284)/(0.7228−0.6284) = 79.6%
+#
+# Cấu hình GUI:
+#   policies:  tick always-pm, always-ent, greedy, block-aware, oracle
+#              (UNtick: buffer-aware, decoy, always-pm-relaxed)
+#   greedy θ:                 0.045
+#   adversary:                jam            ← BẮT BUỘC, mặc định GUI là pns
+#   operating points:         PM = demo_pm, ENT = demo_ent_advanced
+#   λ arrivals/slot:          2.5            ← BẮT BUỘC, mặc định GUI là 4.0
+#   B_max [bits]:             1000000
+#   n_X block [bits]:         100000
+#   d [km]:                   55
+#   horizon [slots]:          3600
+#   bấm Apply → Start → đợi hết 3600 slot → đọc scoreboard
+#
+# Số liệu khớp thesis Table 4.4 (8 seeds, λ=2.5, B_max=1e6, n_X=1e5, d=55):
+#   LỆNH HEADLESS CHO SỐ CHÍNH XÁC (để paste vào slide, không chiếu GUI):
+#   python3 eval_hybrid.py --seeds 8 --no-dqn --lam 2.5 --b-max 1e6 \
+#       --pm-preset demo_pm --ent-preset demo_ent_advanced --d-km 55
+
+[SLIDE 2 — Results under PNS Attack]
+# Bảng duty-cycle trong thesis Table 4.7 được đo bằng SWEEP tham số Eve
+# (đổi tần suất trạng thái HEAVY của Markov chain), KHÔNG phải bằng GUI.
+# GUI chỉ tái hiện được ĐIỂM MẪU duty mặc định của adversary "pns".
+#
+# Điểm mấu chốt chiếu trên GUI (mặc định đã đúng, chỉ cần Apply → Start):
+#   - QBER panel: đường QBER của mọi policy NẰM IM (~1%) xuyên qua dải đỏ
+#     (PNS attack spans) — đây chính là "Why QBER is not enough".
+#   - Mode lane: chỉ decoy nhảy sang ENT trong dải đỏ, greedy/block-aware
+#     đứng yên PM — "Why DecoyWatch works".
+#   - Scoreboard: decoy ~0.6807 > always-ent ~0.6383 > always-pm/greedy/
+#     block-aware ~0.5836 (1 seed; 8-seed Table 4.7 tại duty 10%:
+#     PM 0.4976 / ENT 0.5034 / DecoyWatch 0.5476 / Oracle 0.5613).
+#
+# Cấu hình GUI (hầu hết là mặc định):
+#   policies:  tick always-pm, always-ent, greedy, block-aware,
+#              decoy-0.100-1.000-60, oracle
+#   decoy excess threshold:   0.100
+#   decoy QBER alarm:         1.000 (= tắt báo động QBER, chỉ nhìn decoy)
+#   decoy probe every:        60
+#   adversary:                pns
+#   operating points:         PM = demo_pm, ENT = demo_ent_advanced
+#   λ arrivals/slot:          4              (PNS đo ở λ=4–5, đói khoá mạnh)
+#   B_max:                    1000000
+#   n_X:                      100000
+#   d:                        55
+#   bấm Apply → Start
+#
+# Muốn số bảng duty 2/5/10/20/40% (Table 4.7): tham số Eve transition/kernel
+# KHÔNG có ô nào trong GUI — chạy sweep bằng code (tham khảo
+# docs/superpowers/sdd/2026-08-17-hybrid/validation.md), không làm live.
+# Điểm giao PM/ENT ≈ 10% tương ứng công thức giải tích d* = 10.9% (eq 3.1).
+
+[SLIDE 3 — Block Length + Policy Map]
+# Bảng trái (Block length → Fill time → Regime): KHÔNG phải số đo từ GUI.
+# Đây là số học fill_time = n_X / ns_PM (ns_PM ≈ 69 422 sifted/slot tại d=55):
+#   1e5 / 69422 ≈ 1.4 slot  → supply-limited
+#   3e5 / 69422 ≈ 4.3 slot  → transition
+#   1e6 / 69422 ≈ 14.4 slot → timing-limited   (deadline T₀ = 20 slot)
+#   3e6 / 69422 ≈ 43.2 slot → timing-dominated
+# Trình bày slide: đọc bảng, chỉ vào T₀=20 — "block càng to, khoá về càng
+# muộn so với deadline, timing chi phối thay vì tổng cung".
+#
+# Muốn MINH HOẠ một ô trên GUI (ví dụ timing-limited: n_X=1e6):
+#   operating points:   PM = demo_pm, ENT = demo_ent_advanced
+#   adversary:          pns
+#   λ:                  4
+#   n_X block [bits]:   1000000   ← đổi ô này rồi Apply → Start
+#   policies:           tick always-pm, always-ent, decoy, oracle
+#   → quan sát: buffer về từng cục to, decoy thăm dò đắt hơn (mỗi lần
+#     thăm dò xoá một block ENT đang dở — eq 5), khoảng cách decoy vs
+#     static co lại so với n_X=1e5.
+#
+# Bảng policy map (Table 4.9, 4 seeds, λ=5): chạy optmap.py, KHÔNG làm trong
+# GUI vì GUI chỉ chạy 1 seed/1 điểm (d, n_X):
+#   LỆNH HEADLESS (chạy TRƯỚC buổi bảo vệ, vài phút; đừng chạy live):
+#   python3 optmap.py --seeds 4 --adversary pns --lam 5 \
+#       --d-grid 20,55,85 --n-x-grid 1e5,3e5,1e6,3e6 \
+#       --ent-preset demo_ent_advanced --pm-preset demo_pm
+#   Kết quả kỳ vọng: 55km/n_X≤1e6 → decoy-0.100-1.000-60 thắng
+#   (+0.0888…+0.1012 so với always-pm, lấy 56–79% headroom Oracle);
+#   d=20 (bão hoà) và n_X=3e6 → always-ent.
+# Ý đọc trên slide: "No single policy is always optimal — phụ thuộc khoảng
+# cách, cỡ block, điều kiện tấn công".
