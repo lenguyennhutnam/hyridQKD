@@ -26,19 +26,44 @@ No other dependency is introduced by this app — do not add one without asking.
 
 ---
 
-## 2. Quick start — no hardware, no build
+## 2. Quick start — from a fresh clone to a number in about a minute
 
-Everything below runs from a clone of this repo alone. This is the entry point
-that reproduces the study's central result:
+Everything in this section runs from a clone of this repository alone. **No
+Rust, no build, no `hw_sim`, no VeriQloud checkout** — the numeric model needs
+`numpy`, `matplotlib` and `scipy` only.
+
+### 2.1 Clone and install
 
 ```bash
-cd qkd_app
+git clone https://github.com/lenguyennhutnam/hyridQKD.git
+cd hyridQKD
+```
 
+The default branch is `main` and it already contains everything — no branch
+switching is needed.
+
+```bash
+python3 -m pip install numpy matplotlib scipy
+```
+
+`tkinter` is not on PyPI. It is part of the interpreter but needs a system
+package on Linux, and it is needed only for the two windows:
+
+```bash
+sudo apt install python3-tk        # Debian/Ubuntu, incl. WSL2
+```
+
+On Windows `tkinter` ships with the official installer; the `--no-gui` commands
+below need no display at all, anywhere.
+
+### 2.2 Run it
+
+```bash
 python3 policyviz.py --no-gui --adversary pns --lam 5
 ```
 
 Expected output (seed 99000000, horizon 3600) — pinned by
-`tests/test_policyviz.py`:
+`tests/test_policyviz.py`, so a different number means something is broken:
 
 ```
 policy                                eta  switches  ENT frac   expired    slots
@@ -50,6 +75,11 @@ block-aware                        0.4645         0     0.000      9466     3600
 decoy-0.100-1.000-60               0.5417        40     0.339      8088     3600
 oracle (upper bound)               0.5619        32     0.193      7728     3600
 ```
+
+That is the study's central result: under a photon-number-splitting attack the
+QBER never moves, so `greedy` and `block-aware` sit exactly on `always-pm`
+(they cannot see the attack), while the decoy-ratio controller **beats both
+static choices**. `oracle` is an upper bound, not achievable.
 
 More:
 
@@ -72,10 +102,21 @@ reproducible. View checkboxes (hide a trace, sieve/hide the buffer panel) are vi
 
 ## 3. Hardware stack — only for `gui.py` / `collector.py`
 
-This is **not** needed for `policyviz.py`, `eval_hybrid.py` or `optmap.py`.
+This is **not** needed for `policyviz.py`, `eval_hybrid.py` or `optmap.py`, and
+it **is not** runnable from a clone of this repo alone: `build.sh` compiles the
+Rust sources in the sibling `hw_sim/` and `kiwi_hw_control/` checkouts, and
+`configio.py` rewrites configs under `hw_sim/config_files/`. Expect a workspace
+laid out like this before any of the commands below apply:
+
+```
+<workspace>/
+  hw_sim/            kiwi_hw_control/     # VeriQloud (Rust)
+  DecoyState/                            # unused by this app since the vendoring
+  <this repo>/
+```
 
 ```bash
-cd /mnt/e/qkdsim/qkd_app
+cd <this repo>
 
 bash build.sh          # ~2-3 min with JOBS=1 (9p/drvfs needs serial cargo)
 bash run_stack.sh      # MODE=decoy (PM) by default; MODE=plain for ENT
@@ -102,7 +143,7 @@ overrides in-memory and written through `configio.py`.
 ## 4. Repo layout
 
 ```
-qkd_app/
+hyridQKD/                 <- repo root; the .py files live at the top level
   channel.py         env params → eta/qber/l_predict + death_qber
   keyrate.py         PM 1-decoy finite-key bridge (gain-modelled split)
   keyrate_ent.py     ENT/BBM92 finite-key bridge (Chapman 2022, d=2)
@@ -121,23 +162,21 @@ qkd_app/
   figs/  logs/  bin/  build/   git-ignored
 ```
 
-`qkd_app` is its own Git repo and is self-contained. The sibling `hw_sim` /
-`kiwi_hw_control` / `DecoyState` checkouts are used only by the stack path of §3 —
-the numeric model never imports them. The scratch scripts `_wsl_*`,
-`_poc_bridge.py` and `_thesis_extract/` at the workspace root are not part of
-this app.
+This repository is **self-contained**: the sibling `hw_sim` / `kiwi_hw_control` /
+`DecoyState` checkouts are used only by the stack path of §3 — the numeric model
+never imports them.
 
 ---
 
 ## 5. Tests
 
 ```bash
-# on WSL
-cd qkd_app
+# from the repo root (no WSL and no stack needed)
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -q 2>&1 | tail -5
 # expected from a clone of this repo alone:
 #   Ran 1074 tests   OK (skipped=12)
-# (single module:  python3 -m unittest tests.test_policyviz -q)
+#
+# single module:  python3 -m unittest tests.test_policyviz -q
 ```
 
 The 12 skips are 3 Tk-window tests (no display on a headless box) plus the 9
