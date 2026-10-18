@@ -30,9 +30,14 @@ import sys
 
 import numpy as np
 
-# DecoyState lives next to qkd_app/ in the workspace.
-_DECOY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          "DecoyState")
+# Rusca 2018 bound (1-decoy finite key) comes from Veriqloud's DecoyState repo
+# and is vendored verbatim under third_party/ so this app runs from a clone of
+# this repo alone -- nothing else in the workspace is needed to import it. Read
+# third_party/NOTICE.md for its provenance and how it was checked against the
+# source. Do NOT import the sibling ../DecoyState checkout: it is a second copy
+# that could drift, and a bound silently differing between two machines is
+# exactly the kind of disagreement no test here would catch.
+_DECOY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "third_party")
 if _DECOY_DIR not in sys.path:
     sys.path.insert(0, _DECOY_DIR)
 

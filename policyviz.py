@@ -1232,6 +1232,11 @@ def main(argv=None):
         from matplotlib.figure import Figure
         fig = Figure(figsize=(10, 9), dpi=130)
         draw_panels(fig, session)
+        # `figs/` is git-ignored, so a fresh clone has none and savefig would
+        # surface a bare FileNotFoundError traceback for a documented flag.
+        parent = os.path.dirname(os.path.abspath(args.figure))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         fig.savefig(args.figure, facecolor=fig.get_facecolor())
         print("\nwrote %s" % args.figure)
 

@@ -1,4 +1,12 @@
-"""Tests for hw_sim config read/write. Uses temp copies, never the real files."""
+"""Tests for hw_sim config read/write. Uses temp copies, never the real files.
+
+Skipped as a whole when the sibling hw_sim checkout is absent. Every test here
+copies the REAL config files into a temp dir first, so there is nothing to test
+without them, and they cover only the hardware-stack writer -- none of the
+numeric-model code (`policyviz`, `eval_hybrid`, `optmap`) goes through
+`configio`. Skipping is what lets a clone of this repo alone report a green
+suite instead of nine errors that say nothing about the study.
+"""
 import json
 import os
 import shutil
@@ -8,6 +16,17 @@ import unittest
 import configio
 
 
+_HAVE_HW_SIM = all(os.path.exists(p) for p in (
+    configio.DEFAULT_ALICE, configio.DEFAULT_BOB,
+    configio.DEFAULT_ALICE_PLAIN, configio.DEFAULT_BOB_PLAIN))
+
+_NEEDS_HW_SIM = unittest.skipUnless(
+    _HAVE_HW_SIM,
+    "hw_sim config files not found beside qkd_app; these cover the "
+    "hardware-stack config writer only")
+
+
+@_NEEDS_HW_SIM
 class TestConfigIO(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -78,6 +97,7 @@ class TestConfigIO(unittest.TestCase):
             self.assertEqual(q, 0.0456)
 
 
+@_NEEDS_HW_SIM
 class TestPlainConfigIO(unittest.TestCase):
     """ENT mode writes the PLAIN (non-decoy) config pair."""
 

@@ -11,20 +11,16 @@ needed for `gui.py` / `collector.py`.
 
 ## 1. Requirements
 
-* **WSL2 Ubuntu 20.04** (Linux-only: FIFOs, Unix sockets, `mmap`, crate `nix`)
-  + Python 3.8.10, Rust 1.97 — already present in the lab WSL image
-  + Python packages: `numpy`, `matplotlib`, `tkinter` (TkAgg), `scipy`
-* On Windows, `tkinter`/WSLg is required for the two Tk windows.
-* The sibling folder `../DecoyState` must be present (Rusca 2018 finite-key bound
-  `compute_final_length`); `keyrate.py` imports it via a relative path. Keep the
-  workspace layout:
-
-```
-e:\qkdsim\
-  DecoyState/compute_final_length.py
-  hw_sim/  kiwi_hw_control/           # VeriQloud repos (Rust)
-  qkd_app/                            # ← this folder
-```
+* Python ≥ 3.8 with `numpy`, `matplotlib`, `tkinter` (TkAgg), `scipy`.
+* Nothing else. **No Rust, no `hw_sim`, no VeriQloud checkout, no `DecoyState`**
+  checkout — the Rusca 2018 bound is vendored under `third_party/`
+  (see `third_party/NOTICE.md` for its provenance).
+* **Windows:** the two Tk windows (`gui.py`, `policyviz.py`) need a display; run
+  them inside WSL2 Ubuntu 20.04 (WSLg is enough). The `--no-gui` headless paths
+  run anywhere.
+* **The real qline stack is a separate, optional thing** — Linux-only
+  (FIFOs, Unix sockets, `mmap`, crate `nix`), and only for `gui.py` /
+  `collector.py`. See §3.
 
 No other dependency is introduced by this app — do not add one without asking.
 
@@ -32,17 +28,36 @@ No other dependency is introduced by this app — do not add one without asking.
 
 ## 2. Quick start — no hardware, no build
 
-The most useful entry point needs **nothing built**:
+Everything below runs from a clone of this repo alone. This is the entry point
+that reproduces the study's central result:
 
 ```bash
-cd /mnt/e/qkdsim/qkd_app          # or the cloned path
+cd qkd_app
 
-# a) the hybrid policy visualiser (numeric model, eq 1-24)
-python3 policyviz.py              # window — press Apply, then Start
-python3 policyviz.py --no-gui     # same episode as text scoreboard
-python3 policyviz.py --no-gui --adversary pns --lam 5 --figure figs/x.png
+python3 policyviz.py --no-gui --adversary pns --lam 5
+```
 
-# b) the study's answer "does switching pay", headless
+Expected output (seed 99000000, horizon 3600) — pinned by
+`tests/test_policyviz.py`:
+
+```
+policy                                eta  switches  ENT frac   expired    slots
+--------------------------------------------------------------------------------
+always-pm                          0.4645         0     0.000      9466     3600
+always-ent                         0.5080         0     1.000      8689     3600
+greedy-0.045                       0.4645         0     0.000      9466     3600
+block-aware                        0.4645         0     0.000      9466     3600
+decoy-0.100-1.000-60               0.5417        40     0.339      8088     3600
+oracle (upper bound)               0.5619        32     0.193      7728     3600
+```
+
+More:
+
+```bash
+python3 policyviz.py                          # Tk window -- press Apply, then Start
+python3 policyviz.py --no-gui --figure figs/x.png   # also write the four panels
+
+# the study's answer to "does switching pay"
 python3 eval_hybrid.py --no-dqn --lam 2.5 --b-max 1e6 --seeds 4 --show-sweep
 python3 eval_hybrid.py --ent-preset ent_advanced --lam 2.5 --b-max 1e6 --seeds 8
 python3 optmap.py --adversary pns --lam 5 --seeds 4   # winner per (d_km, n_X) cell
@@ -91,6 +106,7 @@ qkd_app/
   channel.py         env params → eta/qber/l_predict + death_qber
   keyrate.py         PM 1-decoy finite-key bridge (gain-modelled split)
   keyrate_ent.py     ENT/BBM92 finite-key bridge (Chapman 2022, d=2)
+  third_party/       vendored Rusca 2018 bound (NOTICE.md: origin + licence)
   hybridenv.py       eq 1-24 HybridEnv (queue/buffer/deadline, per-slot)
   policies.py        always-pm/ent, greedy, buffer-aware, block-aware, decoy, oracle
   evemarkov.py       3-state Eve Markov chain (jam + PNS, per adversary)
@@ -98,16 +114,18 @@ qkd_app/
   optmap.py          (d_km, n_X, adversary) winner map
   policyviz.py       VizConfig/VizSession + draw_panels (headless + figure export)
   policyviz_ui.py    Tk window (thin: form → VizSession → draw_panels)
-  gui.py / backend.py / stackctl.py / configio.py  real stack plumbing
-  collector.py       sifting + finite-key live extractor
+  gui.py / backend.py / stackctl.py / configio.py  real stack plumbing (§3 only)
+  collector.py       sifting + finite-key live extractor (§3 only)
   presets/*.json     operating points (pm/ent)
-  tests/             1074 tests — PYTHONDONTWRITEBYTECODE=1 on /mnt/e
+  tests/             1074 tests
   figs/  logs/  bin/  build/   git-ignored
 ```
 
-`qkd_app` is its own Git repo; the sibling `hw_sim` / `kiwi_hw_control` /
-`DecoyState` repos are independent. The scratch scripts `_wsl_*`, `_poc_bridge.py`
-and `_thesis_extract/` at the workspace root are not part of this app.
+`qkd_app` is its own Git repo and is self-contained. The sibling `hw_sim` /
+`kiwi_hw_control` / `DecoyState` checkouts are used only by the stack path of §3 —
+the numeric model never imports them. The scratch scripts `_wsl_*`,
+`_poc_bridge.py` and `_thesis_extract/` at the workspace root are not part of
+this app.
 
 ---
 
@@ -115,14 +133,21 @@ and `_thesis_extract/` at the workspace root are not part of this app.
 
 ```bash
 # on WSL
-cd /mnt/e/qkdsim/qkd_app
+cd qkd_app
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -q 2>&1 | tail -5
-# expected:  Ran 1074 tests in ~180s  —  OK
+# expected from a clone of this repo alone:
+#   Ran 1074 tests   OK (skipped=12)
 # (single module:  python3 -m unittest tests.test_policyviz -q)
 ```
 
-Run with `PYTHONDONTWRITEBYTECODE=1` on `/mnt/e` (drvfs/9p) — `__pycache__` mtimes are
-coarse there and stale bytecode causes flaky failures after `git checkout`.
+The 12 skips are 3 Tk-window tests (no display on a headless box) plus the 9
+`tests/test_configio.py` cases, which copy the real `hw_sim` config files and so
+need that checkout. They still run — and must pass — in the full workspace where
+`../hw_sim` exists; there the suite reports `OK` with nothing skipped for configio.
+
+Run with `PYTHONDONTWRITEBYTECODE=1` when the tree is on `/mnt/e` (drvfs/9p) —
+`__pycache__` mtimes are coarse there and stale bytecode causes flaky failures
+after `git checkout`.
 
 The scoreboard printed by `policyviz.py --no-gui` is pinned by
 `tests/test_policyviz.py` (seed 99000000, adversary `pns`, lam=5).
